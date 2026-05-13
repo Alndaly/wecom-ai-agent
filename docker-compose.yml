@@ -1,0 +1,39 @@
+# MVP1 dev stack. Postgres / Redis are scaffolded for MVP2+, but backend
+# defaults to SQLite so you can just run `docker compose up backend web`.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wecom
+      POSTGRES_USER: wecom
+      POSTGRES_PASSWORD: wecom
+    ports: ["5432:5432"]
+    volumes: ["pg:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:///./dev.db
+      JWT_SECRET: dev-secret-change-me
+      CORS_ORIGINS: http://localhost:3000
+    ports: ["8000:8000"]
+    volumes: ["./backend:/app"]
+    working_dir: /app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  web:
+    image: node:20-alpine
+    working_dir: /app
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+      NEXT_PUBLIC_WS_BASE: ws://localhost:8000
+    ports: ["3000:3000"]
+    volumes: ["./web:/app"]
+    command: sh -c "npm install && npm run dev"
+
+volumes:
+  pg:

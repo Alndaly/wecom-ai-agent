@@ -1,0 +1,23 @@
+# Python
+backend/.venv/
+backend/dev.db
+**/__pycache__/
+*.pyc
+*.egg-info/
+
+# Node
+web/node_modules/
+web/.next/
+web/.env.local
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+
+# Misc
+.DS_Store
+*.log
+/tmp/

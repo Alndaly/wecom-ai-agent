@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import get_db
+from app.deps import current_user
+from app.models import Contact, Conversation, Message, Robot, User
+from app.schemas import (
+    ConversationOut,
+    ConversationPatch,
+    MessageOut,
+    MessageSendIn,
+    MessageSendOut,
+    TaskOut,
+)
+from app.services.task_dispatcher import create_and_dispatch_send_text
+
+router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+
+@router.get("", response_model=list[ConversationOut])
+async def list_conversations(
+    robot_id: int | None = None,
+    unread_only: bool = False,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[Conversation]:
+    stmt = select(Conversation).where(Conversation.team_id == user.team_id)
+    if robot_id is not None:
+        stmt = stmt.where(Conversation.robot_id == robot_id)
+    if unread_only:
+        stmt = stmt.where(Conversation.unread_count > 0)
+    stmt = stmt.order_by(desc(Conversation.last_message_at)).limit(200)
+    rows = (await db.execute(stmt)).scalars().all()
+    return list(rows)
+
+
+async def _get_conv(db: AsyncSession, cid: int, team_id: int) -> Conversation:
+    conv = await db.get(Conversation, cid)
+    if not conv or conv.team_id != team_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
+    return conv
+
+
+@router.get("/{cid}", response_model=ConversationOut)
+async def get_conversation(
+    cid: int, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)
+) -> Conversation:
+    return await _get_conv(db, cid, user.team_id)
+
+
+@router.patch("/{cid}", response_model=ConversationOut)
+async def patch_conversation(
+    cid: int,
+    body: ConversationPatch,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Conversation:
+    conv = await _get_conv(db, cid, user.team_id)
+    conv.mode = body.mode
+    await db.commit()
+    await db.refresh(conv)
+    return conv
+
+
+@router.get("/{cid}/messages", response_model=list[MessageOut])
+async def list_messages(
+    cid: int,
+    before: datetime | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[Message]:
+    await _get_conv(db, cid, user.team_id)  # auth check
+    stmt = select(Message).where(Message.conversation_id == cid)
+    if before:
+        stmt = stmt.where(Message.created_at < before)
+    stmt = stmt.order_by(desc(Message.created_at)).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return list(reversed(rows))
+
+
+@router.post("/{cid}/messages", response_model=MessageSendOut)
+async def send_message(
+    cid: int,
+    body: MessageSendIn,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MessageSendOut:
+    conv = await _get_conv(db, cid, user.team_id)
+    robot = await db.get(Robot, conv.robot_id)
+    contact = await db.get(Contact, conv.contact_id)
+    if not robot or not contact:
+        raise HTTPException(status.HTTP_409_CONFLICT, "robot or contact missing")
+    msg, task = await create_and_dispatch_send_text(
+        db,
+        robot=robot,
+        conv=conv,
+        contact_external_id=contact.external_id,
+        text=body.content,
+        sender_type="human",
+        sender_id=user.id,
+    )
+    return MessageSendOut(
+        message=MessageOut.model_validate(msg),
+        task=TaskOut.model_validate(task),
+    )
