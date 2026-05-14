@@ -16,6 +16,11 @@ services:
       POSTGRES_PASSWORD: wecom
     ports: ["5432:5432"]
     volumes: ["pg:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wecom -d wecom"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   redis:
     image: redis:7-alpine
@@ -23,8 +28,15 @@ services:
 
   backend:
     build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      DATABASE_URL: sqlite+aiosqlite:///./dev.db
+      # Default to Postgres when running via compose; the backend's alembic
+      # migrations run on startup so the schema is always in sync. To run
+      # purely against SQLite for an offline dev session set
+      #   DATABASE_URL=sqlite+aiosqlite:///./dev.db
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://wecom:wecom@postgres:5432/wecom}
       JWT_SECRET: dev-secret-change-me
       CORS_ORIGINS: http://localhost:3000
       # rag profile defaults — override per-env / via /settings UI for LLM keys

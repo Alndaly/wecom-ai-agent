@@ -4,26 +4,29 @@ version = "0.1.0"
 description = "WeCom AI Agent — backend (FastAPI)"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
-    "pydantic[email]>=2.7",
-    "pydantic-settings>=2.3",
-    "sqlalchemy>=2.0",
-    "greenlet>=3.0",
-    "aiosqlite>=0.20",
-    "passlib[bcrypt]>=1.7",
-    "bcrypt<4",
-    "pyjwt>=2.8",
-    "python-multipart>=0.0.9",
-    "websockets>=12",
+    "fastapi>=0.136",
+    "uvicorn[standard]>=0.46",
+    "pydantic[email]>=2.13",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0.49",
+    "alembic>=1.18",
+    "greenlet>=3.1",
+    "aiosqlite>=0.22",
+    "psycopg[binary]>=3.3",
+    "asyncpg>=0.31",
+    "bcrypt>=4.2",
+    "pyjwt>=2.10",
+    "python-multipart>=0.0.20",
+    "websockets>=15",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27", "pytest-asyncio>=0.23"]
-milvus = ["pymilvus>=2.4"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+milvus = ["pymilvus>=2.5"]
 neo4j = ["neo4j>=5.20"]
-pdf = ["pypdf>=4.0"]
-real = ["pymilvus>=2.4", "neo4j>=5.20", "pypdf>=4.0"]
+pdf = ["pypdf>=5.0"]
+real = ["pymilvus>=2.5", "neo4j>=5.20", "pypdf>=5.0"]
 
 [build-system]
 requires = ["setuptools>=68"]

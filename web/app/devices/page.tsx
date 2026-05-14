@@ -2,8 +2,9 @@
 import { useEffect, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { api, type Robot } from "@/lib/api";
+import { formatFull } from "@/lib/datetime";
 import { useWebWs } from "@/lib/ws";
-import { toast } from "@/hooks/use-toast";
+import { toast } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -24,12 +25,24 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 export default function DevicesPage() {
   const [robots, setRobots] = useState<Robot[]>([]);
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
   const [justCreated, setJustCreated] = useState<{ robot: Robot; token: string } | null>(null);
+  const [toDelete, setToDelete] = useState<Robot | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   async function reload() {
     setRobots(await api<Robot[]>("/robots"));
@@ -59,16 +72,25 @@ export default function DevicesPage() {
       setName("");
       reload();
     } catch (e: any) {
-      toast({ title: "创建失败", description: e?.message ?? String(e), variant: "destructive" });
+      toast.error("创建失败", { description: e?.message ?? String(e) });
     } finally {
       setCreating(false);
     }
   }
 
-  async function remove(id: number) {
-    if (!confirm("确认删除该设备？")) return;
-    await api(`/robots/${id}`, { method: "DELETE" });
-    reload();
+  async function confirmDelete() {
+    if (!toDelete) return;
+    setDeleting(true);
+    try {
+      await api(`/robots/${toDelete.id}`, { method: "DELETE" });
+      setToDelete(null);
+      reload();
+      toast.success(`已删除设备 ${toDelete.name}`);
+    } catch (e: any) {
+      toast.error("删除失败", { description: e?.message ?? String(e) });
+    } finally {
+      setDeleting(false);
+    }
   }
 
   return (
@@ -132,10 +154,10 @@ export default function DevicesPage() {
                     </Badge>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {r.last_seen_at ? new Date(r.last_seen_at).toLocaleString() : "—"}
+                    {r.last_seen_at ? formatFull(r.last_seen_at) : "—"}
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button variant="ghost" size="icon" onClick={() => remove(r.id)}>
+                    <Button variant="ghost" size="icon" onClick={() => setToDelete(r)}>
                       <Trash2 className="h-4 w-4 text-destructive" />
                     </Button>
                   </TableCell>
@@ -176,7 +198,7 @@ export default function DevicesPage() {
               onClick={() => {
                 if (justCreated)
                   navigator.clipboard.writeText(justCreated.token).catch(() => {});
-                toast({ title: "已复制 token 到剪贴板" });
+                toast.success("已复制 token 到剪贴板");
               }}
             >
               复制 token
@@ -185,6 +207,34 @@ export default function DevicesPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog
+        open={!!toDelete}
+        onOpenChange={(o) => !o && !deleting && setToDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除设备 {toDelete?.name}？</AlertDialogTitle>
+            <AlertDialogDescription>
+              此操作不可恢复。该设备的 token 立即失效，下次启动需要重新生成。
+              历史会话和消息不会被删除。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault(); // keep dialog open while we wait for the request
+                confirmDelete();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -1,20 +1,35 @@
+from __future__ import annotations
+
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import jwt
-from passlib.context import CryptContext
 
 from .config import settings
 
-_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# bcrypt has a 72-byte input cap. Realistic passwords are well under,
+# but we truncate defensively so callers can't trigger the underlying
+# library's ValueError. (This matches passlib's documented behaviour
+# in 1.7.5+.)
+_BCRYPT_MAX = 72
+
+
+def _clip(b: bytes) -> bytes:
+    return b[:_BCRYPT_MAX]
 
 
 def hash_password(p: str) -> str:
-    return _pwd.hash(p)
+    hashed = bcrypt.hashpw(_clip(p.encode("utf-8")), bcrypt.gensalt())
+    return hashed.decode("utf-8")
 
 
 def verify_password(p: str, hashed: str) -> bool:
-    return _pwd.verify(p, hashed)
+    try:
+        return bcrypt.checkpw(_clip(p.encode("utf-8")), hashed.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
 
 
 def create_access_token(sub: str, extra: dict | None = None) -> str:

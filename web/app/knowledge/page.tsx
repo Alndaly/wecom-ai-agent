@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Plus } from "lucide-react";
 import { api, type KnowledgeBase } from "@/lib/api";
-import { toast } from "@/hooks/use-toast";
+import { toast } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -45,7 +45,7 @@ export default function KnowledgePage() {
       setOpen(false);
       reload();
     } catch (e: any) {
-      toast({ title: "创建失败", description: e?.message ?? String(e), variant: "destructive" });
+      toast.error("创建失败", { description: e?.message ?? String(e) });
     } finally {
       setCreating(false);
     }

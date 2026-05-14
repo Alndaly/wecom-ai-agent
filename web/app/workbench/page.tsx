@@ -2,8 +2,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Send, User2 } from "lucide-react";
 import { api, type Conversation, type Message } from "@/lib/api";
+import { formatClockTime, formatRelative } from "@/lib/datetime";
 import { useWebWs } from "@/lib/ws";
-import { toast } from "@/hooks/use-toast";
+import { toast } from "@/components/ui/sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -133,7 +134,7 @@ export default function WorkbenchPage() {
       reloadConvs().catch(() => {});
       if (!text) setDraft("");
     } catch (e: any) {
-      toast({ title: "发送失败", description: e?.message ?? String(e), variant: "destructive" });
+      toast.error("发送失败", { description: e?.message ?? String(e) });
     } finally {
       setSending(false);
     }
@@ -164,7 +165,7 @@ export default function WorkbenchPage() {
           )}
           {convs.map((c) => {
             const initial = (c.contact.nickname || c.contact.external_id).slice(0, 1);
-            const ts = c.last_message_at ? formatTs(c.last_message_at) : "";
+            const ts = c.last_message_at ? formatRelative(c.last_message_at) : "";
             // grid columns: avatar (auto) + content (1fr, can shrink); content
             // itself uses grid-cols-[minmax(0,1fr)_auto] for each row so the
             // text column is hard-capped and badges/timestamps never get
@@ -357,22 +358,6 @@ export default function WorkbenchPage() {
   );
 }
 
-function formatTs(iso: string): string {
-  const d = new Date(iso);
-  const now = new Date();
-  const sameDay =
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate();
-  if (sameDay) {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  }
-  const diffDays = Math.floor((now.getTime() - d.getTime()) / 86400000);
-  if (diffDays === 1) return "昨天";
-  if (diffDays < 7) return `${diffDays}天前`;
-  return d.toLocaleDateString([], { month: "2-digit", day: "2-digit" });
-}
-
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
@@ -434,7 +419,7 @@ function MessageBubble({ m }: { m: Message }) {
           <p className="whitespace-pre-wrap break-words">{m.content}</p>
         </div>
         <div className="text-[10px] text-muted-foreground">
-          {new Date(m.created_at).toLocaleTimeString()}
+          {formatClockTime(m.created_at)}
           {statusLabel && <span> · {statusLabel}</span>}
         </div>
       </div>

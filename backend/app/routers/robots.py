@@ -1,10 +1,12 @@
+import hashlib
+import hmac
 import secrets
-from passlib.hash import sha256_crypt
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import new_robot_token
 from app.deps import current_user
@@ -14,13 +16,19 @@ from app.schemas import RobotCreateIn, RobotCreateOut, RobotOut
 router = APIRouter(prefix="/robots", tags=["robots"])
 
 
+# Robot tokens are 32-byte URL-safe random strings (~256 bits of entropy).
+# We don't need bcrypt / argon2's slow KDF here — a brute-force search
+# against the hash is infeasible regardless. HMAC-SHA256 keyed by the
+# server's JWT secret gives us "DB leak ≠ token leak" without the
+# CPU / library-compatibility cost of passlib.
 def _hash_token(token: str) -> str:
-    # robot tokens are high-entropy; sha256 is fine here (avoid bcrypt 72-byte cap)
-    return sha256_crypt.hash(token, rounds=5000)
+    key = settings.jwt_secret.encode("utf-8")
+    return hmac.new(key, token.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def verify_robot_token(token: str, hashed: str) -> bool:
-    return sha256_crypt.verify(token, hashed)
+    expected = _hash_token(token)
+    return hmac.compare_digest(expected, hashed)
 
 
 @router.get("", response_model=list[RobotOut])

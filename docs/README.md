@@ -20,6 +20,7 @@
 | 12 | [术语表](12-glossary.md) | 名词约定 |
 | 13 | [接入真模型 / Milvus / Neo4j](13-real-providers.md) | 切真东西的完整步骤 |
 | 14 | [真机上手 + 企微 UI 校准](14-android-real-device.md) | Android 端日 1 部署手册 |
+| 15 | [数据库与迁移](15-database-migrations.md) | SQLite / Postgres + Alembic |
 | ADR | [架构决策](adr/README.md) | 关键技术选型记录 |
 
 ## 文档约定

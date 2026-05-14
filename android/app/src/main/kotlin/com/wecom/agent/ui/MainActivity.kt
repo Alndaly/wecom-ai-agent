@@ -157,10 +157,33 @@ class MainActivity : Activity() {
         }
         testSendBtn = Button(this).apply { text = "本地发送测试" }
 
+        val logHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 24, 0, 4)
+        }
+        val logTitleTv = TextView(this).apply {
+            text = "日志"
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
+            )
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        val clearLogBtn = Button(this).apply {
+            text = "清空日志"
+            setOnClickListener {
+                if (::logTv.isInitialized) {
+                    logTv.text = "日志:\n"
+                    appendLog("日志已清空")
+                }
+            }
+        }
+        logHeader.addView(logTitleTv)
+        logHeader.addView(clearLogBtn)
         logTv = TextView(this).apply {
             text = "日志:\n"
-            setPadding(0, 24, 0, 0)
             movementMethod = ScrollingMovementMethod()
+            // cap at ~2000 lines so the activity doesn't OOM on long-running sessions
+            setHorizontallyScrolling(false)
         }
 
         startBtn.setOnClickListener { onStartClicked(prefs, urlEt, ridEt, tokenEt) }
@@ -205,7 +228,7 @@ class MainActivity : Activity() {
             buildTv, urlEt, ridEt, tokenEt, dryCb, keepAwakeCb, startBtn, statusTv,
             permTv, permRow,
             calibTitle, dumpBtn, testContactEt, testTextEt, testSendBtn,
-            logTv,
+            logHeader, logTv,
         ).forEach { root.addView(it) }
         setContentView(scroll)
 
@@ -314,11 +337,25 @@ class MainActivity : Activity() {
     }
 
     // -------------------------------------------------------- helpers
+    private val maxLogLines = 500
+
     private fun appendLog(message: String) {
         val line = "${nowText()}  $message"
         Log.i(logTag, line)
-        if (::logTv.isInitialized) {
-            logTv.append("$line\n")
+        if (!::logTv.isInitialized) return
+        logTv.append("$line\n")
+        // bounded buffer — drop the oldest 25% when we exceed the cap
+        val text = logTv.text.toString()
+        val lineCount = text.count { it == '\n' }
+        if (lineCount > maxLogLines) {
+            val toDrop = lineCount - (maxLogLines * 3 / 4)
+            var idx = 0
+            repeat(toDrop) {
+                val nl = text.indexOf('\n', idx)
+                if (nl < 0) return
+                idx = nl + 1
+            }
+            logTv.text = "日志:（已截断,只保留最近 ${maxLogLines * 3 / 4} 行）\n" + text.substring(idx)
         }
     }
 

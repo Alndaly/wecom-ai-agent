@@ -8,7 +8,8 @@ import {
   type KnowledgeBase,
   type KnowledgeDoc,
 } from "@/lib/api";
-import { toast } from "@/hooks/use-toast";
+import { formatFull } from "@/lib/datetime";
+import { toast } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -68,10 +69,10 @@ export default function KBDetailPage() {
     fd.append("file", file);
     try {
       await apiForm(`/kb/${kbId}/docs`, fd);
-      toast({ title: "已上传,正在解析…" });
+      toast.success("已上传,正在解析…");
       reload();
     } catch (e: any) {
-      toast({ title: "上传失败", description: e?.message, variant: "destructive" });
+      toast.error("上传失败", { description: e?.message });
     }
   }
 
@@ -84,12 +85,12 @@ export default function KBDetailPage() {
       fd.append("name", pasteName);
       fd.append("content", pasteContent);
       await apiForm(`/kb/${kbId}/docs/paste`, fd);
-      toast({ title: "已粘贴,正在解析…" });
+      toast.success("已粘贴,正在解析…");
       setPasteName("");
       setPasteContent("");
       reload();
     } catch (e: any) {
-      toast({ title: "失败", description: e?.message, variant: "destructive" });
+      toast.error("失败", { description: e?.message });
     } finally {
       setBusyPaste(false);
     }
@@ -107,7 +108,7 @@ export default function KBDetailPage() {
       setHits(data.hits);
       setFacts(data.graph_facts);
     } catch (e: any) {
-      toast({ title: "搜索失败", description: e?.message, variant: "destructive" });
+      toast.error("搜索失败", { description: e?.message });
     } finally {
       setSearching(false);
     }
@@ -214,7 +215,7 @@ export default function KBDetailPage() {
                   <TableCell>{d.chunk_count}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{d.bytes}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {new Date(d.updated_at).toLocaleString()}
+                    {formatFull(d.updated_at)}
                   </TableCell>
                 </TableRow>
               ))}

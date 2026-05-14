@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { Save, Wand2, AlertCircle, CheckCircle2 } from "lucide-react";
 import { api } from "@/lib/api";
-import { toast } from "@/hooks/use-toast";
+import { toast } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -71,26 +71,28 @@ export default function SettingsPage() {
   const [retrieval, setRetrieval] = useState<RetrievalCfg | null>(null);
   const [ai, setAI] = useState<AIBehaviorCfg | null>(null);
   const [infra, setInfra] = useState<InfraCfg | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
 
-  async function reload() {
-    setLoading(true);
-    try {
-      const data = await api<any>("/settings");
-      setLlm(data.llm);
-      setEmbed(data.embedding);
-      setRetrieval(data.retrieval);
-      setAI(data.ai);
-      setInfra(data.infra);
-    } finally {
-      setLoading(false);
-    }
+  // Two distinct flows:
+  //   - first mount → show a loading state until we know the values
+  //   - after a save → silently refresh state; don't unmount the form
+  //                    (otherwise input focus jumps, cards remount, and the
+  //                    user perceives it as a full page refresh)
+  async function reload(): Promise<void> {
+    const data = await api<any>("/settings");
+    setLlm(data.llm);
+    setEmbed(data.embedding);
+    setRetrieval(data.retrieval);
+    setAI(data.ai);
+    setInfra(data.infra);
   }
   useEffect(() => {
-    reload().catch(console.error);
+    reload()
+      .catch(console.error)
+      .finally(() => setInitialLoading(false));
   }, []);
 
-  if (loading || !llm || !embed || !retrieval || !ai || !infra)
+  if (initialLoading || !llm || !embed || !retrieval || !ai || !infra)
     return <p className="text-sm text-muted-foreground">加载中…</p>;
 
   return (
@@ -125,11 +127,11 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
     setBusy(true);
     try {
       await api("/settings/llm", { method: "PUT", body: JSON.stringify(v) });
-      toast({ title: "LLM 配置已保存" });
+      toast.success("LLM 配置已保存");
       setV((cur) => ({ ...cur, api_key: "" }));
       onSaved();
     } catch (e: any) {
-      toast({ title: "保存失败", description: e?.message, variant: "destructive" });
+      toast.error("保存失败", { description: e?.message });
     } finally {
       setBusy(false);
     }
@@ -249,11 +251,11 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
     setBusy(true);
     try {
       await api("/settings/embedding", { method: "PUT", body: JSON.stringify(v) });
-      toast({ title: "Embedding 配置已保存" });
+      toast.success("Embedding 配置已保存");
       setV((cur) => ({ ...cur, api_key: "" }));
       onSaved();
     } catch (e: any) {
-      toast({ title: "保存失败", description: e?.message, variant: "destructive" });
+      toast.error("保存失败", { description: e?.message });
     } finally {
       setBusy(false);
     }
@@ -368,10 +370,10 @@ function RetrievalCard({ value, onSaved }: { value: RetrievalCfg; onSaved: () =>
     setBusy(true);
     try {
       await api("/settings/retrieval", { method: "PUT", body: JSON.stringify(v) });
-      toast({ title: "检索参数已保存" });
+      toast.success("检索参数已保存");
       onSaved();
     } catch (e: any) {
-      toast({ title: "保存失败", description: e?.message, variant: "destructive" });
+      toast.error("保存失败", { description: e?.message });
     } finally {
       setBusy(false);
     }
@@ -415,10 +417,10 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
     setBusy(true);
     try {
       await api("/settings/ai", { method: "PUT", body: JSON.stringify(v) });
-      toast({ title: "AI 行为已保存" });
+      toast.success("AI 行为已保存");
       onSaved();
     } catch (e: any) {
-      toast({ title: "保存失败", description: e?.message, variant: "destructive" });
+      toast.error("保存失败", { description: e?.message });
     } finally {
       setBusy(false);
     }

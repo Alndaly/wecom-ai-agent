@@ -127,6 +127,32 @@ backend/.venv/bin/python tools/real_smoke.py
 
 会写真配置 → 探活 → 入库 → 触发 AI 回复 → 断言回复确实引用了知识库事实 → 检查 `ai_reply_logs.model` 不再是 `mock`。
 
+### 9. 切到 Postgres（生产前提）
+
+后端启动时 **自动跑 Alembic 迁移**（`alembic upgrade head`），无需手动建表。本地、Docker、生产共用同一份迁移。
+
+```bash
+# Docker compose 自动用 Postgres：
+docker compose up postgres backend
+
+# 本地连一个独立 Postgres：
+export DATABASE_URL="postgresql+asyncpg://wecom:wecom@localhost:5432/wecom"
+cd backend && . .venv/bin/activate && uvicorn app.main:app --reload
+
+# 端到端针对真 Postgres 跑一遍：
+export PG_TEST_URL="postgresql+asyncpg://<user>:<pwd>@<host>:5432/wecom_ai_test"
+backend/.venv/bin/python tools/postgres_smoke.py
+```
+
+模型改动 → 生成新迁移：
+
+```bash
+cd backend && alembic revision --autogenerate -m "add foo column"
+# 审一遍生成的文件，重命名为 00NN_xxx.py，提交
+```
+
+完整说明见 [docs/15-database-migrations.md](docs/15-database-migrations.md)。
+
 ## 里程碑
 
 见 [docs/11-milestones.md](docs/11-milestones.md)。当前完成度：**MVP1 ✅ · MVP2 ✅ · MVP3 ✅**。
