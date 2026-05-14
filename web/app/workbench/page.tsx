@@ -33,6 +33,7 @@ export default function WorkbenchPage() {
   const [kbHits, setKbHits] = useState<Record<number, KBChunk[]>>({});
   const [memorySummary, setMemorySummary] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const active = useMemo(
     () => convs.find((c) => c.id === activeId) || null,
@@ -76,6 +77,13 @@ export default function WorkbenchPage() {
       if (el) el.scrollTop = el.scrollHeight;
     });
   }, [messages]);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${Math.min(el.scrollHeight, 176)}px`;
+  }, [draft]);
 
   useWebWs(
     useCallback(
@@ -153,13 +161,13 @@ export default function WorkbenchPage() {
   const activeKbHits = active ? kbHits[active.id] || [] : [];
 
   return (
-    <div className="grid h-full grid-cols-[18rem_1fr_20rem]">
+    <div className="grid h-full min-h-0 grid-cols-[18rem_minmax(0,1fr)_20rem] overflow-hidden">
       {/* left: conversations */}
-      <div className="flex flex-col border-r bg-background">
-        <div className="border-b px-4 py-3">
+      <div className="flex min-h-0 min-w-0 flex-col border-r bg-background">
+        <div className="shrink-0 border-b px-4 py-3">
           <h2 className="text-sm font-semibold">会话</h2>
         </div>
-        <ScrollArea className="flex-1">
+        <ScrollArea className="min-h-0 flex-1">
           {convs.length === 0 && (
             <p className="px-4 py-6 text-xs text-muted-foreground">暂无会话</p>
           )}
@@ -214,7 +222,7 @@ export default function WorkbenchPage() {
       </div>
 
       {/* center: chat */}
-      <div className="flex flex-col">
+      <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
         {!active && (
           <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
             选择左侧会话开始
@@ -222,7 +230,7 @@ export default function WorkbenchPage() {
         )}
         {active && (
           <>
-            <div className="flex items-center justify-between border-b bg-background px-4 py-3">
+            <div className="flex shrink-0 items-center justify-between border-b bg-background px-4 py-3">
               <div className="flex items-center gap-3">
                 <Avatar className="h-8 w-8">
                   <AvatarFallback>
@@ -248,17 +256,18 @@ export default function WorkbenchPage() {
               </Select>
             </div>
 
-            <ScrollArea className="flex-1">
-              <div ref={scrollRef} className="space-y-3 px-4 py-4">
+            <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+              <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col justify-end gap-3 px-5 py-4">
                 {messages.map((m) => (
                   <MessageBubble key={m.id} m={m} />
                 ))}
               </div>
-            </ScrollArea>
+            </div>
 
-            <div className="border-t bg-background p-3">
-              <div className="flex gap-2">
+            <div className="shrink-0 border-t bg-background/95 px-4 py-3">
+              <div className="mx-auto w-full max-w-4xl rounded-2xl border border-border/60 bg-background p-2 shadow-sm transition-shadow focus-within:border-border focus-within:shadow-md">
                 <Textarea
+                  ref={inputRef}
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={(e) => {
@@ -267,17 +276,21 @@ export default function WorkbenchPage() {
                       send();
                     }
                   }}
-                  placeholder="输入消息  (⌘/Ctrl + Enter 发送)"
-                  className="min-h-[64px] flex-1 resize-none"
+                  placeholder="输入消息"
+                  rows={1}
+                  className="max-h-44 min-h-[52px] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 text-sm leading-6 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 />
-                <Button
-                  onClick={() => send()}
-                  disabled={sending || !draft.trim()}
-                  className="self-end"
-                >
-                  <Send className="h-4 w-4" />
-                  发送
-                </Button>
+                <div className="flex justify-end px-1 pb-1">
+                  <Button
+                    size="icon"
+                    onClick={() => send()}
+                    disabled={sending || !draft.trim()}
+                    className="h-8 w-8 rounded-full"
+                    aria-label="发送"
+                  >
+                    <Send className="h-4 w-4" />
+                  </Button>
+                </div>
               </div>
             </div>
           </>
@@ -285,8 +298,8 @@ export default function WorkbenchPage() {
       </div>
 
       {/* right: panel */}
-      <div className="flex flex-col border-l bg-background">
-        <ScrollArea className="flex-1">
+      <div className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l bg-background">
+        <ScrollArea className="min-h-0 flex-1">
           <div className="space-y-4 p-4">
             <Section title="客户">
               {active ? (
@@ -371,9 +384,11 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-2 text-xs">
+    <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2 text-xs">
       <span className="text-muted-foreground">{label}</span>
-      <span className={cn("text-foreground", mono && "font-mono")}>{value}</span>
+      <span className={cn("truncate text-right text-foreground", mono && "font-mono")}>
+        {value}
+      </span>
     </div>
   );
 }
@@ -392,7 +407,12 @@ function MessageBubble({ m }: { m: Message }) {
 
   return (
     <div className={cn("flex", isOut ? "justify-end" : "justify-start")}>
-      <div className={cn("max-w-[75%]", isOut ? "items-end" : "items-start", "flex flex-col gap-1")}>
+      <div
+        className={cn(
+          "flex max-w-[min(78%,44rem)] flex-col gap-1",
+          isOut ? "items-end" : "items-start"
+        )}
+      >
         {isOut && (
           <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
             {isAI ? (
@@ -416,7 +436,7 @@ function MessageBubble({ m }: { m: Message }) {
               : "bg-card border"
           )}
         >
-          <p className="whitespace-pre-wrap break-words">{m.content}</p>
+          <p className="whitespace-pre-wrap break-words leading-6">{m.content}</p>
         </div>
         <div className="text-[10px] text-muted-foreground">
           {formatClockTime(m.created_at)}

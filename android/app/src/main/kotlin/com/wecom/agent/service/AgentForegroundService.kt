@@ -3,21 +3,27 @@ package com.wecom.agent.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.wecom.agent.R
 import com.wecom.agent.model.Contact
+import com.wecom.agent.model.DeviceCommandAckPayload
 import com.wecom.agent.model.HeartbeatPayload
 import com.wecom.agent.model.MessageReceivedPayload
+import com.wecom.agent.model.ScreenFramePayload
 import com.wecom.agent.model.TaskAckPayload
 import com.wecom.agent.model.TaskDispatchPayload
 import com.wecom.agent.net.BackendClient
 import kotlinx.coroutines.*
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.util.Date
@@ -36,11 +42,14 @@ class AgentForegroundService : Service() {
         const val EXTRA_ROBOT_ID = "robot_id"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_DRY_RUN = "dry_run"
+        const val EXTRA_A11Y_INGEST = "a11y_ingest"
         const val ACTION_STOP = "com.wecom.agent.ACTION_STOP"
         const val ACTION_STATE_CHANGED = "com.wecom.agent.ACTION_STATE_CHANGED"
         const val ACTION_LOG = "com.wecom.agent.ACTION_LOG"
         const val ACTION_DUMP_UI = "com.wecom.agent.ACTION_DUMP_UI"
         const val ACTION_SEND_TEST = "com.wecom.agent.ACTION_SEND_TEST"
+        const val ACTION_SET_DRY_RUN = "com.wecom.agent.ACTION_SET_DRY_RUN"
+        const val ACTION_SET_A11Y_INGEST = "com.wecom.agent.ACTION_SET_A11Y_INGEST"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
         const val EXTRA_TEST_CONTACT = "test_contact"
@@ -53,8 +62,10 @@ class AgentForegroundService : Service() {
     private var client: BackendClient? = null
     private var executor: TaskExecutor? = null
     private var heartbeatJob: Job? = null
+    private var screenStreamJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var connected = false
+    @Volatile private var a11yInboundEnabled = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -80,6 +91,17 @@ class AgentForegroundService : Service() {
                 }
                 return START_NOT_STICKY
             }
+            ACTION_SET_DRY_RUN -> {
+                val dryRun = intent.getBooleanExtra(EXTRA_DRY_RUN, false)
+                executor?.dryRun = dryRun
+                broadcastLog("dry_run 已即时更新为 $dryRun")
+                return if (executor == null) START_NOT_STICKY else START_STICKY
+            }
+            ACTION_SET_A11Y_INGEST -> {
+                a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
+                broadcastLog("无障碍消息采集已即时更新为 $a11yInboundEnabled")
+                return START_STICKY
+            }
         }
 
         ensureChannel()
@@ -90,13 +112,22 @@ class AgentForegroundService : Service() {
         val rid = intent.getStringExtra(EXTRA_ROBOT_ID) ?: return START_NOT_STICKY
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: return START_NOT_STICKY
         val dryRun = intent.getBooleanExtra(EXTRA_DRY_RUN, false)
-        Log.i(tag, "service starting base=$base robot_id=$rid token_len=${token.length} dryRun=$dryRun")
+        a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
+        Log.i(tag, "service starting base=$base robot_id=$rid token_len=${token.length} dryRun=$dryRun a11yInbound=$a11yInboundEnabled")
         updateNotification("connecting $rid")
         broadcastState("connecting")
         broadcastLog("服务启动，正在连接 $base${if (dryRun) " (dry-run)" else ""}")
 
         // executor + UI listeners — kept alive for the service lifetime
-        executor = TaskExecutor(applicationContext) { msg -> broadcastLog(msg) }.also {
+        executor = TaskExecutor(
+            applicationContext,
+            { msg -> broadcastLog(msg) },
+            onTaskLog = { taskId, level, message ->
+                scope.launch {
+                    appendTaskLog(taskId, level, message)
+                }
+            },
+        ).also {
             it.dryRun = dryRun
         }
 
@@ -105,7 +136,9 @@ class AgentForegroundService : Service() {
             forwardInboundMessage(sender, content, postTime, viaNotification = true)
         }
         WeComAccessibilityService.onChatMessage = { sender, content ->
-            forwardInboundMessage(sender, content, System.currentTimeMillis(), viaNotification = false)
+            if (a11yInboundEnabled) {
+                forwardInboundMessage(sender, content, System.currentTimeMillis(), viaNotification = false)
+            }
         }
 
         client?.stop()
@@ -130,14 +163,14 @@ class AgentForegroundService : Service() {
             if (!isActive) return@launch
             client?.sendEvent(
                 "device.hello",
-                json.encodeToJsonElement(HeartbeatPayload.serializer(), HeartbeatPayload(current_page = currentPage())),
+                json.encodeToJsonElement(HeartbeatPayload.serializer(), heartbeatPayload(includeDeviceInfo = true)),
             )
             broadcastLog("已发送 device.hello")
             while (isActive) {
                 delay(30_000L)
                 client?.sendEvent(
                     "device.heartbeat",
-                    json.encodeToJsonElement(HeartbeatPayload.serializer(), HeartbeatPayload(current_page = currentPage())),
+                    json.encodeToJsonElement(HeartbeatPayload.serializer(), heartbeatPayload(includeDeviceInfo = true)),
                 )
             }
         }
@@ -146,6 +179,7 @@ class AgentForegroundService : Service() {
 
     override fun onDestroy() {
         heartbeatJob?.cancel()
+        screenStreamJob?.cancel()
         client?.stop()
         MessageNotificationListener.onMessage = null
         WeComAccessibilityService.onChatMessage = null
@@ -190,7 +224,29 @@ class AgentForegroundService : Service() {
     private fun currentPage(): String =
         WeComAccessibilityService.instance?.currentPage?.name ?: "UNKNOWN"
 
-    private suspend fun dumpAndUpload(reason: String) {
+    private fun heartbeatPayload(includeDeviceInfo: Boolean = false): HeartbeatPayload {
+        val metrics = resources.displayMetrics
+        val versionName = runCatching {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        }.getOrNull()
+        val deviceName = runCatching {
+            Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME)
+        }.getOrNull()
+        return HeartbeatPayload(
+            current_page = currentPage(),
+            device_type = if (includeDeviceInfo) "android" else null,
+            device_name = if (includeDeviceInfo) deviceName ?: Build.MODEL else null,
+            manufacturer = if (includeDeviceInfo) Build.MANUFACTURER else null,
+            model = if (includeDeviceInfo) Build.MODEL else null,
+            android_version = if (includeDeviceInfo) Build.VERSION.RELEASE else null,
+            sdk_int = if (includeDeviceInfo) Build.VERSION.SDK_INT else null,
+            app_version = if (includeDeviceInfo) versionName else null,
+            screen_width = if (includeDeviceInfo) metrics.widthPixels else null,
+            screen_height = if (includeDeviceInfo) metrics.heightPixels else null,
+        )
+    }
+
+    private suspend fun dumpAndUpload(reason: String, requestId: String? = null) {
         val svc = WeComAccessibilityService.instance
         if (svc == null) {
             broadcastLog("无障碍服务未启用，无法采集 UI 树")
@@ -200,7 +256,12 @@ class AgentForegroundService : Service() {
         broadcastLog("UI 树共 ${tree.length} 字符，已写入 logcat 并尝试上传后端")
         val payload = json.encodeToJsonElement(
             com.wecom.agent.model.UiDumpPayload.serializer(),
-            com.wecom.agent.model.UiDumpPayload(reason = reason, current_page = currentPage(), tree = tree),
+            com.wecom.agent.model.UiDumpPayload(
+                reason = reason,
+                request_id = requestId,
+                current_page = currentPage(),
+                tree = tree,
+            ),
         )
         val ok = client?.sendEvent("device.ui_dump", payload) == true
         broadcastLog(if (ok) "UI 树已上传" else "UI 树未上传（未连接后端）")
@@ -219,6 +280,21 @@ class AgentForegroundService : Service() {
         val task = TaskDispatchPayload(task_id = -1L, type = "send_text", payload = payload)
         val r = ex.run(task)
         broadcastLog(if (r.success) "本地测试发送成功" else "本地测试失败: ${r.error}")
+    }
+
+    private suspend fun appendTaskLog(taskId: Long?, level: String, message: String) {
+        if (taskId == null) {
+            broadcastLog("任务日志未发送：未连接后端")
+            return
+        }
+        val payload = kotlinx.serialization.json.JsonObject(
+            mapOf(
+                "task_id" to kotlinx.serialization.json.JsonPrimitive(taskId),
+                "level" to kotlinx.serialization.json.JsonPrimitive(level),
+                "message" to kotlinx.serialization.json.JsonPrimitive(message),
+            )
+        )
+        client?.sendEvent("task.log", payload)
     }
 
     private fun handleEvent(event: String, payload: JsonElement?) {
@@ -244,9 +320,68 @@ class AgentForegroundService : Service() {
                 }
             }
             "device.command" -> {
-                // MVP1b: nothing yet — screenshot / recalibrate live here later
+                val obj = payload?.jsonObject ?: return
+                val command = obj["command"]?.jsonPrimitive?.contentOrNull
+                when (command) {
+                    "dump_ui" -> {
+                        val requestId = obj["request_id"]?.jsonPrimitive?.contentOrNull
+                        val reason = obj["reason"]?.jsonPrimitive?.contentOrNull ?: "remote"
+                        scope.launch { dumpAndUpload(reason, requestId) }
+                    }
+                    "screen_start" -> {
+                        val intervalMs = obj["interval_ms"]?.jsonPrimitive?.contentOrNull
+                            ?.toLongOrNull()
+                            ?.coerceIn(500L, 5_000L)
+                            ?: 1_000L
+                        startScreenStream(intervalMs)
+                    }
+                    "screen_stop" -> stopScreenStream()
+                    else -> {
+                        sendCommandAck(command ?: "unknown", false, "未知设备命令")
+                        broadcastLog("未知设备命令：$command")
+                    }
+                }
             }
         }
+    }
+
+    private fun startScreenStream(intervalMs: Long) {
+        screenStreamJob?.cancel()
+        sendCommandAck("screen_start", true, "实时屏幕已开启")
+        screenStreamJob = scope.launch {
+            broadcastLog("实时屏幕已开启，间隔 ${intervalMs}ms")
+            while (isActive) {
+                sendScreenFrame()
+                delay(intervalMs)
+            }
+        }
+    }
+
+    private fun stopScreenStream() {
+        screenStreamJob?.cancel()
+        screenStreamJob = null
+        sendCommandAck("screen_stop", true, "实时屏幕已关闭")
+        broadcastLog("实时屏幕已关闭")
+    }
+
+    private fun sendCommandAck(command: String, ok: Boolean, message: String? = null) {
+        val payload = json.encodeToJsonElement(
+            DeviceCommandAckPayload.serializer(),
+            DeviceCommandAckPayload(command = command, ok = ok, message = message),
+        )
+        client?.sendEvent("device.command_ack", payload)
+    }
+
+    private suspend fun sendScreenFrame() {
+        val svc = WeComAccessibilityService.instance
+        val frame = if (svc == null) {
+            ScreenFramePayload(error = "无障碍服务未启用，无法截图")
+        } else {
+            svc.captureScreenJpegBase64(quality = 55)
+        }
+        val payload = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
+        val ok = client?.sendEvent("device.screen_frame", payload) == true
+        if (!ok) broadcastLog("屏幕帧上传失败（未连接后端）")
     }
 
     private fun forwardInboundMessage(

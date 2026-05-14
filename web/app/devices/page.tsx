@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { Copy, Eye, FileSearch, Loader2, Plus, Trash2 } from "lucide-react";
 import { api, type Robot } from "@/lib/api";
 import { formatFull } from "@/lib/datetime";
 import { useWebWs } from "@/lib/ws";
@@ -43,6 +44,17 @@ export default function DevicesPage() {
   const [justCreated, setJustCreated] = useState<{ robot: Robot; token: string } | null>(null);
   const [toDelete, setToDelete] = useState<Robot | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [dumpingRobotId, setDumpingRobotId] = useState<number | null>(null);
+  const [pendingDumpRequest, setPendingDumpRequest] = useState<string | null>(null);
+  const [uiDump, setUiDump] = useState<{
+    request_id: string | null;
+    robot_id: string;
+    current_page: string;
+    reason: string;
+    tree: string;
+    path: string;
+    created_at: string;
+  } | null>(null);
 
   async function reload() {
     setRobots(await api<Robot[]>("/robots"));
@@ -56,6 +68,20 @@ export default function DevicesPage() {
       setRobots((prev) =>
         prev.map((r) => (r.robot_id === payload.robot_id ? { ...r, status: payload.status } : r))
       );
+    }
+    if (event === "robot.updated") {
+      setRobots((prev) =>
+        prev.map((r) => (r.robot_id === payload.robot_id ? { ...r, ...payload } : r))
+      );
+    }
+    if (event === "device.ui_dump") {
+      if (pendingDumpRequest && payload.request_id && payload.request_id !== pendingDumpRequest) return;
+      setUiDump(payload);
+      setDumpingRobotId(null);
+      setPendingDumpRequest(null);
+      toast.success("UI 树已回传", {
+        description: `${payload.robot_id} · ${payload.current_page ?? "UNKNOWN"}`,
+      });
     }
   });
 
@@ -90,6 +116,23 @@ export default function DevicesPage() {
       toast.error("删除失败", { description: e?.message ?? String(e) });
     } finally {
       setDeleting(false);
+    }
+  }
+
+  async function requestUiDump(robot: Robot) {
+    setDumpingRobotId(robot.id);
+    try {
+      const data = await api<{ request_id: string; dispatched: boolean }>(
+        `/robots/${robot.id}/ui-dump`,
+        { method: "POST" }
+      );
+      setPendingDumpRequest(data.request_id);
+      toast.success("已请求采集 UI 树", {
+        description: "请保持目标应用在手机前台，回传后会自动弹出。",
+      });
+    } catch (e: any) {
+      setDumpingRobotId(null);
+      toast.error("请求失败", { description: e?.message ?? String(e) });
     }
   }
 
@@ -132,7 +175,7 @@ export default function DevicesPage() {
                 <TableHead>robot_id</TableHead>
                 <TableHead>状态</TableHead>
                 <TableHead>最近上线</TableHead>
-                <TableHead className="w-16"></TableHead>
+                <TableHead className="w-28"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -146,7 +189,11 @@ export default function DevicesPage() {
               {robots.map((r) => (
                 <TableRow key={r.id}>
                   <TableCell>{r.id}</TableCell>
-                  <TableCell>{r.name}</TableCell>
+                  <TableCell>
+                    <Link href={`/devices/${r.id}`} className="font-medium hover:underline">
+                      {r.name}
+                    </Link>
+                  </TableCell>
                   <TableCell className="font-mono text-xs">{r.robot_id}</TableCell>
                   <TableCell>
                     <Badge variant={r.status === "online" ? "success" : "secondary"}>
@@ -157,9 +204,34 @@ export default function DevicesPage() {
                     {r.last_seen_at ? formatFull(r.last_seen_at) : "—"}
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button variant="ghost" size="icon" onClick={() => setToDelete(r)}>
-                      <Trash2 className="h-4 w-4 text-destructive" />
-                    </Button>
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        asChild
+                        variant="ghost"
+                        size="icon"
+                        title="查看设备详情"
+                      >
+                        <Link href={`/devices/${r.id}`}>
+                          <Eye className="h-4 w-4" />
+                        </Link>
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="获取当前 UI 树"
+                        disabled={r.status !== "online" || dumpingRobotId === r.id}
+                        onClick={() => requestUiDump(r)}
+                      >
+                        {dumpingRobotId === r.id ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <FileSearch className="h-4 w-4" />
+                        )}
+                      </Button>
+                      <Button variant="ghost" size="icon" onClick={() => setToDelete(r)}>
+                        <Trash2 className="h-4 w-4 text-destructive" />
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -204,6 +276,44 @@ export default function DevicesPage() {
               复制 token
             </Button>
             <Button onClick={() => setJustCreated(null)}>我已保存</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!uiDump} onOpenChange={(o) => !o && setUiDump(null)}>
+        <DialogContent className="max-w-5xl">
+          <DialogHeader>
+            <DialogTitle>当前 UI 树</DialogTitle>
+            <DialogDescription>
+              {uiDump
+                ? `${uiDump.robot_id} · ${uiDump.current_page} · ${formatFull(uiDump.created_at)}`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+          {uiDump && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>request_id: {uiDump.request_id ?? "manual"}</span>
+                <span>reason: {uiDump.reason}</span>
+                <span>saved: {uiDump.path}</span>
+              </div>
+              <pre className="max-h-[60vh] overflow-auto rounded-md border bg-muted p-3 font-mono text-xs leading-relaxed">
+                {uiDump.tree}
+              </pre>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (uiDump) navigator.clipboard.writeText(uiDump.tree).catch(() => {});
+                toast.success("已复制 UI 树");
+              }}
+            >
+              <Copy className="h-4 w-4" />
+              复制
+            </Button>
+            <Button onClick={() => setUiDump(null)}>关闭</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

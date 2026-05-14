@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef } from "react";
-import { WS_BASE, getToken } from "./api";
+import { WS_BASE, getToken, refreshAccessToken } from "./api";
 
 type Handler = (event: string, payload: any) => void;
 
@@ -13,12 +13,12 @@ export function useWebWs(onEvent: Handler) {
   }, [onEvent]);
 
   useEffect(() => {
-    const token = getToken();
-    if (!token) return;
     let stopped = false;
     let pingTimer: ReturnType<typeof setInterval> | null = null;
 
     const connect = () => {
+      const token = getToken();
+      if (!token) return;
       const ws = new WebSocket(`${WS_BASE}/ws/web?token=${encodeURIComponent(token)}`);
       ref.current = ws;
       ws.onmessage = (e) => {
@@ -36,9 +36,14 @@ export function useWebWs(onEvent: Handler) {
           } catch {}
         }, 30_000);
       };
-      ws.onclose = () => {
+      ws.onclose = async (event) => {
         if (pingTimer) clearInterval(pingTimer);
-        if (!stopped) setTimeout(connect, 2000);
+        if (stopped) return;
+        if (event.code === 4401) {
+          const refreshed = await refreshAccessToken();
+          if (!refreshed) return;
+        }
+        setTimeout(connect, 2000);
       };
     };
     connect();

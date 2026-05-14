@@ -3,6 +3,7 @@
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeNotificationStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canTakeScreenshot="true"
     android:canRetrieveWindowContent="true"
     android:packageNames="com.tencent.wework"
     android:notificationTimeout="100" />

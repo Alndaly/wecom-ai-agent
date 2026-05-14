@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     private lateinit var batteryBtn: Button
     private lateinit var dryCb: CheckBox
     private lateinit var keepAwakeCb: CheckBox
+    private lateinit var a11yIngestCb: CheckBox
     private lateinit var dumpBtn: Button
     private lateinit var testContactEt: EditText
     private lateinit var testTextEt: EditText
@@ -118,6 +119,19 @@ class MainActivity : Activity() {
                 prefs.edit().putBoolean("keep_screen_on", checked).apply()
                 applyKeepScreenOn(checked)
                 appendLog(if (checked) "已开启屏幕常亮" else "已关闭屏幕常亮")
+            }
+        }
+        a11yIngestCb = CheckBox(this).apply {
+            text = "无障碍采集聊天消息（实验性，默认关闭）"
+            isChecked = prefs.getBoolean("a11y_ingest", false)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean("a11y_ingest", checked).apply()
+                val intent = Intent(this@MainActivity, AgentForegroundService::class.java).apply {
+                    action = AgentForegroundService.ACTION_SET_A11Y_INGEST
+                    putExtra(AgentForegroundService.EXTRA_A11Y_INGEST, checked)
+                }
+                startService(intent)
+                appendLog("无障碍消息采集 = $checked")
             }
         }
         // apply once at startup
@@ -221,11 +235,16 @@ class MainActivity : Activity() {
         }
         dryCb.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean("dry_run", checked).apply()
-            appendLog("dry_run = $checked （下次启动 Agent 生效）")
+            val intent = Intent(this, AgentForegroundService::class.java).apply {
+                action = AgentForegroundService.ACTION_SET_DRY_RUN
+                putExtra(AgentForegroundService.EXTRA_DRY_RUN, checked)
+            }
+            startService(intent)
+            appendLog("dry_run = $checked （已请求即时生效）")
         }
 
         listOf(
-            buildTv, urlEt, ridEt, tokenEt, dryCb, keepAwakeCb, startBtn, statusTv,
+            buildTv, urlEt, ridEt, tokenEt, dryCb, keepAwakeCb, a11yIngestCb, startBtn, statusTv,
             permTv, permRow,
             calibTitle, dumpBtn, testContactEt, testTextEt, testSendBtn,
             logHeader, logTv,
@@ -288,6 +307,7 @@ class MainActivity : Activity() {
                 putExtra(AgentForegroundService.EXTRA_ROBOT_ID, rid)
                 putExtra(AgentForegroundService.EXTRA_TOKEN, token)
                 putExtra(AgentForegroundService.EXTRA_DRY_RUN, dryCb.isChecked)
+                putExtra(AgentForegroundService.EXTRA_A11Y_INGEST, a11yIngestCb.isChecked)
             }
             startForegroundService(intent)
             agentState = "正在连接后端..."

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-me"
     jwt_algorithm: str = "HS256"
     jwt_expire_min: int = 60 * 24
+    jwt_refresh_expire_days: int = 30
     cors_origins: str = "http://localhost:3000"
     log_level: str = "INFO"
 

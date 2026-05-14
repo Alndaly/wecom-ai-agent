@@ -36,8 +36,21 @@ def create_access_token(sub: str, extra: dict | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": sub,
+        "typ": "access",
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.jwt_expire_min)).timestamp()),
+        **(extra or {}),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def create_refresh_token(sub: str, extra: dict | None = None) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": sub,
+        "typ": "refresh",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=settings.jwt_refresh_expire_days)).timestamp()),
         **(extra or {}),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)

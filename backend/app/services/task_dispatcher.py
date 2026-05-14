@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ws_manager import hub
-from app.models import Conversation, Message, Robot, RobotTask
+from app.models import Conversation, Message, Robot, RobotTask, RobotTaskLog
 from app.schemas import MessageOut, TaskOut
 
 
@@ -42,6 +42,7 @@ async def create_and_dispatch_send_text(
     )
     db.add(task)
     await db.flush()
+    db.add(RobotTaskLog(robot_id=robot.id, task_id=task.id, level="info", message=f"task created: send_text contact={contact_external_id}"))
 
     msg.task_id = task.id
     conv.last_message_at = msg.created_at
@@ -64,6 +65,7 @@ async def _try_dispatch(db: AsyncSession, robot: Robot, task: RobotTask) -> None
     )
     if delivered:
         task.status = "dispatched"
+        db.add(RobotTaskLog(robot_id=robot.id, task_id=task.id, level="info", message="task dispatched to android"))
         await db.commit()
         await db.refresh(task)
 
@@ -82,6 +84,7 @@ async def update_task_on_callback(
     task.status = status
     if error:
         task.last_error = error
+        db.add(RobotTaskLog(robot_id=robot.id, task_id=task.id, level="error", message=error))
     if task.message_id:
         msg = await db.get(Message, task.message_id)
         if msg:
@@ -98,6 +101,28 @@ async def update_task_on_callback(
         robot.team_id,
         "task.updated",
         {"task_id": task.id, "status": task.status, "error": task.last_error},
+    )
+
+
+async def append_task_log(
+    db: AsyncSession,
+    *,
+    robot: Robot,
+    task_id: int | None,
+    level: str,
+    message: str,
+) -> None:
+    db.add(RobotTaskLog(robot_id=robot.id, task_id=task_id, level=level, message=message))
+    await db.commit()
+    await hub.broadcast_web(
+        robot.team_id,
+        "task.log",
+        {
+            "robot_id": robot.robot_id,
+            "task_id": task_id,
+            "level": level,
+            "message": message,
+        },
     )
 
 

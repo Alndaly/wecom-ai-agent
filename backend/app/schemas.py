@@ -18,7 +18,12 @@ class LoginIn(BaseModel):
 
 class TokenOut(BaseModel):
     access_token: str
+    refresh_token: str | None = None
     token_type: str = "bearer"
+
+
+class RefreshTokenIn(BaseModel):
+    refresh_token: str
 
 
 class UserOut(ORM):
@@ -39,6 +44,15 @@ class RobotOut(ORM):
     robot_id: str
     status: str
     current_page: str | None = None
+    device_type: str | None = None
+    device_name: str | None = None
+    manufacturer: str | None = None
+    model: str | None = None
+    android_version: str | None = None
+    sdk_int: int | None = None
+    app_version: str | None = None
+    screen_width: int | None = None
+    screen_height: int | None = None
     last_seen_at: datetime | None = None
     created_at: datetime
 
@@ -46,6 +60,24 @@ class RobotOut(ORM):
 class RobotCreateOut(BaseModel):
     robot: RobotOut
     token: str  # one-time, plaintext
+
+
+class RobotUiDumpRequestOut(BaseModel):
+    request_id: str
+    dispatched: bool
+
+
+class RobotCommandOut(BaseModel):
+    dispatched: bool
+
+
+class RobotTaskLogOut(ORM):
+    id: int
+    robot_id: int
+    task_id: int | None
+    level: str
+    message: str
+    created_at: datetime
 
 
 # ---------- contacts / conversations ----------

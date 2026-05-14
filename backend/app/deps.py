@@ -20,6 +20,8 @@ async def current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
     try:
         payload = decode_token(token)
+        if payload.get("typ") == "refresh":
+            raise ValueError("refresh token cannot authorize requests")
         uid = int(payload["sub"])
     except Exception:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token")

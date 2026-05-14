@@ -39,11 +39,37 @@ data class TaskAckPayload(
 data class HeartbeatPayload(
     val current_page: String? = null,
     val battery: Int? = null,
+    val device_type: String? = null,
+    val device_name: String? = null,
+    val manufacturer: String? = null,
+    val model: String? = null,
+    val android_version: String? = null,
+    val sdk_int: Int? = null,
+    val app_version: String? = null,
+    val screen_width: Int? = null,
+    val screen_height: Int? = null,
 )
 
 @Serializable
 data class UiDumpPayload(
     val reason: String,
+    val request_id: String? = null,
     val current_page: String? = null,
     val tree: String,
+)
+
+@Serializable
+data class ScreenFramePayload(
+    val image: String? = null,
+    val mime: String = "image/jpeg",
+    val width: Int? = null,
+    val height: Int? = null,
+    val error: String? = null,
+)
+
+@Serializable
+data class DeviceCommandAckPayload(
+    val command: String,
+    val ok: Boolean,
+    val message: String? = null,
 )

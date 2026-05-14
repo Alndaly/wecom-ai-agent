@@ -21,10 +21,11 @@ data class TaskResult(val success: Boolean, val error: String? = null)
 class TaskExecutor(
     private val ctx: Context,
     private val logSink: (String) -> Unit,
+    private val onTaskLog: (suspend (Long?, String, String) -> Unit)? = null,
 ) {
     private val tag = "TaskExecutor"
     private val mutex = Mutex()
-    private val automator = WeComAutomator(ctx) { msg -> logSink(msg) }
+    private val automator = WeComAutomator(ctx, { msg -> logSink(msg) })
 
     @Volatile var dryRun: Boolean = false
 
@@ -46,6 +47,7 @@ class TaskExecutor(
             return TaskResult(false, "missing fields")
         }
 
+        logSink("执行 send_text，dry_run=$dryRun")
         if (dryRun) {
             logSink("[dry-run] send_text → $contactExternalId : $text")
             Log.i(tag, "[dry-run] send_text → $contactExternalId : $text")
@@ -55,10 +57,10 @@ class TaskExecutor(
 
         logSink("发送消息 → $contactExternalId")
         val err = automator.sendText(contactName = contactExternalId, text = text)
-        return if (err == null) TaskResult(true)
-        else {
+        if (err == null) return TaskResult(true)
+        onTaskLog?.invoke(task.task_id, "error", err)
+        return TaskResult(false, err).also {
             Log.w(tag, "send_text failed: $err")
-            TaskResult(false, err)
         }
     }
 }

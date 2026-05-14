@@ -50,6 +50,15 @@ class Robot(Base):
     token_hash: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(16), default="offline")  # offline/online/busy
     current_page: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    device_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    device_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    manufacturer: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    android_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sdk_int: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    app_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    screen_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    screen_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -125,6 +134,18 @@ class RobotTask(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class RobotTaskLog(Base):
+    __tablename__ = "robot_task_logs"
+    __table_args__ = (Index("ix_task_log_task_created", "task_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    robot_id: Mapped[int] = mapped_column(ForeignKey("robots.id"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("robot_tasks.id"), nullable=True, index=True)
+    level: Mapped[str] = mapped_column(String(16), default="info")
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AIPrompt(Base):

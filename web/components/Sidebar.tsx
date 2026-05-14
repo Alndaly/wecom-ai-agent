@@ -4,6 +4,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { Bot, BookOpen, MessageSquare, Settings, Smartphone, LogOut } from "lucide-react";
 import { setToken } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { cn } from "@/lib/utils";
 
 const items = [
@@ -43,7 +44,8 @@ export function Sidebar() {
           );
         })}
       </nav>
-      <div className="p-3 border-t">
+      <div className="space-y-3 border-t p-3">
+        <ThemeToggle />
         <Button
           variant="ghost"
           size="sm"

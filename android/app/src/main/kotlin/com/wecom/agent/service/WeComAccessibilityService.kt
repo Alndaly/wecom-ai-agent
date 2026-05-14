@@ -1,9 +1,16 @@
 package com.wecom.agent.service
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Bitmap
+import android.os.Build
+import android.util.Base64
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.wecom.agent.model.ScreenFramePayload
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.io.ByteArrayOutputStream
+import kotlin.coroutines.resume
 
 /**
  * Singleton accessibility service for WeCom. Two jobs:
@@ -36,9 +43,11 @@ class WeComAccessibilityService : AccessibilityService() {
     @Volatile var currentChatTitle: String? = null
         private set
 
-    /** Dedupe per-session: we never re-fire the same (sender, content) within 30s. */
+    /** Dedupe per-session: we never re-fire the same (sender, content) within a short window. */
     private val recent = ArrayDeque<Triple<String, String, Long>>()
-    private val recentTtlMs = 30_000L
+    private val recentTtlMs = 10 * 60_000L
+    private var baselineChatTitle: String? = null
+    private var baselineReady = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -50,8 +59,7 @@ class WeComAccessibilityService : AccessibilityService() {
         event ?: return
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> updatePage(event)
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 if (currentPage == Page.CHAT) maybeHarvestChat()
             }
             else -> Unit
@@ -68,6 +76,50 @@ class WeComAccessibilityService : AccessibilityService() {
         }
         out.append("=== UI dump pkg=").append(root.packageName).append(" page=").append(currentPage).append(" ===\n")
         walk(root, 0, out)
+    }
+
+    suspend fun captureScreenJpegBase64(quality: Int = 55): ScreenFramePayload {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return ScreenFramePayload(error = "实时屏幕需要 Android 11 / API 30 及以上")
+        }
+        return suspendCancellableCoroutine { cont ->
+            takeScreenshot(
+                android.view.Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        val bitmap = Bitmap.wrapHardwareBuffer(
+                            screenshot.hardwareBuffer,
+                            screenshot.colorSpace,
+                        )
+                        screenshot.hardwareBuffer.close()
+                        if (bitmap == null) {
+                            cont.resume(ScreenFramePayload(error = "截图失败：bitmap 为空"))
+                            return
+                        }
+                        val software = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                        bitmap.recycle()
+                        val out = ByteArrayOutputStream()
+                        software.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(20, 90), out)
+                        val width = software.width
+                        val height = software.height
+                        software.recycle()
+                        cont.resume(
+                            ScreenFramePayload(
+                                image = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP),
+                                mime = "image/jpeg",
+                                width = width,
+                                height = height,
+                            ),
+                        )
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        cont.resume(ScreenFramePayload(error = "截图失败：$errorCode"))
+                    }
+                },
+            )
+        }
     }
 
     private fun walk(n: AccessibilityNodeInfo?, depth: Int, sb: StringBuilder) {
@@ -101,7 +153,8 @@ class WeComAccessibilityService : AccessibilityService() {
     private fun updatePage(event: AccessibilityEvent) {
         val cls = event.className?.toString().orEmpty()
         currentPage = when {
-            cls.contains("LauncherUI", true) -> Page.HOME
+            cls.contains("LauncherUI", true) ||
+                cls.contains("WwMainActivity", true) -> Page.HOME
             cls.contains("ChatActivity", true) ||
                 cls.contains("MessageList", true) ||
                 cls.contains("MessageInfo", true) -> Page.CHAT
@@ -112,7 +165,15 @@ class WeComAccessibilityService : AccessibilityService() {
         }
         Log.d(tag, "page=$currentPage cls=$cls")
         if (currentPage == Page.CHAT) {
-            currentChatTitle = inferChatTitle()
+            val title = inferChatTitle()
+            if (title != currentChatTitle) {
+                baselineChatTitle = null
+                baselineReady = false
+            }
+            currentChatTitle = title
+        } else {
+            baselineChatTitle = null
+            baselineReady = false
         }
     }
 
@@ -152,34 +213,70 @@ class WeComAccessibilityService : AccessibilityService() {
         val now = System.currentTimeMillis()
         gc(now)
 
-        val texts = mutableListOf<AccessibilityNodeInfo>()
+        val candidates = mutableListOf<String>()
         fun walk(n: AccessibilityNodeInfo?) {
             n ?: return
             val cls = n.className?.toString() ?: ""
-            if (cls.contains("TextView", true) && !n.text.isNullOrBlank()) texts.add(n)
+            if (cls.contains("TextView", true) && !n.text.isNullOrBlank()) {
+                val r = android.graphics.Rect()
+                n.getBoundsInScreen(r)
+                val content = n.text.toString().trim()
+                if (isInboundBubbleCandidate(n, r, screenWidth, content)) {
+                    candidates.add(content)
+                }
+            }
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(root)
 
-        for (t in texts) {
-            val r = android.graphics.Rect()
-            t.getBoundsInScreen(r)
-            // header zone excluded
-            if (r.top < 200) continue
-            // input bar (bottom) excluded
-            if (r.bottom > resources.displayMetrics.heightPixels - 120) continue
-            // outbound bubble (right half) excluded
-            if (r.left > screenWidth / 2) continue
-            val content = t.text.toString().trim()
-            if (content.isEmpty() || content.length > 2000) continue
-            if (alreadySeen(title, content, now)) continue
+        if (!baselineReady || baselineChatTitle != title) {
+            for (content in candidates) {
+                recent.addLast(Triple(title, content, now))
+            }
+            baselineChatTitle = title
+            baselineReady = true
+            Log.d(tag, "baseline chat=$title candidates=${candidates.size}")
+            return
+        }
+
+        for (content in candidates) {
+            if (alreadySeen(title, content)) continue
             recent.addLast(Triple(title, content, now))
             cb(title, content)
         }
     }
 
-    private fun alreadySeen(sender: String, content: String, now: Long): Boolean {
-        for ((s, c, _t) in recent) {
+    private fun isInboundBubbleCandidate(
+        node: AccessibilityNodeInfo,
+        bounds: android.graphics.Rect,
+        screenWidth: Int,
+        content: String,
+    ): Boolean {
+        // header zone excluded
+        if (bounds.top < 200) return false
+        // input bar (bottom) excluded
+        if (bounds.bottom > resources.displayMetrics.heightPixels - 120) return false
+        // outbound bubble (right half) excluded
+        if (bounds.left > screenWidth / 2) return false
+        if (content.isEmpty() || content.length > 2000) return false
+        if (content == currentChatTitle) return false
+        if (!hasScrollableAncestor(node)) return false
+        return true
+    }
+
+    private fun hasScrollableAncestor(node: AccessibilityNodeInfo): Boolean {
+        var p = node.parent
+        var depth = 0
+        while (p != null && depth < 8) {
+            if (p.isScrollable) return true
+            p = p.parent
+            depth += 1
+        }
+        return false
+    }
+
+    private fun alreadySeen(sender: String, content: String): Boolean {
+        for ((s, c) in recent) {
             if (s == sender && c == content) return true
         }
         return false

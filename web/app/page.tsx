@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, setToken, getToken } from "@/lib/api";
+import { api, setAuthTokens, getToken } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -29,11 +29,11 @@ export default function LoginPage() {
     setErr(null);
     setLoading(true);
     try {
-      const data = await api<{ access_token: string }>("/auth/login", {
+      const data = await api<{ access_token: string; refresh_token?: string | null }>("/auth/login", {
         method: "POST",
         body: JSON.stringify({ email, password }),
       });
-      setToken(data.access_token);
+      setAuthTokens(data);
       router.push("/workbench");
     } catch (e: any) {
       setErr(e.message ?? String(e));

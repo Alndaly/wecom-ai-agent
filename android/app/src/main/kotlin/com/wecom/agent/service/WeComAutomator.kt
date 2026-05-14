@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
+import android.graphics.Rect
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
@@ -24,6 +25,8 @@ class WeComAutomator(
 ) {
     private val tag = "WeComAuto"
     private val wecomPkg = "com.tencent.wework"
+
+    private enum class UiPlace { TARGET_CHAT, CHAT, HOME, SEARCH, OTHER }
 
     /** UI operations have to happen on the main looper; we just poll. */
     private suspend fun a11y(): AccessibilityService? {
@@ -47,16 +50,14 @@ class WeComAutomator(
         if (!waitForPackage(svc, wecomPkg)) return "WeCom not in foreground after open"
         delay(700)
 
-        // 2. tap search icon on home → type contact → tap first hit
-        if (!openSearch(svc)) return "could not open search"
-        delay(500)
-        if (!typeIntoSearch(svc, contactName)) return "could not type into search"
-        delay(900) // let results render
-        if (!clickFirstSearchResult(svc, contactName)) {
-            dumpTree(svc, "search-no-result")
-            return "no search result for '$contactName'"
+        // 2. Decide from the current UI tree. If we're already in the right
+        // chat, do not navigate again; otherwise normalize to a page where
+        // contact selection is safe.
+        if (!ensureTargetChat(svc, contactName)) {
+            dumpTree(svc, "target-chat-not-open")
+            return "could not open chat '$contactName'"
         }
-        delay(800)
+        delay(500)
 
         // 3. type into chat input + click send
         if (!typeIntoChatInput(svc, text)) {
@@ -70,6 +71,110 @@ class WeComAutomator(
         }
         log("sendText OK → $contactName")
         return null
+    }
+
+    private suspend fun ensureTargetChat(
+        svc: AccessibilityService,
+        contactName: String,
+    ): Boolean {
+        when (classifyUi(svc, contactName)) {
+            UiPlace.TARGET_CHAT -> {
+                log("当前已在目标聊天页 → $contactName")
+                return true
+            }
+            UiPlace.CHAT, UiPlace.SEARCH, UiPlace.OTHER -> {
+                if (!backToHomeOrTargetChat(svc, contactName)) return false
+            }
+            UiPlace.HOME -> Unit
+        }
+
+        if (classifyUi(svc, contactName) == UiPlace.TARGET_CHAT) return true
+
+        if (clickVisibleConversation(svc, contactName)) {
+            delay(700)
+            if (classifyUi(svc, contactName) == UiPlace.TARGET_CHAT) return true
+        }
+
+        log("未能可靠确认目标聊天页，停止在搜索/更多按钮猜测链路上继续操作")
+        return classifyUi(svc, contactName) == UiPlace.TARGET_CHAT
+    }
+
+    private suspend fun backToHomeOrTargetChat(
+        svc: AccessibilityService,
+        contactName: String,
+    ): Boolean {
+        repeat(5) {
+            when (classifyUi(svc, contactName)) {
+                UiPlace.TARGET_CHAT, UiPlace.HOME -> return true
+                else -> {
+                    log("当前页面非目标聊天/首页，执行返回校准")
+                    svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+                    delay(450)
+                }
+            }
+        }
+        return classifyUi(svc, contactName) in setOf(UiPlace.TARGET_CHAT, UiPlace.HOME)
+    }
+
+    private fun classifyUi(
+        svc: AccessibilityService,
+        contactName: String,
+    ): UiPlace {
+        val root = svc.rootInActiveWindow ?: return UiPlace.OTHER
+        val page = (svc as? WeComAccessibilityService)?.currentPage
+        val title = if (page == WeComAccessibilityService.Page.CHAT) {
+            (svc as? WeComAccessibilityService)?.currentChatTitle.orEmpty()
+        } else {
+            ""
+        }
+
+        if (page == WeComAccessibilityService.Page.CHAT) {
+            if (isTargetChat(root, title, contactName)) return UiPlace.TARGET_CHAT
+            if (isChatLike(root)) return UiPlace.CHAT
+        }
+        if (page == WeComAccessibilityService.Page.SEARCH || isSearchLike(root)) return UiPlace.SEARCH
+        if (page == WeComAccessibilityService.Page.HOME || isHomeLike(root)) return UiPlace.HOME
+        if (isTargetChat(root, title, contactName)) return UiPlace.TARGET_CHAT
+        if (isChatLike(root)) return UiPlace.CHAT
+        return UiPlace.OTHER
+    }
+
+    private fun isTargetChat(
+        root: AccessibilityNodeInfo,
+        title: String,
+        contactName: String,
+    ): Boolean {
+        val hasChatInput = root.findFirst {
+            it.isEditable && it.isFocusable && it.boundsCenterY() > ctx.resources.displayMetrics.heightPixels * 0.55
+        } != null
+        if (!hasChatInput) return false
+        if (title.contains(contactName)) return true
+        return root.findFirst {
+            matchesText(it, contactName) && it.boundsCenterY() in 60..220
+        } != null
+    }
+
+    private fun isChatLike(root: AccessibilityNodeInfo): Boolean {
+        return root.findFirst { it.isEditable && it.isFocusable } != null
+    }
+
+    private fun isSearchLike(root: AccessibilityNodeInfo): Boolean {
+        val topEditable = root.findFirst {
+            it.isEditable && it.boundsCenterY() < 260
+        }
+        return topEditable != null && root.findFirst {
+            matchesText(it, "搜索") && it.boundsCenterY() < 260
+        } != null
+    }
+
+    private fun isHomeLike(root: AccessibilityNodeInfo): Boolean {
+        val topMessageTitle = root.findFirst {
+            matchesText(it, "消息") && it.boundsCenterY() < 180
+        }
+        val bottomTabs = listOf("消息", "邮件", "文档", "工作台", "通讯录").count { label ->
+            root.findFirst { matchesText(it, label) && it.boundsCenterY() > ctx.resources.displayMetrics.heightPixels * 0.75 } != null
+        }
+        return topMessageTitle != null || bottomTabs >= 2
     }
 
     // ---------------------------------------------------------------- nav
@@ -100,44 +205,25 @@ class WeComAutomator(
     }
 
     // -------------------------------------------------------------- search
-    private suspend fun openSearch(svc: AccessibilityService): Boolean {
-        val root = svc.rootInActiveWindow ?: return false
-        // strategy 1: any node with content-description "搜索" / text "搜索"
-        val byDesc = root.findFirst { matchesText(it, "搜索") }
-        if (byDesc != null && byDesc.tap()) return true
-
-        // strategy 2: ImageButton/ImageView at top-right
-        val candidates = root.findAll {
-            (it.className?.contains("ImageButton") == true ||
-                    it.className?.contains("ImageView") == true) &&
-                    it.isClickable
-        }
-        // pick the right-most top one
-        val pick = candidates.maxByOrNull { it.boundsCenterX() - it.boundsCenterY() }
-        return pick?.tap() == true
-    }
-
-    private suspend fun typeIntoSearch(svc: AccessibilityService, q: String): Boolean {
-        // some versions auto-focus the search box; wait briefly for an editable field
-        val edit = findEditable(svc, timeoutMs = 3_000) ?: return false
-        return edit.replaceText(q)
-    }
-
-    private suspend fun clickFirstSearchResult(
+    private suspend fun clickVisibleConversation(
         svc: AccessibilityService,
         contactName: String,
     ): Boolean {
-        // wait for results to populate
-        repeat(20) {
+        repeat(8) {
             val root = svc.rootInActiveWindow
-            if (root != null) {
-                val match = root.findFirst { matchesText(it, contactName) }
-                if (match != null) {
-                    // climb to the nearest clickable ancestor (a result row is usually a LinearLayout)
-                    var n: AccessibilityNodeInfo? = match
-                    while (n != null && !n.isClickable) n = n.parent
-                    if (n != null && n.tap()) return true
-                    if (match.tap()) return true
+            val match = root?.findFirst {
+                matchesText(it, contactName) && it.boundsCenterY() > 180
+            }
+            if (match != null) {
+                var n: AccessibilityNodeInfo? = match
+                while (n != null && !n.isClickable) n = n.parent
+                if (n != null && n.tap()) {
+                    log("已点击可见会话 → $contactName")
+                    return true
+                }
+                if (match.tap()) {
+                    log("已点击可见会话文本 → $contactName")
+                    return true
                 }
             }
             delay(150)
@@ -147,7 +233,7 @@ class WeComAutomator(
 
     // -------------------------------------------------------------- chat
     private suspend fun typeIntoChatInput(svc: AccessibilityService, text: String): Boolean {
-        val edit = findEditable(svc, timeoutMs = 3_000) ?: return false
+        val edit = findChatEditable(svc, timeoutMs = 3_000) ?: return false
         return edit.replaceText(text)
     }
 
@@ -163,12 +249,12 @@ class WeComAutomator(
         return anyButton?.tap() == true
     }
 
-    private suspend fun findEditable(svc: AccessibilityService, timeoutMs: Long): AccessibilityNodeInfo? {
+    private suspend fun findChatEditable(svc: AccessibilityService, timeoutMs: Long): AccessibilityNodeInfo? {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val root = svc.rootInActiveWindow
             val edit = root?.findFirst {
-                it.isEditable && it.isFocusable
+                it.isEditable && it.isFocusable && it.boundsCenterY() > ctx.resources.displayMetrics.heightPixels * 0.55
             }
             if (edit != null) return edit
             delay(150)
@@ -240,13 +326,13 @@ private fun matchesText(n: AccessibilityNodeInfo, s: String): Boolean {
 }
 
 private fun AccessibilityNodeInfo.boundsCenterX(): Int {
-    val r = android.graphics.Rect()
+    val r = Rect()
     getBoundsInScreen(r)
     return r.centerX()
 }
 
 private fun AccessibilityNodeInfo.boundsCenterY(): Int {
-    val r = android.graphics.Rect()
+    val r = Rect()
     getBoundsInScreen(r)
     return r.centerY()
 }

@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # it, but we mirror that here as a defence-in-depth — other inbound channels
 # (REST replay, third-party recorders) may forward the raw text.
 _AGG_PREFIX_RX = re.compile(r"^\s*\[\s*\d+\s*条\s*]\s*")
+_BOT_ECHO_RX = re.compile(r"^\s*收到您说的[「\"']")
+_TIME_ONLY_RX = re.compile(r"^\s*(上午|下午)?\s*\d{1,2}:\d{2}\s*$")
 
 
 def _clean_content(text: str) -> str:
@@ -95,6 +97,10 @@ async def ingest_inbound_message(
     cleaned = _clean_content(evt.content)
     if not cleaned:
         return None  # nothing left after stripping notification noise
+    if _TIME_ONLY_RX.match(cleaned):
+        return None  # chat timestamp separators are not customer messages
+    if _BOT_ECHO_RX.match(cleaned):
+        return None  # our own confirmation template echoed back from UI scraping
     msg = Message(
         conversation_id=conv.id,
         direction="in",

@@ -14,7 +14,7 @@ from app.models import Robot, RobotTask
 from app.routers.robots import verify_robot_token
 from app.schemas import AndroidMessageReceived
 from app.services.conversation import ingest_inbound_message
-from app.services.task_dispatcher import update_task_on_callback
+from app.services.task_dispatcher import append_task_log, update_task_on_callback
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -103,9 +103,13 @@ async def _handle_event(robot: Robot, data: dict) -> None:
             r = await db.get(Robot, robot.id)
             if r:
                 r.last_seen_at = datetime.now(timezone.utc)
-                if "current_page" in payload:
-                    r.current_page = payload["current_page"]
+                _apply_device_status(r, payload)
                 await db.commit()
+        await hub.broadcast_web(
+            robot.team_id,
+            "robot.updated",
+            _robot_payload(robot.robot_id, payload),
+        )
         return
 
     if event == "message.received":
@@ -128,15 +132,82 @@ async def _handle_event(robot: Robot, data: dict) -> None:
                 )
         return
 
+    if event == "task.log":
+        task_id = payload.get("task_id")
+        message = payload.get("message") or ""
+        level = payload.get("level") or "info"
+        async with SessionLocal() as db:
+            r = await db.get(Robot, robot.id)
+            if r:
+                await append_task_log(db, robot=r, task_id=int(task_id) if task_id is not None else None, level=level, message=message)
+        return
+
     if event == "device.ui_dump":
-        _save_ui_dump(robot, payload)
+        dump = _save_ui_dump(robot, payload)
+        await hub.broadcast_web(robot.team_id, "device.ui_dump", dump)
+        return
+
+    if event == "device.screen_frame":
+        await hub.broadcast_web(
+            robot.team_id,
+            "device.screen_frame",
+            {
+                "robot_id": robot.robot_id,
+                "image": payload.get("image"),
+                "mime": payload.get("mime") or "image/jpeg",
+                "width": payload.get("width"),
+                "height": payload.get("height"),
+                "error": payload.get("error"),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return
+
+    if event == "device.command_ack":
+        await hub.broadcast_web(
+            robot.team_id,
+            "device.command_ack",
+            {
+                "robot_id": robot.robot_id,
+                "command": payload.get("command"),
+                "ok": payload.get("ok"),
+                "message": payload.get("message"),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return
 
     log.info("unknown android event: %s", event)
 
 
-def _save_ui_dump(robot: Robot, payload: dict) -> None:
+def _apply_device_status(robot: Robot, payload: dict) -> None:
+    fields = (
+        "current_page",
+        "device_type",
+        "device_name",
+        "manufacturer",
+        "model",
+        "android_version",
+        "sdk_int",
+        "app_version",
+        "screen_width",
+        "screen_height",
+    )
+    for field in fields:
+        if field in payload:
+            setattr(robot, field, payload[field])
+
+
+def _robot_payload(robot_id: str, payload: dict) -> dict:
+    return {
+        "robot_id": robot_id,
+        **{k: v for k, v in payload.items() if k != "battery"},
+    }
+
+
+def _save_ui_dump(robot: Robot, payload: dict) -> dict:
     """Persist a UI tree dump under var/ui_dumps/ so we can calibrate locators."""
+    request_id = payload.get("request_id")
     reason = (payload.get("reason") or "manual").replace("/", "_")[:64]
     page = (payload.get("current_page") or "UNKNOWN")[:32]
     tree = payload.get("tree") or ""
@@ -146,3 +217,12 @@ def _save_ui_dump(robot: Robot, payload: dict) -> None:
     fp = base / f"{robot.robot_id}-{ts}-{page}-{reason}.txt"
     fp.write_text(tree, encoding="utf-8")
     log.info("ui_dump saved: %s (%d bytes)", fp, len(tree))
+    return {
+        "request_id": request_id,
+        "robot_id": robot.robot_id,
+        "current_page": page,
+        "reason": reason,
+        "tree": tree,
+        "path": str(fp),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }

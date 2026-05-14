@@ -1,0 +1,80 @@
+=== UI dump pkg=com.tencent.wework page=CHAT ===
+[FrameLayout]
+  [ViewGroup] desc="企业微信的标题栏。"
+    [RelativeLayout] id=ne1 F
+      [TextView] id=nc9 CF
+      [TextView] id=ncq txt="七月" CF
+      [TextView] id=nd0 txt="＠微信"
+      [TextView] id=ndb CF
+      [TextView] id=nd7 CF
+    [RelativeLayout] id=awn CF
+      [ListView] id=iju FS
+        [RelativeLayout] id=cmg CF
+          [TextView] id=i_d txt="昨天  下午 7:55" F
+          [ImageView] id=ih9 CF
+          [LinearLayout] id=hsj CF
+            [TextView] id=i9j txt="111" F
+        [RelativeLayout] id=cmg CF
+          [TextView] id=i_d txt="昨天  下午 8:21" F
+          [ImageView] id=ih9 CF
+          [LinearLayout] id=hsj CF
+            [TextView] id=i9j txt="不错哦" F
+        [RelativeLayout] id=cmg CF
+          [TextView] id=i_d txt="昨天  下午 8:22" F
+          [ImageView] id=ih9 CF
+          [LinearLayout] id=hsj CF
+            [TextView] id=i9j txt="不错" F
+        [RelativeLayout] id=cmg CF
+          [TextView] id=i_d txt="昨天  下午 8:22" F
+          [ImageView] id=ih9 CF
+          [LinearLayout] id=hsj CF
+            [TextView] id=i9j txt="111" F
+        [RelativeLayout] id=cmg CF
+          [TextView] id=i_d txt="昨天  下午 8:22" F
+          [ImageView] id=ih9 CF
+          [LinearLayout] id=hsj CF
+            [TextView] id=i9j txt="222" F
+        [RelativeLayout] id=cmg CF
+          [TextView] id=i_d txt="昨天  下午 8:23" F
+          [ImageView] id=ih9 CF
+          [LinearLayout] id=hsj CF
+            [TextView] id=i9j txt="333" F
+        [RelativeLayout]
+      [ViewGroup] F
+      [RecyclerView] id=gfi F
+        [RelativeLayout]
+          [LinearLayout] id=ge8 CF
+            [LinearLayout] id=ghz CF
+              [ImageView] id=ghx CF
+            [TextView] id=gjr txt="企业名片" CF
+        [RelativeLayout]
+          [LinearLayout] id=ge8 CF
+            [LinearLayout] id=ghz CF
+              [ImageView] id=ghx CF
+            [TextView] id=gjr txt="发起收款" CF
+        [RelativeLayout]
+          [LinearLayout] id=ge8 CF
+            [LinearLayout] id=ghz CF
+              [ImageView] id=ghx CF
+            [TextView] id=gjr txt="客户转账" CF
+        [RelativeLayout]
+          [LinearLayout] id=ge8 CF
+            [LinearLayout] id=ghz CF
+              [ImageView] id=ghx CF
+            [TextView] id=gjr txt="快捷回复" CF
+        [RelativeLayout]
+          [LinearLayout] id=ge8 CF
+            [LinearLayout] id=ghz CF
+              [ImageView] id=ghx CF
+            [TextView] id=gjr txt="推荐客服" CF
+        [RelativeLayout]
+          [LinearLayout] id=ge8 CF
+            [LinearLayout] id=ghz CF
+              [ImageView] id=ghx CF
+            [TextView] id=gjr txt="商品图册" CF
+      [LinearLayout] id=i9t CF
+        [ImageView] id=g_d CF
+        [EditText] id=i_6 txt="发消息或按住..." CFE
+        [ImageView] id=i9y CF
+        [ImageView] id=i9u CF
+    [ImageView] id=hw_magic_window_screen_drag_bar desc="企业微信控制柄" F

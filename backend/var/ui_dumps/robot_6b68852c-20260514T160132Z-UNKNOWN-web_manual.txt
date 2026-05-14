@@ -1,0 +1,69 @@
+=== UI dump pkg=com.tencent.wework page=UNKNOWN ===
+[FrameLayout]
+  [ViewGroup] desc="企业微信的标题栏。"
+    [TextView] id=ndw CF
+    [TextView] id=ncq txt="消息" CF
+    [TextView] id=ndh CF
+    [TextView] id=nd7 CF
+    [TextView] id=nd_ CF
+    [RecyclerView] id=czp F
+      [LinearLayout]
+        [LinearLayout] id=fg9 CF
+          [TextView] id=fg8 txt="全部"
+        [LinearLayout] id=bpr CF
+          [TextView] id=ej9
+          [TextView] id=bse txt="日程"
+        [ViewGroup] id=n9j CF
+          [TextView] id=n9l
+          [TextView] id=n_l txt="待办"
+        [LinearLayout] id=i35 CF
+          [TextView] id=i4g txt="会议"
+      [RelativeLayout] CF
+        [TextView] id=hrr txt="Revornix交流群"
+        [TextView] id=g80 txt="2025/4/19"
+        [TextView] id=czg
+        [TextView] id=mdj
+      [RelativeLayout] CF
+        [TextView] id=hrr txt="七月"
+        [TextView] id=p18 txt="＠微信"
+        [TextView] id=g80 txt="昨天"
+        [TextView] id=czg
+        [TextView] id=mdj txt="333"
+      [RelativeLayout] CF
+        [TextView] id=hrr txt="企业微信团队"
+        [TextView] id=g80 txt="昨天"
+        [TextView] id=czg
+        [TextView] id=mdj txt="登录操作通知"
+      [RelativeLayout] CF
+        [TextView] id=hrr txt="管理企业"
+        [TextView] id=g80 txt="星期三"
+        [TextView] id=czg
+        [TextView] id=mdj txt="企业微信认证审核已通过，已认证为小型企业规模，企业成员规模上限提升至1000人"
+      [RelativeLayout] CF
+        [TextView] id=hrr txt="微盘"
+        [TextView] id=g80 txt="星期三"
+        [TextView] id=czg
+        [TextView] id=mdj txt="企业认证成功，微盘免费容量已提升至 100G"
+      [View]
+    [TextView] id=pjk
+    [RelativeLayout] CF
+      [TextView] id=hrr txt="消息"
+    [RelativeLayout] CF
+      [TextView] id=hrr txt="邮件"
+    [RelativeLayout] CF
+      [TextView] id=hrr txt="文档"
+    [RelativeLayout] CF
+      [TextView] id=hrr txt="工作台"
+    [RelativeLayout] CF
+      [TextView] id=hrr txt="通讯录"
+    [RelativeLayout] id=og3 CF
+      [TextView] id=mi0 txt="华勤达"
+      [LinearLayout] id=d2p CF
+        [TextView] id=d36 txt="青庸科技"
+    [RelativeLayout] id=dsr CF
+    [RelativeLayout] id=k_v CF
+    [RecyclerView] id=km_ F
+      [LinearLayout] CF
+        [TextView] id=hst txt="青庸科技"
+    [LinearLayout] id=lr6 CF
+      [TextView] id=lt_ txt="设置"

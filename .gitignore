@@ -21,3 +21,4 @@ android/.idea/
 .DS_Store
 *.log
 /tmp/
+ui_dumps/
