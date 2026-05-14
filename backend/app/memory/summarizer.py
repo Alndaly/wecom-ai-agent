@@ -47,7 +47,7 @@ async def maybe_refresh(
     if not transcript:
         return None
 
-    summary, _ = await _summarize(transcript)
+    summary, _ = await _summarize(db, contact.team_id, transcript)
 
     if profile is None:
         profile = UserProfile(
@@ -66,7 +66,7 @@ async def maybe_refresh(
 
     # vector entry for semantic recall
     try:
-        embed = await get_embedding_provider().embed_one(summary)
+        embed = await (await get_embedding_provider(db, contact.team_id)).embed_one(summary)
     except Exception:
         embed = None
     db.add(
@@ -86,8 +86,8 @@ async def maybe_refresh(
     return profile
 
 
-async def _summarize(transcript: str) -> tuple[str, float]:
-    provider = get_provider()
+async def _summarize(db: AsyncSession, team_id: int, transcript: str) -> tuple[str, float]:
+    provider = await get_provider(db, team_id)
     res = await provider.chat(
         [
             ChatMessage(role="system", content=_SUMMARY_PROMPT),

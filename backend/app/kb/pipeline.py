@@ -49,7 +49,7 @@ async def ingest_document(db: AsyncSession, *, doc_id: int) -> None:
         overlap = kb.chunk_overlap or settings.kb_chunk_overlap
         pieces = chunker.chunk(text, size=size, overlap=overlap)
 
-        embedder = get_embedding_provider()
+        embedder = await get_embedding_provider(db, kb.team_id)
         vectors = await embedder.embed(pieces)
 
         seeds = [s.strip() for s in (kb.description or "").split(",") if s.strip()]

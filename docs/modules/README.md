@@ -15,3 +15,4 @@
 | 长期记忆 | [memory.md](memory.md) | 3 |
 | 风控 | [risk.md](risk.md) | 5 |
 | 数据分析 | [analytics.md](analytics.md) | 5 |
+| 运行时配置 | [settings.md](settings.md) | 3 |

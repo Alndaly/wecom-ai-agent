@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Bot, BookOpen, MessageSquare, Smartphone, LogOut } from "lucide-react";
+import { Bot, BookOpen, MessageSquare, Settings, Smartphone, LogOut } from "lucide-react";
 import { setToken } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ const items = [
   { href: "/workbench", label: "工作台", icon: MessageSquare },
   { href: "/devices", label: "设备", icon: Smartphone },
   { href: "/knowledge", label: "知识库", icon: BookOpen },
+  { href: "/settings", label: "模型配置", icon: Settings },
 ];
 
 export function Sidebar() {

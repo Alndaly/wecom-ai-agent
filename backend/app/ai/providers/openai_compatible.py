@@ -35,7 +35,7 @@ class OpenAICompatibleProvider(LLMProvider):
         max_tokens: int = 512,
     ) -> LLMResult:
         if not self.api_key:
-            raise RuntimeError("LLM_API_KEY is empty; set it or switch LLM_PROVIDER=mock")
+            raise RuntimeError("LLM api_key is empty; configure it via /settings or env")
 
         body = {
             "model": self.model,
@@ -44,19 +44,23 @@ class OpenAICompatibleProvider(LLMProvider):
             "max_tokens": max_tokens,
         }
         t0 = time.perf_counter()
-        async with httpx.AsyncClient(timeout=30) as http:
+        async with httpx.AsyncClient(timeout=60) as http:
             r = await http.post(
                 f"{self.base_url}/chat/completions",
                 json=body,
                 headers={"Authorization": f"Bearer {self.api_key}"},
             )
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
-        choice = data["choices"][0]
-        text = choice["message"]["content"]
-        finish = choice.get("finish_reason", "")
-        # naive heuristic confidence
+        try:
+            choice = data["choices"][0]
+            text = choice["message"]["content"] or ""
+            finish = choice.get("finish_reason", "")
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"unexpected LLM response shape: {data!r}") from e
+        # heuristic confidence; finish_reason=stop is the green-light signal
         conf = 0.8 if finish == "stop" else 0.55
         if not text.strip():
             conf = 0.3

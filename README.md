@@ -80,7 +80,7 @@ MVP2 端到端验证：
 backend/.venv/bin/python tools/ai_smoke.py
 ```
 
-### 6. MVP3 — 知识库 + 长期记忆
+### 6. MVP3 — 知识库 + 长期记忆 + 模型在线配置
 
 零配置可跑（内存向量库 + 图谱 + mock embedding）：
 
@@ -88,17 +88,33 @@ backend/.venv/bin/python tools/ai_smoke.py
 backend/.venv/bin/python tools/kb_smoke.py
 ```
 
-接 Milvus / Neo4j / 真 embedding：
+**模型配置走 Web `/settings` 页面**（不要再用环境变量）。LLM / Embedding 都用 OpenAI 兼容协议,内置预设：OpenAI / DeepSeek / 通义 / 智谱 / Ollama。改完点「测试」探活,「保存」即时生效,无需重启后端。
+
+接 Milvus / Neo4j：
 
 ```bash
-export EMBEDDING_PROVIDER=openai
-export EMBEDDING_API_KEY=sk-...
-export VECTOR_STORE=milvus   MILVUS_URI=http://localhost:19530
-export GRAPH_STORE=neo4j     NEO4J_URI=bolt://localhost:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=...
-export KB_MIN_SCORE=0.5
+# 一键起 RAG 全栈
+docker compose --profile rag up
+# 然后让后端连过去
+export VECTOR_STORE=milvus
+export GRAPH_STORE=neo4j
+export NEO4J_PASSWORD=neo4jtest
+pip install '.[real]'   # pymilvus + neo4j + pypdf
+uvicorn app.main:app --port 8000
 ```
 
-Web 上 `/knowledge` 新建库 + 上传 / 粘贴文档 + 内置「检索测试」。工作台右栏在 AI 触发后会自动加载 `kb.hits` 命中卡片。
+完整步骤见 [docs/13-real-providers.md](docs/13-real-providers.md)。
+
+### 7. 真模型端到端验证
+
+```bash
+export REAL_LLM_API_KEY=sk-...
+export REAL_LLM_MODEL=gpt-4o-mini      # 或 deepseek-chat / qwen-plus / glm-4
+export REAL_KB_MIN_SCORE=0.5
+backend/.venv/bin/python tools/real_smoke.py
+```
+
+会写真配置 → 探活 → 入库 → 触发 AI 回复 → 断言回复确实引用了知识库事实 → 检查 `ai_reply_logs.model` 不再是 `mock`。
 
 ## 里程碑
 

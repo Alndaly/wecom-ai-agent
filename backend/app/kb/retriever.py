@@ -1,7 +1,9 @@
 """Hybrid retrieval: vector top-K + 1-hop graph expansion.
 
+Per-team embedding provider + per-team retrieval settings.
+
 Public surface:
-  retrieve(team_id, query, top_k=...) -> RetrievalResult
+  retrieve(db, team_id, query, top_k=None) -> RetrievalResult
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models import KnowledgeChunk
+from app.services import settings_service
 
 from .embeddings import get_embedding_provider
 from .graphstore import Node, get_graph_store
@@ -42,7 +45,6 @@ class RetrievalResult:
     graph_facts: list[GraphFact] = field(default_factory=list)
 
     def to_context(self) -> str:
-        """Format as text block that gets injected into the LLM prompt."""
         if not self.hits and not self.graph_facts:
             return ""
         parts: list[str] = []
@@ -69,14 +71,16 @@ async def retrieve(
     if not query:
         return RetrievalResult()
 
-    k = top_k or settings.kb_top_k
-    embed = await get_embedding_provider().embed_one(query)
+    retrieval_cfg = await settings_service.get(db, team_id, "retrieval")
+    k = top_k or int(retrieval_cfg.get("top_k") or settings.kb_top_k)
+    floor = float(retrieval_cfg.get("min_score") or settings.kb_min_score)
+
+    embedder = await get_embedding_provider(db, team_id)
+    embed = await embedder.embed_one(query)
     vector_hits = await get_vector_store().search(
         embed, top_k=k, filter_={"team_id": team_id}
     )
 
-    # Filter by score floor, drop anything obviously irrelevant
-    floor = settings.kb_min_score
     keep = [h for h in vector_hits if h.score >= floor]
 
     hits: list[Hit] = []
@@ -96,7 +100,6 @@ async def retrieve(
             )
         )
 
-    # Backfill text/meta from DB if vector store didn't carry them
     if hits and any(not h.text for h in hits):
         rows = (
             await db.execute(
@@ -108,7 +111,6 @@ async def retrieve(
             if not h.text and h.chunk_id in by_id:
                 h.text = by_id[h.chunk_id].text
 
-    # Graph expansion: take entities from top hit's chunk row → 1-hop neighbors
     graph_facts: list[GraphFact] = []
     if expand_graph and chunk_ids:
         first = chunk_ids[0]
@@ -134,7 +136,6 @@ async def retrieve(
                             dst_name=dst.name,
                         )
                     )
-        # dedupe
         seen: set[tuple] = set()
         deduped: list[GraphFact] = []
         for f in graph_facts:

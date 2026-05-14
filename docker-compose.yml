@@ -1,5 +1,12 @@
-# MVP1 dev stack. Postgres / Redis are scaffolded for MVP2+, but backend
-# defaults to SQLite so you can just run `docker compose up backend web`.
+# Dev stack.
+#
+# - core    : postgres + redis + backend + web   (always up)
+# - rag     : milvus standalone + neo4j          (profile=rag)
+# - all     : everything                          (profile=rag)
+#
+# Examples:
+#   docker compose up backend web                       # MVP1/2/3 with in-memory RAG
+#   docker compose --profile rag up                     # full stack incl. Milvus & Neo4j
 services:
   postgres:
     image: postgres:16-alpine
@@ -20,6 +27,13 @@ services:
       DATABASE_URL: sqlite+aiosqlite:///./dev.db
       JWT_SECRET: dev-secret-change-me
       CORS_ORIGINS: http://localhost:3000
+      # rag profile defaults — override per-env / via /settings UI for LLM keys
+      VECTOR_STORE: ${VECTOR_STORE:-memory}
+      MILVUS_URI:   ${MILVUS_URI:-http://milvus:19530}
+      GRAPH_STORE:  ${GRAPH_STORE:-memory}
+      NEO4J_URI:    ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USER:   ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4jtest}
     ports: ["8000:8000"]
     volumes: ["./backend:/app"]
     working_dir: /app
@@ -35,5 +49,75 @@ services:
     volumes: ["./web:/app"]
     command: sh -c "npm install && npm run dev"
 
+  # ----- RAG profile -----
+  etcd:
+    profiles: ["rag"]
+    image: quay.io/coreos/etcd:v3.5.14
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes: ["etcd:/etcd"]
+
+  minio:
+    profiles: ["rag"]
+    image: minio/minio:RELEASE.2024-05-28T17-19-04Z
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /minio_data
+    volumes: ["minio:/minio_data"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  milvus:
+    profiles: ["rag"]
+    image: milvusdb/milvus:v2.4.10
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports: ["19530:19530", "9091:9091"]
+    depends_on:
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    volumes: ["milvus:/var/lib/milvus"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  neo4j:
+    profiles: ["rag"]
+    image: neo4j:5.22-community
+    environment:
+      NEO4J_AUTH: neo4j/neo4jtest
+      NEO4J_server_default__listen__address: 0.0.0.0
+    ports: ["7474:7474", "7687:7687"]
+    volumes: ["neo4j_data:/data"]
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "neo4jtest", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
 volumes:
   pg:
+  etcd:
+  minio:
+  milvus:
+  neo4j_data:

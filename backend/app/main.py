@@ -13,6 +13,7 @@ from app.core.security import hash_password
 from app.models import Team, User
 from app.routers import ai as ai_router
 from app.routers import auth, conversations, kb, memory, robots
+from app.routers import settings as settings_router
 from app.ws import android as ws_android
 from app.ws import web as ws_web
 
@@ -61,6 +62,7 @@ app.include_router(conversations.router)
 app.include_router(ai_router.router)
 app.include_router(kb.router)
 app.include_router(memory.router)
+app.include_router(settings_router.router)
 app.include_router(ws_web.router)
 app.include_router(ws_android.router)
 

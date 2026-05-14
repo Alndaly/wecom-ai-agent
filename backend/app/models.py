@@ -238,3 +238,28 @@ class UserMemory(Base):
     embedding_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     embedding_json: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Runtime, team-scoped configuration (LLM, embedding, retrieval, ...)
+# ---------------------------------------------------------------------------
+class TeamSetting(Base):
+    """One row per (team_id, key). Value is a JSON blob.
+
+    `key` taxonomy:
+      - "llm"        → provider, model, api_key, base_url, temperature
+      - "embedding"  → provider, model, api_key, base_url, dim
+      - "retrieval"  → top_k, min_score
+      - "ai"         → confidence_threshold, context_window, default_prompt
+    """
+    __tablename__ = "team_settings"
+    __table_args__ = (UniqueConstraint("team_id", "key", name="uq_team_setting"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), index=True)
+    key: Mapped[str] = mapped_column(String(64))
+    value_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

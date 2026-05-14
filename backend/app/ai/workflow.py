@@ -35,6 +35,7 @@ from app.models import (
     UserProfile,
     utcnow,
 )
+from app.services import settings_service
 
 from .providers import ChatMessage, get_provider
 
@@ -69,6 +70,9 @@ class AIState:
     memory_summary: str = ""
     retrieval: RetrievalResult = field(default_factory=RetrievalResult)
     trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    # team-scoped runtime config (loaded once per request)
+    context_window: int = 10
+    confidence_threshold: float = 0.55
 
 
 async def handle_inbound(
@@ -83,14 +87,20 @@ async def handle_inbound(
         await _finalize(db, state, d)
         return d
 
+    ai_cfg = await settings_service.get(db, conv.team_id, "ai")
+    state.context_window = int(ai_cfg.get("context_window") or settings.ai_context_window)
+    state.confidence_threshold = float(
+        ai_cfg.get("confidence_threshold") or settings.ai_confidence_threshold
+    )
+
     # 2. context
-    state.history = await _load_history(db, conv.id)
-    state.prompt = await _load_prompt(db, conv.team_id)
+    state.history = await _load_history(db, conv.id, state.context_window)
+    state.prompt = await _load_prompt(db, conv.team_id, ai_cfg)
     state.memory_summary = await _load_memory(db, conv.contact_id)
     state.retrieval = await _retrieve(db, conv.team_id, message.content)
 
     # 3. generate
-    decision = await _generate(state)
+    decision = await _generate(state, db)
     decision.memory_summary = state.memory_summary
     decision.kb_hit_ids = [h.chunk_id for h in state.retrieval.hits]
     decision.kb_context = state.retrieval.to_context()
@@ -99,11 +109,11 @@ async def handle_inbound(
     if (
         decision.action == "reply"
         and conv.mode == "mixed"
-        and decision.confidence < settings.ai_confidence_threshold
+        and decision.confidence < state.confidence_threshold
     ):
         decision.action = "suggest"
         decision.reason = (
-            f"confidence {decision.confidence:.2f} < threshold {settings.ai_confidence_threshold}"
+            f"confidence {decision.confidence:.2f} < threshold {state.confidence_threshold}"
         )
 
     await _finalize(db, state, decision)
@@ -113,25 +123,29 @@ async def handle_inbound(
 # ---------------------------------------------------------------------------
 # nodes
 # ---------------------------------------------------------------------------
-async def _load_history(db: AsyncSession, conversation_id: int) -> list[Message]:
+async def _load_history(db: AsyncSession, conversation_id: int, limit: int) -> list[Message]:
     rows = (
         await db.execute(
             select(Message)
             .where(Message.conversation_id == conversation_id)
             .order_by(desc(Message.created_at))
-            .limit(settings.ai_context_window)
+            .limit(limit)
         )
     ).scalars().all()
     return list(reversed(rows))
 
 
-async def _load_prompt(db: AsyncSession, team_id: int) -> str:
+async def _load_prompt(db: AsyncSession, team_id: int, ai_cfg: dict) -> str:
+    """Prefer team-saved prompt in ai_prompts, then settings UI default, then env."""
     row = (
         await db.execute(
             select(AIPrompt).where(AIPrompt.team_id == team_id, AIPrompt.key == "default")
         )
     ).scalar_one_or_none()
-    return (row.content if row else settings.ai_default_prompt)
+    if row and row.content:
+        return row.content
+    cfg_prompt = (ai_cfg.get("default_prompt") or "").strip()
+    return cfg_prompt or settings.ai_default_prompt
 
 
 async def _load_memory(db: AsyncSession, contact_id: int) -> str:
@@ -147,8 +161,11 @@ async def _retrieve(db: AsyncSession, team_id: int, query: str) -> RetrievalResu
         return RetrievalResult()
 
 
-async def _generate(state: AIState) -> Decision:
-    provider = get_provider()
+async def _generate(state: AIState, db: AsyncSession) -> Decision:
+    team_id = state.conv.team_id
+    provider = await get_provider(db, team_id)
+    llm_cfg = await settings_service.get(db, team_id, "llm")
+
     system_parts = [state.prompt]
     if state.memory_summary:
         system_parts.append(f"【客户画像】{state.memory_summary}")
@@ -164,7 +181,9 @@ async def _generate(state: AIState) -> Decision:
         role = "user" if m.direction == "in" else "assistant"
         msgs.append(ChatMessage(role=role, content=m.content))
     try:
-        result = await provider.chat(msgs, temperature=settings.llm_temperature)
+        result = await provider.chat(
+            msgs, temperature=float(llm_cfg.get("temperature", settings.llm_temperature))
+        )
     except Exception as e:
         log.exception("LLM error")
         return Decision(

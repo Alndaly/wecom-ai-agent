@@ -18,6 +18,7 @@
 | 10 | [API 与 WS 协议](10-api-contracts.md) | REST / WebSocket 契约 |
 | 11 | [里程碑](11-milestones.md) | MVP1~5 与验收标准 |
 | 12 | [术语表](12-glossary.md) | 名词约定 |
+| 13 | [接入真模型 / Milvus / Neo4j](13-real-providers.md) | 切真东西的完整步骤 |
 | ADR | [架构决策](adr/README.md) | 关键技术选型记录 |
 
 ## 文档约定
