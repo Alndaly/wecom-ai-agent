@@ -67,6 +67,28 @@ async def patch_conversation(
     return conv
 
 
+@router.post("/{cid}/read", response_model=ConversationOut)
+async def mark_read(
+    cid: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Conversation:
+    """Clear the unread badge. Called when the operator opens (focuses) a
+    conversation. Idempotent; also broadcasts so other Web tabs reset too."""
+    conv = await _get_conv(db, cid, user.team_id)
+    if conv.unread_count:
+        conv.unread_count = 0
+        await db.commit()
+        await db.refresh(conv)
+        from app.core.ws_manager import hub  # local import to avoid cycle
+        await hub.broadcast_web(
+            user.team_id,
+            "conversation.updated",
+            ConversationOut.model_validate(conv).model_dump(mode="json"),
+        )
+    return conv
+
+
 @router.get("/{cid}/messages", response_model=list[MessageOut])
 async def list_messages(
     cid: int,

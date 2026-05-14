@@ -48,6 +48,11 @@ def _mask_api_key(d: dict) -> dict:
     return out
 
 
+def _is_placeholder(val: str | None) -> bool:
+    """Empty or the literal mask sent back from the UI = 'keep saved value'."""
+    return not val or val == _MASK
+
+
 # ---------- schemas ----------
 class LLMIn(BaseModel):
     provider: Literal["mock", "openai"] = "openai"
@@ -106,10 +111,14 @@ async def _upsert(
     scope: Scope,
     payload: dict,
     *,
-    treat_empty_api_key_as_keep: bool = True,
+    treat_placeholder_as_keep: bool = True,
 ) -> int:
-    # if api_key blank, drop it so the existing one is preserved
-    if treat_empty_api_key_as_keep and "api_key" in payload and not payload["api_key"]:
+    # api_key empty or still the mask "********" → drop, so the existing one is preserved
+    if (
+        treat_placeholder_as_keep
+        and "api_key" in payload
+        and _is_placeholder(payload["api_key"])
+    ):
         payload = {k: v for k, v in payload.items() if k != "api_key"}
     return await settings_service.upsert(db, team_id, scope, payload)
 
@@ -159,6 +168,23 @@ class ProbeOut(BaseModel):
     dim: int | None = None
 
 
+def _merge_for_test(saved: dict, body_payload: dict | None) -> dict:
+    """Overlay body on top of saved, with placeholder api_key ('' or '********')
+    meaning 'use saved value'."""
+    cfg = dict(saved)
+    if body_payload is None:
+        return cfg
+    for k, v in body_payload.items():
+        if k == "api_key" and _is_placeholder(v):
+            continue  # keep saved api_key
+        cfg[k] = v
+    return cfg
+
+
+def _requires_real_key(cfg: dict) -> bool:
+    return (cfg.get("provider") or "").lower() == "openai"
+
+
 @router.post("/test/llm", response_model=ProbeOut)
 async def test_llm(
     body: LLMIn | None = None,
@@ -167,15 +193,22 @@ async def test_llm(
 ) -> ProbeOut:
     """One-shot ping. If a body is provided, the form values are tested
     *without* persisting; otherwise the currently-saved config is used.
-    api_key="" in the body means "use saved value".
+    api_key="" or "********" in the body means 'use saved value'.
+
+    When the user explicitly picked provider=openai but no usable api_key can
+    be resolved, we fail loudly — silent fallback to mock used to make people
+    think their real-model config worked.
     """
     saved = await settings_service.get(db, user.team_id, "llm")
-    cfg = dict(saved)
-    if body is not None:
-        payload = body.model_dump()
-        if not payload.get("api_key"):
-            payload.pop("api_key", None)
-        cfg.update(payload)
+    cfg = _merge_for_test(saved, body.model_dump() if body else None)
+
+    if _requires_real_key(cfg) and not (cfg.get("api_key") or "").strip():
+        return ProbeOut(
+            ok=False,
+            detail="provider=openai 但 api_key 为空（请填写 api_key 后再点测试）",
+            model="(none)",
+        )
+
     try:
         provider = build_provider(cfg)
         result = await provider.chat(
@@ -183,11 +216,21 @@ async def test_llm(
             temperature=0.0,
             max_tokens=16,
         )
+        # Surface which provider actually answered so the user can spot a fallback.
+        prov_name = getattr(provider, "name", "?")
+        actual = f"{prov_name} · {result.model}"
+        # If user asked for openai but we still got mock (defensive), flag it.
+        if _requires_real_key(cfg) and prov_name != "openai":
+            return ProbeOut(
+                ok=False,
+                detail=f"配置 provider=openai 但实际使用了 {prov_name}（检查 api_key / base_url）",
+                model=actual,
+            )
         return ProbeOut(
             ok=True,
             detail=result.text[:80] or "(empty)",
             latency_ms=result.latency_ms,
-            model=result.model,
+            model=actual,
         )
     except Exception as e:  # noqa: BLE001
         return ProbeOut(ok=False, detail=str(e)[:300])
@@ -200,19 +243,31 @@ async def test_embedding(
     db: AsyncSession = Depends(get_db),
 ) -> ProbeOut:
     saved = await settings_service.get(db, user.team_id, "embedding")
-    cfg = dict(saved)
-    if body is not None:
-        payload = body.model_dump()
-        if not payload.get("api_key"):
-            payload.pop("api_key", None)
-        cfg.update(payload)
+    cfg = _merge_for_test(saved, body.model_dump() if body else None)
+
+    if _requires_real_key(cfg) and not (cfg.get("api_key") or "").strip():
+        return ProbeOut(
+            ok=False,
+            detail="provider=openai 但 api_key 为空（请填写 api_key 后再点测试）",
+        )
+
     try:
         provider = build_embedding_provider(cfg)
         vec = await provider.embed_one("ping")
+        prov_name = getattr(provider, "name", "?")
+        model = getattr(provider, "model", provider.name)
+        actual = f"{prov_name} · {model}"
+        if _requires_real_key(cfg) and prov_name != "openai":
+            return ProbeOut(
+                ok=False,
+                detail=f"配置 provider=openai 但实际使用了 {prov_name}（检查 api_key / base_url）",
+                model=actual,
+                dim=len(vec),
+            )
         return ProbeOut(
             ok=True,
             detail=f"vector returned, |v|={len(vec)}",
-            model=getattr(provider, "model", provider.name),
+            model=actual,
             dim=len(vec),
         )
     except Exception as e:  # noqa: BLE001

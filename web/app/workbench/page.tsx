@@ -62,6 +62,10 @@ export default function WorkbenchPage() {
       api<{ summary?: string } | null>(`/memory/${conv.contact_id}`)
         .then((p) => setMemorySummary(p?.summary || null))
         .catch(() => setMemorySummary(null));
+      // mark as read on the server (only if there are unread messages)
+      if (conv.unread_count > 0) {
+        api(`/conversations/${activeId}/read`, { method: "POST" }).catch(() => {});
+      }
     }
   }, [activeId, convs, reloadMessages]);
 
@@ -80,6 +84,11 @@ export default function WorkbenchPage() {
             setMessages((prev) =>
               prev.some((m) => m.id === payload.message.id) ? prev : [...prev, payload.message]
             );
+            // operator is currently looking at this conversation → mark read
+            // immediately so the unread badge does not flicker on.
+            if (payload.message?.direction === "in") {
+              api(`/conversations/${activeId}/read`, { method: "POST" }).catch(() => {});
+            }
           }
           reloadConvs().catch(() => {});
         } else if (event === "message.updated") {
@@ -155,32 +164,47 @@ export default function WorkbenchPage() {
           )}
           {convs.map((c) => {
             const initial = (c.contact.nickname || c.contact.external_id).slice(0, 1);
+            const ts = c.last_message_at ? formatTs(c.last_message_at) : "";
+            // grid columns: avatar (auto) + content (1fr, can shrink); content
+            // itself uses grid-cols-[minmax(0,1fr)_auto] for each row so the
+            // text column is hard-capped and badges/timestamps never get
+            // pushed off-screen.
             return (
               <button
                 key={c.id}
                 onClick={() => setActiveId(c.id)}
                 className={cn(
-                  "flex w-full items-start gap-3 border-b px-4 py-3 text-left transition-colors",
+                  "grid w-full grid-cols-[auto_minmax(0,1fr)] items-start gap-3 border-b px-3 py-3 text-left transition-colors",
                   activeId === c.id ? "bg-accent" : "hover:bg-accent/50"
                 )}
               >
-                <Avatar className="h-9 w-9 mt-0.5">
-                  <AvatarFallback>{initial}</AvatarFallback>
+                <Avatar className="h-10 w-10 mt-0.5">
+                  <AvatarFallback className="text-sm">{initial}</AvatarFallback>
                 </Avatar>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-2">
                     <span className="truncate text-sm font-medium">
                       {c.contact.nickname || c.contact.external_id}
                     </span>
+                    {ts && (
+                      <span className="text-[10px] text-muted-foreground">
+                        {ts}
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                    <p className="truncate text-xs text-muted-foreground">
+                      {c.last_message_preview || "—"}
+                    </p>
                     {c.unread_count > 0 && (
-                      <Badge variant="destructive" className="px-1.5 py-0 text-[10px]">
-                        {c.unread_count}
+                      <Badge
+                        variant="destructive"
+                        className="h-4 min-w-[18px] justify-center rounded-full px-1 text-[10px] leading-none"
+                      >
+                        {c.unread_count > 99 ? "99+" : c.unread_count}
                       </Badge>
                     )}
                   </div>
-                  <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                    {c.last_message_preview || "—"}
-                  </p>
                 </div>
               </button>
             );
@@ -331,6 +355,22 @@ export default function WorkbenchPage() {
       </div>
     </div>
   );
+}
+
+function formatTs(iso: string): string {
+  const d = new Date(iso);
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  const diffDays = Math.floor((now.getTime() - d.getTime()) / 86400000);
+  if (diffDays === 1) return "昨天";
+  if (diffDays < 7) return `${diffDays}天前`;
+  return d.toLocaleDateString([], { month: "2-digit", day: "2-digit" });
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {

@@ -4,10 +4,21 @@ Handles the inbound side (Android → backend) and broadcasts to Web hub.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# WeCom aggregates >1 pending unread messages in a single chat into a single
+# notification whose body is prefixed with "[N条]". The Android listener strips
+# it, but we mirror that here as a defence-in-depth — other inbound channels
+# (REST replay, third-party recorders) may forward the raw text.
+_AGG_PREFIX_RX = re.compile(r"^\s*\[\s*\d+\s*条\s*]\s*")
+
+
+def _clean_content(text: str) -> str:
+    return _AGG_PREFIX_RX.sub("", text or "").strip()
 
 from app.ai import workflow as ai_workflow
 from app.core.ws_manager import hub
@@ -74,20 +85,30 @@ async def ingest_inbound_message(
         db.add(conv)
         await db.flush()
 
+    # IMPORTANT: server time only.
+    # We used to honour evt.sent_at (client clock) and that meant a phone
+    # whose clock was a few seconds ahead would file the inbound *after*
+    # the AI reply that was generated milliseconds later on the server.
+    # Client timestamps are kept in the wire schema for analytics but
+    # MUST NOT be used for ordering.
+    now = utcnow()
+    cleaned = _clean_content(evt.content)
+    if not cleaned:
+        return None  # nothing left after stripping notification noise
     msg = Message(
         conversation_id=conv.id,
         direction="in",
         sender_type="customer",
         type=evt.type,
-        content=evt.content,
+        content=cleaned,
         external_msg_id=evt.external_msg_id,
-        created_at=evt.sent_at or utcnow(),
+        created_at=now,
     )
     db.add(msg)
 
     conv.unread_count = (conv.unread_count or 0) + 1
-    conv.last_message_at = msg.created_at
-    conv.last_message_preview = evt.content[:200]
+    conv.last_message_at = now
+    conv.last_message_preview = cleaned[:200]
 
     await db.commit()
     await db.refresh(msg)

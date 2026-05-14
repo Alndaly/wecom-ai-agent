@@ -105,7 +105,18 @@ uvicorn app.main:app --port 8000
 
 完整步骤见 [docs/13-real-providers.md](docs/13-real-providers.md)。
 
-### 7. 真模型端到端验证
+### 7. Android 真机（不再是 stub）
+
+`AccessibilityService` + `NotificationListener` 已经接到企微：
+- 通知监听 → 实时上报 `message.received`
+- 任务下发 → `WeComAutomator` 真去打开企微 → 搜索 → 输入 → 点发送
+- 失败自动 dump UI 树到后端 `var/ui_dumps/`
+- 干跑（dry-run）开关 + 校准按钮 + 测试发送一应俱全
+
+完整上手手册：[docs/14-android-real-device.md](docs/14-android-real-device.md)。
+我没真机所以代码里的 UI 节点策略只能靠 dump 来调；第一次发不成功时把 `var/ui_dumps/` 里的 dump 给我看一眼就能改对。
+
+### 8. 真模型端到端验证
 
 ```bash
 export REAL_LLM_API_KEY=sk-...

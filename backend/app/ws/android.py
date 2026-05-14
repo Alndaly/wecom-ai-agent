@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from pathlib import Path
+
 from app.core.db import SessionLocal
 from app.core.ws_manager import hub
 from app.models import Robot, RobotTask
@@ -126,4 +128,21 @@ async def _handle_event(robot: Robot, data: dict) -> None:
                 )
         return
 
+    if event == "device.ui_dump":
+        _save_ui_dump(robot, payload)
+        return
+
     log.info("unknown android event: %s", event)
+
+
+def _save_ui_dump(robot: Robot, payload: dict) -> None:
+    """Persist a UI tree dump under var/ui_dumps/ so we can calibrate locators."""
+    reason = (payload.get("reason") or "manual").replace("/", "_")[:64]
+    page = (payload.get("current_page") or "UNKNOWN")[:32]
+    tree = payload.get("tree") or ""
+    base = Path("var/ui_dumps")
+    base.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fp = base / f"{robot.robot_id}-{ts}-{page}-{reason}.txt"
+    fp.write_text(tree, encoding="utf-8")
+    log.info("ui_dump saved: %s (%d bytes)", fp, len(tree))

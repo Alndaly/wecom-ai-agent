@@ -113,7 +113,10 @@ export default function SettingsPage() {
 }
 
 function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
-  const [v, setV] = useState<LlmCfg>(value);
+  // Never carry the masked "********" into form state — start api_key blank
+  // and let the backend keep its saved value when we send empty.
+  const hasSavedKey = value.api_key === "********";
+  const [v, setV] = useState<LlmCfg>({ ...value, api_key: "" });
   const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(false);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
@@ -123,6 +126,7 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
     try {
       await api("/settings/llm", { method: "PUT", body: JSON.stringify(v) });
       toast({ title: "LLM 配置已保存" });
+      setV((cur) => ({ ...cur, api_key: "" }));
       onSaved();
     } catch (e: any) {
       toast({ title: "保存失败", description: e?.message, variant: "destructive" });
@@ -207,10 +211,10 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
             full
           />
           <Field
-            label="api_key（留空则保持已保存的值）"
+            label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 key）" : ""}`}
             value={v.api_key}
             onChange={(x) => setV({ ...v, api_key: x })}
-            placeholder={v.api_key === "********" ? "已配置 ********" : "sk-..."}
+            placeholder={hasSavedKey ? "已配置 ✓ — 留空则保持，填写则覆盖" : "sk-..."}
             type="password"
             full
           />
@@ -235,7 +239,8 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
 }
 
 function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => void }) {
-  const [v, setV] = useState<EmbedCfg>(value);
+  const hasSavedKey = value.api_key === "********";
+  const [v, setV] = useState<EmbedCfg>({ ...value, api_key: "" });
   const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(false);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
@@ -245,6 +250,7 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
     try {
       await api("/settings/embedding", { method: "PUT", body: JSON.stringify(v) });
       toast({ title: "Embedding 配置已保存" });
+      setV((cur) => ({ ...cur, api_key: "" }));
       onSaved();
     } catch (e: any) {
       toast({ title: "保存失败", description: e?.message, variant: "destructive" });
@@ -328,10 +334,10 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
             full
           />
           <Field
-            label="api_key（留空则保持已保存的值）"
+            label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 key）" : ""}`}
             value={v.api_key}
             onChange={(x) => setV({ ...v, api_key: x })}
-            placeholder={v.api_key === "********" ? "已配置 ********" : "sk-..."}
+            placeholder={hasSavedKey ? "已配置 ✓ — 留空则保持，填写则覆盖" : "sk-..."}
             type="password"
             full
           />

@@ -40,3 +40,10 @@ data class HeartbeatPayload(
     val current_page: String? = null,
     val battery: Int? = null,
 )
+
+@Serializable
+data class UiDumpPayload(
+    val reason: String,
+    val current_page: String? = null,
+    val tree: String,
+)

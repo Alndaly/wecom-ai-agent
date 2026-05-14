@@ -50,9 +50,20 @@ SEARCH  CHAT    CONTACT  MOMENTS    UNKNOWN
 | 后端 → Android | `task.dispatch` | 下发任务（含 `taskId`、`type`、`payload`） |
 | 后端 → Android | `device.command` | 软指令（重启监听、清缓存、截图） |
 
-## 3.5 验收标准（MVP1）
+## 3.5 验收标准
 
-- [ ] 设备启动后能向后端注册并保持心跳 ≥ 1 小时不掉线。
-- [ ] 在企微聊天页能稳定捕获文本消息并上报（实测准确率 ≥ 95%）。
-- [ ] 收到 `send_text` 任务能在 ≤ 5s 内完成发送并回执。
-- [ ] 异常页面 30s 内能自动回到 HOME。
+代码层（已完成 ✅）：
+- [x] WS 连接 + 心跳 + 自动重连
+- [x] NotificationListener 解析 WeCom 通知,推 `message.received`
+- [x] AccessibilityService 在 CHAT 页时主动 harvest 新气泡（去重 30s）
+- [x] `task.dispatch (send_text)` → `WeComAutomator` 真打开企微/搜索/输入/发送
+- [x] 失败自动 dump 节点树到 logcat + 上传 `device.ui_dump`
+- [x] dry-run 开关 + 校准/测试按钮
+- [x] `device.ui_dump` 后端落 `backend/var/ui_dumps/`
+
+真机层（由你拿真机 + 企微账号验收）：
+- [ ] 抓取通知准确率 ≥ 95%
+- [ ] `send_text` 在 ≤ 5s 完成,并在企微聊天里出现
+- [ ] 异常页面 30s 内能自动回到 HOME
+
+完整真机部署 + UI 校准步骤见 [14-android-real-device.md](14-android-real-device.md)。

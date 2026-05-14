@@ -140,8 +140,169 @@ async def main() -> int:
             assert mine and mine["status"] == "sent", f"expected sent, got {mine}"
             print("[smoke] outbound human message status=sent OK")
 
+        # ---- regression: client-supplied sent_at must not control ordering ----
+        # Send a "future" inbound, then a human reply; the AI/human reply's
+        # created_at must still be >= the inbound's (server time wins).
+        await test_clock_skew_ordering(http, auth)
+
+        # ---- regression: POST /conversations/{id}/read clears unread_count ----
+        await test_mark_read(http, auth)
+
+        # ---- regression: WeCom "[N条]" aggregation prefix gets stripped ----
+        await test_aggregation_prefix_strip(http, auth)
+
     print("[smoke] ALL PASSED ✓")
     return 0
+
+
+async def test_aggregation_prefix_strip(http, auth):
+    # Fresh robot, mode=human so AI doesn't muddy the message stream
+    r = await http.post("/robots", headers=auth, json={"name": "prefix-bot"})
+    r.raise_for_status()
+    d = r.json()
+    rid, rtoken = d["robot"]["robot_id"], d["token"]
+
+    cases = [
+        ("111", "111"),
+        ("[2条]222", "222"),
+        ("[ 3 条 ] 333", "333"),                      # whitespace tolerated
+        ("[10条]hello world", "hello world"),
+        ("不是前缀[2条]的消息", "不是前缀[2条]的消息"),   # only strips at the start
+    ]
+
+    url = f"{WS_BASE}/ws/android?robot_id={rid}&token={rtoken}"
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"event": "device.hello", "payload": {"current_page": "HOME"}}))
+        for raw, _ in cases:
+            await ws.send(json.dumps({
+                "event": "message.received",
+                "payload": {
+                    "contact": {"external_id": "wxid_prefix", "nickname": "前缀客户"},
+                    "external_msg_id": f"pfx_{uuid.uuid4().hex[:8]}",
+                    "type": "text",
+                    "content": raw,
+                },
+            }))
+            # small gap so timestamps are strictly increasing
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.4)
+
+    convs = (
+        await http.get("/conversations", headers=auth, params={"robot_id": d["robot"]["id"]})
+    ).json()
+    assert convs, "no conv for prefix-bot"
+    await http.patch(f"/conversations/{convs[0]['id']}", headers=auth, json={"mode": "human"})
+
+    msgs = (
+        await http.get(f"/conversations/{convs[0]['id']}/messages?limit=200", headers=auth)
+    ).json()
+    inbound = [m for m in msgs if m["direction"] == "in"]
+    actual = [m["content"] for m in inbound]
+    expected = [c for _, c in cases]
+    assert actual == expected, f"expected {expected}, got {actual}"
+    print(f"[smoke] [N条] aggregation prefix stripped OK ({len(actual)} cases)")
+
+
+async def test_mark_read(http, auth):
+    # produce an unread inbound on a fresh robot (mode forced to human so AI
+    # doesn't auto-reply and skew counters)
+    r = await http.post("/robots", headers=auth, json={"name": "read-bot"})
+    r.raise_for_status()
+    d = r.json()
+    rid, rtoken = d["robot"]["robot_id"], d["token"]
+
+    url = f"{WS_BASE}/ws/android?robot_id={rid}&token={rtoken}"
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"event": "device.hello", "payload": {"current_page": "HOME"}}))
+        await ws.send(json.dumps({
+            "event": "message.received",
+            "payload": {
+                "contact": {"external_id": "wxid_read", "nickname": "Read客户"},
+                "external_msg_id": f"rd_{uuid.uuid4().hex[:8]}",
+                "type": "text",
+                "content": "hello unread",
+            },
+        }))
+        await asyncio.sleep(0.4)
+
+    convs = (
+        await http.get("/conversations", headers=auth, params={"robot_id": d["robot"]["id"]})
+    ).json()
+    assert convs, "no conv for read-bot"
+    target = convs[0]
+    # if AI auto-replied, the inbound is still 1; we don't care which mode here
+    assert target["unread_count"] > 0, f"expected unread > 0; got {target}"
+
+    r = await http.post(f"/conversations/{target['id']}/read", headers=auth)
+    r.raise_for_status()
+    after = r.json()
+    assert after["unread_count"] == 0, f"unread not cleared: {after}"
+
+    # idempotent: second call still 0
+    r2 = await http.post(f"/conversations/{target['id']}/read", headers=auth)
+    r2.raise_for_status()
+    assert r2.json()["unread_count"] == 0
+    print("[smoke] mark-read clears unread_count OK (idempotent)")
+
+
+async def test_clock_skew_ordering(http, auth):
+    from datetime import timedelta
+    # create a fresh robot just for this
+    r = await http.post("/robots", headers=auth, json={"name": "skew-bot"})
+    r.raise_for_status()
+    d = r.json()
+    rid, rtoken = d["robot"]["robot_id"], d["token"]
+
+    # force mode=human first to avoid AI auto-reply complicating timestamps
+    url = f"{WS_BASE}/ws/android?robot_id={rid}&token={rtoken}"
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"event": "device.hello", "payload": {"current_page": "HOME"}}))
+
+        future_ts = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+        await ws.send(json.dumps({
+            "event": "message.received",
+            "payload": {
+                "contact": {"external_id": "wxid_skew", "nickname": "未来客户"},
+                "external_msg_id": f"skew_{uuid.uuid4().hex[:8]}",
+                "type": "text",
+                "content": "我从未来发来的消息",
+                "sent_at": future_ts,
+            },
+        }))
+        await asyncio.sleep(0.3)
+
+    convs = (await http.get("/conversations", headers=auth, params={"robot_id": d["robot"]["id"]})).json()
+    conv = convs[0]
+    await http.patch(f"/conversations/{conv['id']}", headers=auth, json={"mode": "human"})
+    # send a human reply
+    await http.post(
+        f"/conversations/{conv['id']}/messages",
+        headers=auth,
+        json={"type": "text", "content": "我从现在回复"},
+    )
+
+    msgs = (await http.get(f"/conversations/{conv['id']}/messages", headers=auth)).json()
+    msgs.sort(key=lambda m: m["id"])  # insertion order
+    inbound = [m for m in msgs if m["direction"] == "in"][0]
+    outbound = [m for m in msgs if m["direction"] == "out"][0]
+
+    def parse(ts: str):
+        s = ts.replace("Z", "+00:00")
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+
+    in_ts = parse(inbound["created_at"])
+    out_ts = parse(outbound["created_at"])
+    assert out_ts >= in_ts, (
+        f"server time ordering broken: out({out_ts}) < in({in_ts}); "
+        f"inbound created_at is from client clock"
+    )
+    # and definitely not the +120s future from the wire
+    delta = (datetime.now(timezone.utc) - in_ts).total_seconds()
+    assert abs(delta) < 30, f"inbound timestamp not from server clock; delta={delta}s"
+    print("[smoke] clock-skew ordering OK (server time used)")
 
 
 if __name__ == "__main__":
