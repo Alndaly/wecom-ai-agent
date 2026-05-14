@@ -21,6 +21,7 @@ class BackendClient(
     private val robotId: String,
     private val token: String,
     private val onEvent: (event: String, payload: JsonElement?) -> Unit,
+    private val onState: (state: String) -> Unit = {},
 ) {
     private val tag = "BackendClient"
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -60,6 +61,7 @@ class BackendClient(
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         Log.i(tag, "ws open")
                         backoffMs = 1_000L
+                        onState("connected")
                         open.complete(Unit)
                     }
 
@@ -76,11 +78,13 @@ class BackendClient(
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         Log.w(tag, "ws failure", t)
+                        onState("disconnected")
                         if (!closed.isCompleted) closed.complete(Unit)
                     }
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         Log.i(tag, "ws closed $code $reason")
+                        onState("disconnected")
                         if (!closed.isCompleted) closed.complete(Unit)
                     }
                 })

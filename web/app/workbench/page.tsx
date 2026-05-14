@@ -114,10 +114,14 @@ export default function WorkbenchPage() {
     if (!active || !content) return;
     setSending(true);
     try {
-      await api(`/conversations/${active.id}/messages`, {
+      const res = await api<{ message: Message }>(`/conversations/${active.id}/messages`, {
         method: "POST",
         body: JSON.stringify({ type: "text", content }),
       });
+      setMessages((prev) =>
+        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+      );
+      reloadConvs().catch(() => {});
       if (!text) setDraft("");
     } catch (e: any) {
       toast({ title: "发送失败", description: e?.message ?? String(e), variant: "destructive" });

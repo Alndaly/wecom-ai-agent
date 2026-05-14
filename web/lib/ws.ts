@@ -6,6 +6,12 @@ type Handler = (event: string, payload: any) => void;
 
 export function useWebWs(onEvent: Handler) {
   const ref = useRef<WebSocket | null>(null);
+  const handlerRef = useRef(onEvent);
+
+  useEffect(() => {
+    handlerRef.current = onEvent;
+  }, [onEvent]);
+
   useEffect(() => {
     const token = getToken();
     if (!token) return;
@@ -18,7 +24,7 @@ export function useWebWs(onEvent: Handler) {
       ws.onmessage = (e) => {
         try {
           const data = JSON.parse(e.data);
-          if (data.event) onEvent(data.event, data.payload);
+          if (data.event) handlerRef.current(data.event, data.payload);
         } catch {
           /* ignore */
         }
@@ -41,6 +47,5 @@ export function useWebWs(onEvent: Handler) {
       if (pingTimer) clearInterval(pingTimer);
       ref.current?.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 }

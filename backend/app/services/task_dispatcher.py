@@ -51,12 +51,12 @@ async def create_and_dispatch_send_text(
     await db.refresh(msg)
     await db.refresh(task)
 
-    await _try_dispatch(robot, task)
+    await _try_dispatch(db, robot, task)
     await _broadcast_message_new(robot.team_id, conv.id, msg)
     return msg, task
 
 
-async def _try_dispatch(robot: Robot, task: RobotTask) -> None:
+async def _try_dispatch(db: AsyncSession, robot: Robot, task: RobotTask) -> None:
     delivered = await hub.send_android(
         robot.robot_id,
         "task.dispatch",
@@ -64,6 +64,8 @@ async def _try_dispatch(robot: Robot, task: RobotTask) -> None:
     )
     if delivered:
         task.status = "dispatched"
+        await db.commit()
+        await db.refresh(task)
 
 
 async def update_task_on_callback(

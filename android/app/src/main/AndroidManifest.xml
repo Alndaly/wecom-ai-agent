@@ -12,6 +12,7 @@
     <application
         android:label="WeCom Agent"
         android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:supportsRtl="true">
 
         <activity

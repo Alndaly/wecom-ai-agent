@@ -67,6 +67,10 @@ async def main(args: argparse.Namespace) -> None:
                     await asyncio.sleep(0.5)
                     await send("task.completed", {"task_id": payload["task_id"]})
                     print(f"[mock] -> task.completed task_id={payload['task_id']}")
+        except websockets.ConnectionClosedOK:
+            print("[mock] websocket closed normally")
+        except websockets.ConnectionClosedError as e:
+            print(f"[mock] websocket closed with error: {e}")
         finally:
             hb_task.cancel()
 
