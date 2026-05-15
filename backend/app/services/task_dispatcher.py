@@ -89,6 +89,8 @@ async def update_task_on_callback(
     status: str,
     error: str | None = None,
 ) -> None:
+    if task_id is None or task_id <= 0:
+        return  # sentinel id from a local-test path — no row to update
     task = await db.get(RobotTask, task_id)
     if not task or task.robot_id != robot.id:
         return
@@ -133,7 +135,18 @@ async def append_task_log(
     level: str,
     message: str,
 ) -> None:
-    db.add(RobotTaskLog(robot_id=robot.id, task_id=task_id, level=level, message=message))
+    # If a task_id is supplied but no row exists (e.g. -1 sentinel or stale ref
+    # after a manual delete), Postgres' FK enforcement would reject the insert.
+    # Drop the reference rather than crashing the whole inbound pipeline.
+    safe_task_id: int | None = task_id
+    if safe_task_id is not None:
+        if safe_task_id <= 0:
+            safe_task_id = None
+        else:
+            exists = await db.get(RobotTask, safe_task_id)
+            if exists is None:
+                safe_task_id = None
+    db.add(RobotTaskLog(robot_id=robot.id, task_id=safe_task_id, level=level, message=message))
     await db.commit()
     await hub.broadcast_web(
         robot.team_id,

@@ -121,7 +121,12 @@ async def _handle_event(robot: Robot, data: dict) -> None:
         return
 
     if event in ("task.completed", "task.failed"):
-        task_id = int(payload.get("task_id"))
+        # Local test on Android uses task_id=-1 as a "no real task" sentinel —
+        # ignore those callbacks entirely (no SQL row exists to update).
+        raw = payload.get("task_id")
+        task_id = int(raw) if raw is not None else 0
+        if task_id <= 0:
+            return
         status = "completed" if event == "task.completed" else "failed"
         error = payload.get("error")
         async with SessionLocal() as db:
@@ -133,13 +138,17 @@ async def _handle_event(robot: Robot, data: dict) -> None:
         return
 
     if event == "task.log":
-        task_id = payload.get("task_id")
+        raw = payload.get("task_id")
+        task_id = int(raw) if raw is not None else None
+        # Same sentinel — drop the FK reference to NULL so PG doesn't blow up.
+        if task_id is not None and task_id <= 0:
+            task_id = None
         message = payload.get("message") or ""
         level = payload.get("level") or "info"
         async with SessionLocal() as db:
             r = await db.get(Robot, robot.id)
             if r:
-                await append_task_log(db, robot=r, task_id=int(task_id) if task_id is not None else None, level=level, message=message)
+                await append_task_log(db, robot=r, task_id=task_id, level=level, message=message)
         return
 
     if event == "device.ui_dump":
