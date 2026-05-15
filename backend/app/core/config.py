@@ -13,8 +13,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     heartbeat_timeout_sec: int = 90
-    task_dispatch_timeout_sec: int = 60
-
     # ---- AI ----
     llm_provider: str = "mock"  # mock | openai
     llm_model: str = "gpt-4o-mini"

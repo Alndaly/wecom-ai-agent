@@ -18,7 +18,7 @@ from app.schemas import (
     MessageSendOut,
     TaskOut,
 )
-from app.services.task_dispatcher import create_and_dispatch_send_text
+from app.services.send_orchestrator import create_and_dispatch_send_text
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 

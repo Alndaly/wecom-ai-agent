@@ -25,7 +25,8 @@ async def _kb_search(ctx: ToolContext, args: dict[str, Any]) -> str:
     query = (args.get("query") or "").strip()
     if not query:
         return "ERROR: query 不能为空"
-    top_k = int(args.get("top_k") or 5)
+    requested_top_k = int(args.get("top_k") or 8)
+    top_k = max(6, min(requested_top_k, 12))
     try:
         res = await retrieve(ctx.db, team_id=ctx.team_id, query=query, top_k=top_k)
     except Exception as e:  # noqa: BLE001
@@ -42,21 +43,32 @@ async def _kb_search(ctx: ToolContext, args: dict[str, Any]) -> str:
 
     if not hits:
         return f"未在知识库中找到与「{query}」相关的内容。"
-    lines = [f"针对「{query}」的检索结果（top {len(hits)}）:"]
+    lines = [
+        f"针对「{query}」的混合检索结果（Milvus 语义召回 + Neo4j 图谱扩展，top {len(hits)}）:"
+    ]
     for i, h in enumerate(hits, 1):
         snippet = (h.text or "").replace("\n", " ").strip()
-        if len(snippet) > 240:
-            snippet = snippet[:240] + "…"
-        lines.append(f"[{i}] score={h.score:.2f} chunk={h.chunk_id} · {snippet}")
+        if len(snippet) > 700:
+            snippet = snippet[:700] + "…"
+        source = getattr(h, "source", "vector")
+        lines.append(
+            f"[{i}] source={source} score={h.score:.2f} chunk={h.chunk_id} · {snippet}"
+        )
+    if res.graph_facts:
+        lines.append("关联实体:")
+        for f in res.graph_facts[:8]:
+            lines.append(
+                f"- ({f.src_label}:{f.src_name}) -[{f.rel}]-> ({f.dst_label}:{f.dst_name})"
+            )
     return "\n".join(lines)
 
 
 kb_search = Tool(
     name="kb_search",
-    description="查询企业内部知识库（向量+图谱检索），返回最相关的片段。优先用它回答事实性问题。",
+    description="查询企业内部知识库（Milvus 向量召回 + Neo4j 图谱扩展），返回可用于总结回答的多个片段。优先用它回答事实性问题。",
     params={
         "query": {"type": "string", "desc": "检索的中文短语，越具体越好"},
-        "top_k": {"type": "int", "desc": "返回结果条数，默认 5"},
+        "top_k": {"type": "int", "desc": "返回结果条数，默认 8；不要小于 6"},
     },
     call=_kb_search,
 )

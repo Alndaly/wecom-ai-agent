@@ -31,8 +31,7 @@ import java.util.Locale
  * Single-screen control panel:
  *   - Backend connection settings (ws url / robot_id / token)
  *   - Permission status row (accessibility, notification listener, battery)
- *   - Dry-run toggle (don't actually drive the WeCom UI yet — just ack)
- *   - Calibration buttons (dump UI tree / test send)
+ *   - Calibration button (dump UI tree)
  *   - Live log
  */
 class MainActivity : Activity() {
@@ -44,13 +43,9 @@ class MainActivity : Activity() {
     private lateinit var a11yBtn: Button
     private lateinit var notifBtn: Button
     private lateinit var batteryBtn: Button
-    private lateinit var dryCb: CheckBox
     private lateinit var keepAwakeCb: CheckBox
     private lateinit var a11yIngestCb: CheckBox
     private lateinit var dumpBtn: Button
-    private lateinit var testContactEt: EditText
-    private lateinit var testTextEt: EditText
-    private lateinit var testSendBtn: Button
 
     @Volatile private var connectionState: String = "idle"
     @Volatile private var agentState: String = "未启动"
@@ -108,10 +103,6 @@ class MainActivity : Activity() {
             hint = "token"
             setText(prefs.getString("token", ""))
         }
-        dryCb = CheckBox(this).apply {
-            text = "Dry-run（不真正驱动企微 UI，只 ack）"
-            isChecked = prefs.getBoolean("dry_run", true)
-        }
         keepAwakeCb = CheckBox(this).apply {
             text = "屏幕常亮 / 防熄屏（建议保持开启）"
             isChecked = prefs.getBoolean("keep_screen_on", true)
@@ -161,15 +152,6 @@ class MainActivity : Activity() {
             setPadding(0, 32, 0, 8)
         }
         dumpBtn = Button(this).apply { text = "采集当前 UI 树（写 logcat + 上传后端）" }
-        testContactEt = EditText(this).apply {
-            hint = "测试联系人昵称（用于打开聊天）"
-            setText(prefs.getString("test_contact", ""))
-        }
-        testTextEt = EditText(this).apply {
-            hint = "测试文本"
-            setText(prefs.getString("test_text", "你好，这是一条测试"))
-        }
-        testSendBtn = Button(this).apply { text = "本地发送测试" }
 
         val logHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -217,36 +199,10 @@ class MainActivity : Activity() {
             startService(intent)
             appendLog("已请求采集 UI 树（请确保企微已在前台）")
         }
-        testSendBtn.setOnClickListener {
-            val c = testContactEt.text.toString().trim()
-            val t = testTextEt.text.toString().trim()
-            if (c.isBlank() || t.isBlank()) {
-                Toast.makeText(this, "联系人和文本都不能为空", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            prefs.edit().putString("test_contact", c).putString("test_text", t).apply()
-            val intent = Intent(this, AgentForegroundService::class.java).apply {
-                action = AgentForegroundService.ACTION_SEND_TEST
-                putExtra(AgentForegroundService.EXTRA_TEST_CONTACT, c)
-                putExtra(AgentForegroundService.EXTRA_TEST_TEXT, t)
-            }
-            startService(intent)
-            appendLog("已请求本地发送测试 → $c")
-        }
-        dryCb.setOnCheckedChangeListener { _, checked ->
-            prefs.edit().putBoolean("dry_run", checked).apply()
-            val intent = Intent(this, AgentForegroundService::class.java).apply {
-                action = AgentForegroundService.ACTION_SET_DRY_RUN
-                putExtra(AgentForegroundService.EXTRA_DRY_RUN, checked)
-            }
-            startService(intent)
-            appendLog("dry_run = $checked （已请求即时生效）")
-        }
-
         listOf(
-            buildTv, urlEt, ridEt, tokenEt, dryCb, keepAwakeCb, a11yIngestCb, startBtn, statusTv,
+            buildTv, urlEt, ridEt, tokenEt, keepAwakeCb, a11yIngestCb, startBtn, statusTv,
             permTv, permRow,
-            calibTitle, dumpBtn, testContactEt, testTextEt, testSendBtn,
+            calibTitle, dumpBtn,
             logHeader, logTv,
         ).forEach { root.addView(it) }
         setContentView(scroll)
@@ -306,7 +262,6 @@ class MainActivity : Activity() {
                 putExtra(AgentForegroundService.EXTRA_BASE_URL, base)
                 putExtra(AgentForegroundService.EXTRA_ROBOT_ID, rid)
                 putExtra(AgentForegroundService.EXTRA_TOKEN, token)
-                putExtra(AgentForegroundService.EXTRA_DRY_RUN, dryCb.isChecked)
                 putExtra(AgentForegroundService.EXTRA_A11Y_INGEST, a11yIngestCb.isChecked)
             }
             startForegroundService(intent)

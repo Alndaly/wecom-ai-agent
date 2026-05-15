@@ -97,3 +97,35 @@ class Neo4jGraphStore(GraphStore):
                 tid=team_id, names=lowers,
             )
             return [Node(label=r["n"]["label"], name=r["n"]["name"]) async for r in res]
+
+    async def related_chunks(
+        self, team_id: int, seed_chunk_ids: list[int], *, limit: int = 8
+    ) -> list[int]:
+        seed_names = [f"chunk-{cid}" for cid in seed_chunk_ids]
+        if not seed_names:
+            return []
+        async with self.driver.session() as s:
+            res = await s.run(
+                """
+                MATCH (seed:Entity {team_id:$tid, label:'Chunk'})
+                WHERE seed.name IN $seed_names
+                MATCH (seed)-[:MENTIONS]->(entity:Entity)
+                MATCH (related:Entity {team_id:$tid, label:'Chunk'})-[:MENTIONS]->(entity)
+                WHERE NOT related.name IN $seed_names
+                WITH related, count(DISTINCT entity) AS overlap
+                ORDER BY overlap DESC, related.name ASC
+                RETURN related.name AS name
+                LIMIT $lim
+                """,
+                tid=team_id,
+                seed_names=seed_names,
+                lim=limit,
+            )
+            out: list[int] = []
+            async for rec in res:
+                name = str(rec["name"] or "")
+                try:
+                    out.append(int(name.removeprefix("chunk-")))
+                except ValueError:
+                    continue
+            return out

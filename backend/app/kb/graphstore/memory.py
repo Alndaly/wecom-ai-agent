@@ -83,3 +83,29 @@ class MemoryGraphStore(GraphStore):
             for (lbl, nm), n in self._nodes.get(team_id, {}).items()
             if nm in lower or any(t in nm for t in lower)
         ]
+
+    async def related_chunks(
+        self, team_id: int, seed_chunk_ids: list[int], *, limit: int = 8
+    ) -> list[int]:
+        seed_keys = {("Chunk", f"chunk-{cid}") for cid in seed_chunk_ids}
+        if not seed_keys:
+            return []
+        async with self._lock:
+            mentioned_entities: set[tuple[str, str]] = set()
+            for key in seed_keys:
+                for rel, dst_key in self._adj[team_id].get(key, ()):
+                    if rel == "MENTIONS" and dst_key[0] != "Chunk":
+                        mentioned_entities.add(dst_key)
+
+            related: list[int] = []
+            for src_key, edges in self._adj[team_id].items():
+                if src_key[0] != "Chunk" or src_key in seed_keys:
+                    continue
+                if any(rel == "MENTIONS" and dst in mentioned_entities for rel, dst in edges):
+                    try:
+                        related.append(int(src_key[1].removeprefix("chunk-")))
+                    except ValueError:
+                        continue
+                    if len(related) >= limit:
+                        break
+            return related

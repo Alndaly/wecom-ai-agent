@@ -10,11 +10,11 @@ from pathlib import Path
 
 from app.core.db import SessionLocal
 from app.core.ws_manager import hub
-from app.models import Robot, RobotTask
+from app.models import Robot
 from app.routers.robots import verify_robot_token
 from app.schemas import AndroidMessageReceived
 from app.services.conversation import ingest_inbound_message
-from app.services.task_dispatcher import append_task_log, update_task_on_callback
+from app.services.send_orchestrator import append_task_log
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -52,25 +52,6 @@ async def android_ws(
     await hub.broadcast_web(
         robot.team_id, "robot.status", {"robot_id": robot.robot_id, "status": "online"}
     )
-
-    # flush any pending tasks
-    async with SessionLocal() as db:
-        pending = (
-            await db.execute(
-                select(RobotTask)
-                .where(RobotTask.robot_id == robot.id, RobotTask.status == "pending")
-                .order_by(RobotTask.id)
-            )
-        ).scalars().all()
-        for task in pending:
-            sent = await hub.send_android(
-                robot.robot_id,
-                "task.dispatch",
-                {"task_id": task.id, "type": task.type, "payload": task.payload_json},
-            )
-            if sent:
-                task.status = "dispatched"
-        await db.commit()
 
     try:
         while True:
@@ -118,23 +99,6 @@ async def _handle_event(robot: Robot, data: dict) -> None:
             r = await db.get(Robot, robot.id)
             if r:
                 await ingest_inbound_message(db, r, evt)
-        return
-
-    if event in ("task.completed", "task.failed"):
-        # Local test on Android uses task_id=-1 as a "no real task" sentinel —
-        # ignore those callbacks entirely (no SQL row exists to update).
-        raw = payload.get("task_id")
-        task_id = int(raw) if raw is not None else 0
-        if task_id <= 0:
-            return
-        status = "completed" if event == "task.completed" else "failed"
-        error = payload.get("error")
-        async with SessionLocal() as db:
-            r = await db.get(Robot, robot.id)
-            if r:
-                await update_task_on_callback(
-                    db, robot=r, task_id=task_id, status=status, error=error
-                )
         return
 
     if event == "task.log":

@@ -41,6 +41,12 @@ class GraphStore(ABC):
         self, team_id: int, names: list[str]
     ) -> list[Node]: ...
 
+    async def related_chunks(
+        self, team_id: int, seed_chunk_ids: list[int], *, limit: int = 8
+    ) -> list[int]:
+        """Return chunks connected to the seed chunks through shared graph entities."""
+        return []
+
     async def delete_chunks(self, team_id: int, chunk_ids: list[int]) -> None:
         """Remove Chunk nodes (and their incident edges) for the given ids.
 

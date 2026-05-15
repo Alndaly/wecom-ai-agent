@@ -16,8 +16,6 @@ import com.wecom.agent.model.DeviceCommandAckPayload
 import com.wecom.agent.model.HeartbeatPayload
 import com.wecom.agent.model.MessageReceivedPayload
 import com.wecom.agent.model.ScreenFramePayload
-import com.wecom.agent.model.TaskAckPayload
-import com.wecom.agent.model.TaskDispatchPayload
 import com.wecom.agent.net.BackendClient
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
@@ -25,14 +23,11 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import java.text.SimpleDateFormat
 import java.time.Instant
-import java.util.Date
-import java.util.Locale
 import java.util.UUID
 
 /**
- * Foreground service that owns the WebSocket lifecycle and the task executor.
+ * Foreground service that owns the WebSocket lifecycle and device primitives.
  * Started by MainActivity after the user configures backend URL / robot_id / token.
  */
 class AgentForegroundService : Service() {
@@ -42,26 +37,20 @@ class AgentForegroundService : Service() {
         const val EXTRA_BASE_URL = "base_url"
         const val EXTRA_ROBOT_ID = "robot_id"
         const val EXTRA_TOKEN = "token"
-        const val EXTRA_DRY_RUN = "dry_run"
         const val EXTRA_A11Y_INGEST = "a11y_ingest"
         const val ACTION_STOP = "com.wecom.agent.ACTION_STOP"
         const val ACTION_STATE_CHANGED = "com.wecom.agent.ACTION_STATE_CHANGED"
         const val ACTION_LOG = "com.wecom.agent.ACTION_LOG"
         const val ACTION_DUMP_UI = "com.wecom.agent.ACTION_DUMP_UI"
-        const val ACTION_SEND_TEST = "com.wecom.agent.ACTION_SEND_TEST"
-        const val ACTION_SET_DRY_RUN = "com.wecom.agent.ACTION_SET_DRY_RUN"
         const val ACTION_SET_A11Y_INGEST = "com.wecom.agent.ACTION_SET_A11Y_INGEST"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
-        const val EXTRA_TEST_CONTACT = "test_contact"
-        const val EXTRA_TEST_TEXT = "test_text"
     }
 
     private val tag = "AgentSvc"
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var client: BackendClient? = null
-    private var executor: TaskExecutor? = null
     private var heartbeatJob: Job? = null
     private var screenStreamJob: Job? = null
     // periodic message-list scanner — three tiers at different cadences
@@ -86,22 +75,6 @@ class AgentForegroundService : Service() {
                 scope.launch { dumpAndUpload("manual") }
                 return START_NOT_STICKY
             }
-            ACTION_SEND_TEST -> {
-                val c = intent.getStringExtra(EXTRA_TEST_CONTACT).orEmpty()
-                val t = intent.getStringExtra(EXTRA_TEST_TEXT).orEmpty()
-                if (c.isBlank() || t.isBlank()) {
-                    broadcastLog("发送测试失败：联系人或文本为空")
-                } else {
-                    scope.launch { runSendTest(c, t) }
-                }
-                return START_NOT_STICKY
-            }
-            ACTION_SET_DRY_RUN -> {
-                val dryRun = intent.getBooleanExtra(EXTRA_DRY_RUN, false)
-                executor?.dryRun = dryRun
-                broadcastLog("dry_run 已即时更新为 $dryRun")
-                return if (executor == null) START_NOT_STICKY else START_STICKY
-            }
             ACTION_SET_A11Y_INGEST -> {
                 a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
                 broadcastLog("无障碍消息采集已即时更新为 $a11yInboundEnabled")
@@ -116,25 +89,11 @@ class AgentForegroundService : Service() {
         val base = intent?.getStringExtra(EXTRA_BASE_URL) ?: return START_NOT_STICKY
         val rid = intent.getStringExtra(EXTRA_ROBOT_ID) ?: return START_NOT_STICKY
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: return START_NOT_STICKY
-        val dryRun = intent.getBooleanExtra(EXTRA_DRY_RUN, false)
         a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
-        Log.i(tag, "service starting base=$base robot_id=$rid token_len=${token.length} dryRun=$dryRun a11yInbound=$a11yInboundEnabled")
+        Log.i(tag, "service starting base=$base robot_id=$rid token_len=${token.length} a11yInbound=$a11yInboundEnabled")
         updateNotification("connecting $rid")
         broadcastState("connecting")
-        broadcastLog("服务启动，正在连接 $base${if (dryRun) " (dry-run)" else ""}")
-
-        // executor + UI listeners — kept alive for the service lifetime
-        executor = TaskExecutor(
-            applicationContext,
-            { msg -> broadcastLog(msg) },
-            onTaskLog = { taskId, level, message ->
-                scope.launch {
-                    appendTaskLog(taskId, level, message)
-                }
-            },
-        ).also {
-            it.dryRun = dryRun
-        }
+        broadcastLog("服务启动，正在连接 $base")
 
         // wire inbound channels → ws.message.received
         MessageNotificationListener.onMessage = { sender, content, postTime ->
@@ -293,58 +252,10 @@ class AgentForegroundService : Service() {
         broadcastLog(if (ok) "UI 树已上传" else "UI 树未上传（未连接后端）")
     }
 
-    private suspend fun runSendTest(contact: String, text: String) {
-        val ex = executor ?: run {
-            broadcastLog("executor 未初始化")
-            return
-        }
-        broadcastLog("开始本地测试发送: $contact :: $text")
-        val payload = kotlinx.serialization.json.JsonObject(mapOf(
-            "conversation_external_id" to kotlinx.serialization.json.JsonPrimitive(contact),
-            "text" to kotlinx.serialization.json.JsonPrimitive(text),
-        ))
-        val task = TaskDispatchPayload(task_id = -1L, type = "send_text", payload = payload)
-        val r = ex.run(task)
-        broadcastLog(if (r.success) "本地测试发送成功" else "本地测试失败: ${r.error}")
-    }
-
-    private suspend fun appendTaskLog(taskId: Long?, level: String, message: String) {
-        if (taskId == null) {
-            broadcastLog("任务日志未发送：未连接后端")
-            return
-        }
-        val payload = kotlinx.serialization.json.JsonObject(
-            mapOf(
-                "task_id" to kotlinx.serialization.json.JsonPrimitive(taskId),
-                "level" to kotlinx.serialization.json.JsonPrimitive(level),
-                "message" to kotlinx.serialization.json.JsonPrimitive(message),
-            )
-        )
-        client?.sendEvent("task.log", payload)
-    }
-
     private fun handleEvent(event: String, payload: JsonElement?) {
         Log.i(tag, "<- $event")
         broadcastLog("收到后端事件：$event")
         when (event) {
-            "task.dispatch" -> {
-                val p = json.decodeFromJsonElement(TaskDispatchPayload.serializer(), payload ?: return)
-                broadcastLog("收到任务 #${p.task_id}：${p.type}")
-                scope.launch {
-                    val ex = executor ?: return@launch
-                    val result = ex.run(p)
-                    val ackEvent = if (result.success) "task.completed" else "task.failed"
-                    val ackPayload = json.encodeToJsonElement(
-                        TaskAckPayload.serializer(),
-                        TaskAckPayload(task_id = p.task_id, error = result.error),
-                    )
-                    client?.sendEvent(ackEvent, ackPayload)
-                    broadcastLog(
-                        if (result.success) "任务 #${p.task_id} 执行完成"
-                        else "任务 #${p.task_id} 执行失败：${result.error}"
-                    )
-                }
-            }
             "device.command" -> {
                 val obj = payload?.jsonObject ?: return
                 val command = obj["command"]?.jsonPrimitive?.contentOrNull
@@ -370,7 +281,7 @@ class AgentForegroundService : Service() {
                     "back",
                     "home",
                     "open_wecom" -> {
-                        scope.launch { handleReactCommand(command!!, obj) }
+                        scope.launch { handleReactCommand(command, obj) }
                     }
                     else -> {
                         sendCommandAck(command ?: "unknown", false, "未知设备命令")
@@ -644,6 +555,4 @@ class AgentForegroundService : Service() {
         )
         Log.i(tag, message)
     }
-
-    private fun nowText(): String = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
 }

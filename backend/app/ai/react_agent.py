@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers import ChatMessage, get_provider
 from app.core.config import settings
-from app.core.ws_manager import hub
+from app.device import DeviceClient, UiNode
 from app.models import Robot
 from app.services import settings_service
 
@@ -71,27 +71,9 @@ TOOL_SCHEMA = {
 
 # ---- types ----------------------------------------------------------------
 @dataclass
-class _Node:
-    id: int
-    cls: str
-    view_id: str
-    text: str
-    desc: str
-    clickable: bool
-    focusable: bool
-    editable: bool
-    scrollable: bool
-    bounds: tuple[int, int, int, int]  # l, t, r, b
-
-    def center(self) -> tuple[int, int]:
-        l, t, r, b = self.bounds
-        return (l + r) // 2, (t + b) // 2
-
-
-@dataclass
 class _Observation:
     tree: str
-    nodes: dict[int, _Node]
+    nodes: dict[int, UiNode]
     screen_size: tuple[int, int]
     screenshot_b64: str | None = None  # JPEG base64 if available
     screenshot_mime: str = "image/jpeg"
@@ -203,54 +185,26 @@ async def run_react(
 
 # ---- observation ---------------------------------------------------------
 async def _observe(robot: Robot, *, want_screenshot: bool) -> _Observation:
-    dump = await hub.send_request(
-        robot.robot_id,
-        "device.command",
-        {"command": "dump_ui", "reason": "react"},
-        timeout=8.0,
-    )
-    nodes_payload = dump.get("nodes") or []
-    nodes: dict[int, _Node] = {}
-    for raw in nodes_payload:
-        bounds = raw.get("bounds") or [0, 0, 0, 0]
-        if len(bounds) != 4:
-            continue
-        n = _Node(
-            id=int(raw["id"]),
-            cls=str(raw.get("cls") or ""),
-            view_id=str(raw.get("view_id") or ""),
-            text=str(raw.get("text") or ""),
-            desc=str(raw.get("desc") or ""),
-            clickable=bool(raw.get("clickable")),
-            focusable=bool(raw.get("focusable")),
-            editable=bool(raw.get("editable")),
-            scrollable=bool(raw.get("scrollable")),
-            bounds=(int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])),
-        )
-        nodes[n.id] = n
-
-    screen_w = int(dump.get("screen_width") or 0)
-    screen_h = int(dump.get("screen_height") or 0)
+    device = DeviceClient(robot)
+    dump = await device.dump_ui(reason="react", timeout=8.0)
+    nodes = {n.id: n for n in dump.nodes if len(n.bounds) == 4}
+    screen_w = int(dump.screen_width or 0)
+    screen_h = int(dump.screen_height or 0)
 
     screenshot_b64: str | None = None
     screenshot_mime = "image/jpeg"
     if want_screenshot:
         try:
-            shot = await hub.send_request(
-                robot.robot_id,
-                "device.command",
-                {"command": "screenshot_once"},
-                timeout=10.0,
-            )
-            data = (shot.get("data") or {}) if isinstance(shot, dict) else {}
-            screenshot_b64 = data.get("image") if isinstance(data, dict) else None
-            if isinstance(data, dict):
+            shot = await device.screenshot_once(timeout=10.0)
+            data = shot.data or {}
+            screenshot_b64 = data.get("image")
+            if data:
                 screenshot_mime = str(data.get("mime") or "image/jpeg")
         except Exception:  # noqa: BLE001
             log.debug("[react] screenshot fetch failed; falling back to tree-only")
 
     return _Observation(
-        tree=_shrink_tree(dump.get("tree") or ""),
+        tree=_shrink_tree(dump.tree),
         nodes=nodes,
         screen_size=(screen_w, screen_h),
         screenshot_b64=screenshot_b64,
@@ -372,6 +326,7 @@ async def _execute(
     *,
     step_timeout: float,
 ) -> tuple[bool, str]:
+    device = DeviceClient(robot)
     if action == "tap_node":
         node = _lookup_node(obs, args.get("node_id"))
         if node is None:
@@ -381,19 +336,11 @@ async def _execute(
         # distinctive text — more robust to small layout shifts. Otherwise
         # fall back to coordinate tap.
         if node.text and len(node.text) >= 2:
-            ack = await hub.send_request(
-                robot.robot_id, "device.command",
-                {"command": "tap_text", "text": node.text},
-                timeout=step_timeout,
-            )
-            if bool(ack.get("ok")):
-                return True, f"tap_text({node.text!r}) -> {ack.get('message') or 'ok'}"
-        ack = await hub.send_request(
-            robot.robot_id, "device.command",
-            {"command": "tap_xy", "x": cx, "y": cy},
-            timeout=step_timeout,
-        )
-        return bool(ack.get("ok")), f"tap_xy({cx},{cy}) -> {ack.get('message') or ''}"
+            ack = await device.tap_text(node.text, timeout=step_timeout)
+            if ack.ok:
+                return True, f"tap_text({node.text!r}) -> {ack.message or 'ok'}"
+        ack = await device.tap_xy(cx, cy, timeout=step_timeout)
+        return ack.ok, f"tap_xy({cx},{cy}) -> {ack.message or ''}"
 
     if action == "input_text":
         node_id = args.get("node_id")
@@ -406,46 +353,34 @@ async def _execute(
                 return False, f"node {node_id} 不可编辑（cls={node.cls}）"
             # Focus the input first (tap), then write text.
             cx, cy = node.center()
-            await hub.send_request(
-                robot.robot_id, "device.command",
-                {"command": "tap_xy", "x": cx, "y": cy},
-                timeout=step_timeout,
-            )
+            await device.tap_xy(cx, cy, timeout=step_timeout)
             await asyncio.sleep(0.25)
-        ack = await hub.send_request(
-            robot.robot_id, "device.command",
-            {"command": "input_text", "text": text},
-            timeout=step_timeout,
-        )
-        return bool(ack.get("ok")), ack.get("message") or ""
+        ack = await device.input_text(text, timeout=step_timeout)
+        return ack.ok, ack.message or ""
 
     if action == "swipe":
         direction = (args.get("direction") or "up").lower()
         target_node = _lookup_node(obs, args.get("node_id"))
         x1, y1, x2, y2 = _swipe_coords(direction, obs, target_node)
-        ack = await hub.send_request(
-            robot.robot_id, "device.command",
-            {"command": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": 280},
-            timeout=step_timeout,
-        )
-        return bool(ack.get("ok")), ack.get("message") or ""
+        ack = await device.swipe(x1, y1, x2, y2, duration_ms=280, timeout=step_timeout)
+        return ack.ok, ack.message or ""
 
     if action == "back":
-        ack = await hub.send_request(robot.robot_id, "device.command", {"command": "back"}, timeout=step_timeout)
-        return bool(ack.get("ok")), ack.get("message") or ""
+        ack = await device.back(timeout=step_timeout)
+        return ack.ok, ack.message or ""
 
     if action == "home":
-        ack = await hub.send_request(robot.robot_id, "device.command", {"command": "home"}, timeout=step_timeout)
-        return bool(ack.get("ok")), ack.get("message") or ""
+        ack = await device.home(timeout=step_timeout)
+        return ack.ok, ack.message or ""
 
     if action == "open_wecom":
-        ack = await hub.send_request(robot.robot_id, "device.command", {"command": "open_wecom"}, timeout=step_timeout)
-        return bool(ack.get("ok")), ack.get("message") or ""
+        ack = await device.open_wecom(timeout=step_timeout)
+        return ack.ok, ack.message or ""
 
     return False, f"unhandled action: {action}"
 
 
-def _lookup_node(obs: _Observation, node_id: Any) -> _Node | None:
+def _lookup_node(obs: _Observation, node_id: Any) -> UiNode | None:
     try:
         nid = int(node_id)
     except (TypeError, ValueError):
@@ -454,7 +389,7 @@ def _lookup_node(obs: _Observation, node_id: Any) -> _Node | None:
 
 
 def _swipe_coords(
-    direction: str, obs: _Observation, target: _Node | None
+    direction: str, obs: _Observation, target: UiNode | None
 ) -> tuple[int, int, int, int]:
     """Pick reasonable swipe endpoints. If `target` is given we swipe inside
     its bounds (e.g. scrolling a specific list), otherwise the full screen."""

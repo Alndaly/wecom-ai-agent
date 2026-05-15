@@ -23,19 +23,6 @@ data class MessageReceivedPayload(
 )
 
 @Serializable
-data class TaskDispatchPayload(
-    val task_id: Long,
-    val type: String,
-    val payload: JsonElement,
-)
-
-@Serializable
-data class TaskAckPayload(
-    val task_id: Long,
-    val error: String? = null,
-)
-
-@Serializable
 data class HeartbeatPayload(
     val current_page: String? = null,
     val battery: Int? = null,
