@@ -4,10 +4,10 @@ Architecture:
   - Caller passes a natural-language `goal` (e.g. "open chat with 七月 and send
     'hello'") plus a robot reference.
   - Each iteration:
-      1. Pull UI tree + screenshot from device.
-      2. Number every node; format tree text with `[N]` prefixes.
-      3. Send tree (+ optional screenshot for vision models) to LLM with a
-         strict JSON tool-use protocol.
+      1. Pull UI tree from device.
+      2. Try a deterministic fast path for common send-message flows.
+      3. If no reasonable node is found, attach an optional screenshot and ask
+         the LLM for a strict JSON tool-use decision.
       4. LLM picks an action by *node id*, not coordinates. The backend
          resolves the id to bounds and dispatches the right primitive to the
          device.
@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers import ChatMessage, get_provider
+from app.ai.react_locators import LocatorStore, parse_send_goal, role_for_decision
 from app.core.config import settings
 from app.device import DeviceClient, UiNode
 from app.models import Robot
@@ -125,11 +126,17 @@ async def run_react(
     provider = await get_provider(db, robot.team_id)
     llm_cfg = await settings_service.get(db, robot.team_id, "llm")
     use_vision = _vision_enabled(llm_cfg)
+    locator_store = LocatorStore(robot)
 
     for i in range(1, max_steps + 1):
         # ---- observe ----
         try:
-            obs = await _observe(robot, want_screenshot=use_vision)
+            obs = await _observe(robot, want_screenshot=False)
+            await _log(
+                "info",
+                f"[react] step {i} observed nodes={len(obs.nodes)} "
+                f"screen={obs.screen_size[0]}x{obs.screen_size[1]} screenshot=no",
+            )
         except TimeoutError as e:
             await _log("error", f"[react] step {i} observe timeout: {e}")
             return AgentResult(ok=False, summary=f"observe 超时：{e}", steps=steps)
@@ -138,32 +145,72 @@ async def run_react(
             return AgentResult(ok=False, summary=f"observe 失败：{e}", steps=steps)
 
         # ---- decide ----
-        try:
-            decision = await _decide(provider, goal, obs, steps, use_vision=use_vision)
-        except Exception as e:  # noqa: BLE001
-            await _log("error", f"[react] step {i} llm failed: {e}")
-            return AgentResult(ok=False, summary=f"LLM 调用失败：{e}", steps=steps)
+        decision, decision_source = _fast_decide(goal, obs, steps, locator_store)
+        if decision is None:
+            decision_source = "llm"
+            if use_vision:
+                obs = await _attach_screenshot(robot, obs)
+            await _log(
+                "info",
+                f"[react] step {i} fast path miss; fallback={decision_source} "
+                f"screenshot={'yes' if obs.screenshot_b64 else 'no'}",
+            )
+            try:
+                decision = await _decide(provider, goal, obs, steps, use_vision=use_vision)
+            except Exception as e:  # noqa: BLE001
+                await _log("error", f"[react] step {i} llm failed: {e}")
+                return AgentResult(ok=False, summary=f"LLM 调用失败：{e}", steps=steps)
 
         thought = decision.get("thought") or ""
         action = (decision.get("action") or "").strip()
         args = decision.get("args") or {}
         await _log(
             "info",
-            f"[react] step {i}/{max_steps} thought={thought!r} action={action} args={_short(args)}",
+            f"[react] step {i}/{max_steps} source={decision_source} "
+            f"thought={thought!r} action={action} args={_short(args)}",
         )
 
         if action == "done":
             success = bool(args.get("success", True))
             summary = str(args.get("summary") or "")
+            if decision_source == "llm":
+                artifact = locator_store.save_fallback_artifact(
+                    goal=goal,
+                    step_index=i,
+                    obs_tree=obs.tree,
+                    nodes=obs.nodes,
+                    screen_size=obs.screen_size,
+                    screenshot_b64=obs.screenshot_b64,
+                    screenshot_mime=obs.screenshot_mime,
+                    decision=decision,
+                    ok=success,
+                    message=summary,
+                )
+                await _log("info", f"[react] fallback artifact={artifact}")
             steps.append(AgentStep(i, thought, action, args, success, summary, 0))
             return AgentResult(ok=success, summary=summary or "agent done", steps=steps)
 
         if action not in TOOL_SCHEMA:
+            if decision_source == "llm":
+                artifact = locator_store.save_fallback_artifact(
+                    goal=goal,
+                    step_index=i,
+                    obs_tree=obs.tree,
+                    nodes=obs.nodes,
+                    screen_size=obs.screen_size,
+                    screenshot_b64=obs.screenshot_b64,
+                    screenshot_mime=obs.screenshot_mime,
+                    decision=decision,
+                    ok=False,
+                    message=f"未知动作 {action}",
+                )
+                await _log("info", f"[react] fallback artifact={artifact}")
             await _log("warn", f"[react] unknown action {action!r}, aborting")
             return AgentResult(ok=False, summary=f"未知动作 {action}", steps=steps)
 
         # ---- act (resolve node_id → device primitive) ----
         t0 = time.monotonic()
+        used_node = _lookup_node(obs, args.get("node_id"))
         try:
             ok, msg = await _execute(robot, action, args, obs, step_timeout=step_timeout)
         except TimeoutError as e:
@@ -175,6 +222,46 @@ async def run_react(
             "info" if ok else "warn",
             f"[react] step {i} → ok={ok} msg={msg!r} ({elapsed}ms)",
         )
+        role = str(args.get("_locator_role") or "") or _infer_locator_role(action, args, used_node, goal, obs)
+        if decision_source == "llm":
+            artifact = locator_store.save_fallback_artifact(
+                goal=goal,
+                step_index=i,
+                obs_tree=obs.tree,
+                nodes=obs.nodes,
+                screen_size=obs.screen_size,
+                screenshot_b64=obs.screenshot_b64,
+                screenshot_mime=obs.screenshot_mime,
+                decision=decision,
+                ok=ok,
+                message=msg,
+            )
+            await _log("info", f"[react] fallback artifact={artifact}")
+            if ok and used_node is not None and role:
+                parsed_goal = parse_send_goal(goal)
+                learn_node = used_node
+                if role == "chat_target" and parsed_goal is not None:
+                    learn_node = _node_with_label_inside(obs, used_node, parsed_goal.target) or used_node
+                elif role == "send_button":
+                    learn_node = (
+                        _node_with_label_inside(obs, used_node, "发送")
+                        or _node_with_label_inside(obs, used_node, "Send")
+                        or used_node
+                    )
+                elif role == "search_entry":
+                    learn_node = _search_node_inside(obs, used_node) or used_node
+                locator_store.remember_success(
+                    role=role,
+                    action=action,
+                    node=learn_node,
+                    obs_meta={"node_count": len(obs.nodes), "screen_size": list(obs.screen_size)},
+                    source="llm",
+                    target=(parsed_goal.target if parsed_goal else None),
+                )
+                await _log("info", f"[react] locator learned role={role} node={learn_node.id}")
+        elif decision_source == "cache" and not ok:
+            locator_store.remember_failure(role=role)
+            await _log("warn", f"[react] cached locator failed role={role or 'unknown'}; will fallback if needed")
         steps.append(AgentStep(i, thought, action, args, ok, msg, elapsed))
         await asyncio.sleep(0.4)
 
@@ -212,6 +299,26 @@ async def _observe(robot: Robot, *, want_screenshot: bool) -> _Observation:
     )
 
 
+async def _attach_screenshot(robot: Robot, obs: _Observation) -> _Observation:
+    device = DeviceClient(robot)
+    try:
+        shot = await device.screenshot_once(timeout=10.0)
+        data = shot.data or {}
+        screenshot_b64 = data.get("image")
+        screenshot_mime = str(data.get("mime") or "image/jpeg") if data else "image/jpeg"
+    except Exception:  # noqa: BLE001
+        log.debug("[react] screenshot fetch failed; falling back to tree-only")
+        screenshot_b64 = None
+        screenshot_mime = "image/jpeg"
+    return _Observation(
+        tree=obs.tree,
+        nodes=obs.nodes,
+        screen_size=obs.screen_size,
+        screenshot_b64=screenshot_b64,
+        screenshot_mime=screenshot_mime,
+    )
+
+
 _MAX_TREE_CHARS = 4500
 
 
@@ -238,6 +345,251 @@ def _shrink_tree(tree: str) -> str:
     if len(out) > _MAX_TREE_CHARS:
         out = out[:_MAX_TREE_CHARS] + "\n…(truncated)"
     return out
+
+
+def _fast_decide(
+    goal: str, obs: _Observation, history: list[AgentStep], locator_store: LocatorStore
+) -> tuple[dict[str, Any] | None, str]:
+    """Cached locator path + generic rule bootstrap for send-message flows.
+
+    Cache wins first. The generic rules are only a bootstrap and a recovery
+    path; successful LLM fallbacks refresh the cache with current node features.
+    """
+    parsed = parse_send_goal(goal)
+    if parsed is None:
+        return None, "none"
+    target, text = parsed.target, parsed.text
+    failed_cache_roles = {
+        str(s.args.get("_locator_role"))
+        for s in history
+        if not s.ok and s.args.get("_locator_role")
+    }
+
+    if not _is_wecom_tree(obs.tree):
+        return {
+            "thought": "当前不在企业微信，先切到前台。",
+            "action": "open_wecom",
+            "args": {},
+        }, "rule"
+
+    if _last_success(history, "tap_node", contains_message="发送"):
+        return {
+            "thought": "上一轮已经点击发送按钮，目标完成。",
+            "action": "done",
+            "args": {"success": True, "summary": f"已向 {target} 发送消息。"},
+        }, "rule"
+
+    if _last_success(history, "tap_node", locator_role="chat_target"):
+        cached_message_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target)
+        if cached_message_input is not None:
+            return {
+                "thought": "目标会话已打开，命中缓存的消息输入框 locator。",
+                "action": "input_text",
+                "args": {"node_id": cached_message_input.id, "text": text, "_locator_role": "message_input"},
+            }, "cache"
+        message_input = _find_message_input(obs)
+        if message_input is not None:
+            return {
+                "thought": "目标会话已打开，找到消息输入框，输入目标文本。",
+                "action": "input_text",
+                "args": {"node_id": message_input.id, "text": text, "_locator_role": "message_input"},
+            }, "rule"
+
+    if _last_success(history, "input_text"):
+        search_input_done = _last_success(history, "input_text", locator_role="search_input")
+        if search_input_done:
+            cached_target_after_search = None if "chat_target" in failed_cache_roles else locator_store.match("chat_target", obs.nodes, target=target)
+            if cached_target_after_search is not None:
+                return {
+                    "thought": "搜索已输入，命中缓存的搜索结果会话 locator。",
+                    "action": "tap_node",
+                    "args": {"node_id": cached_target_after_search.id, "_locator_role": "chat_target"},
+                }, "cache"
+            target_after_search = _find_text_node(obs, target)
+            if target_after_search is not None:
+                return {
+                    "thought": "搜索结果中找到目标联系人，直接打开会话。",
+                    "action": "tap_node",
+                    "args": {"node_id": target_after_search.id, "_locator_role": "chat_target"},
+                }, "rule"
+            return None, "none"
+
+        cached_send = None if "send_button" in failed_cache_roles else locator_store.match("send_button", obs.nodes, target=target)
+        if cached_send is not None:
+            return {
+                "thought": "消息已输入，命中缓存的发送按钮 locator。",
+                "action": "tap_node",
+                "args": {"node_id": cached_send.id, "_locator_role": "send_button"},
+            }, "cache"
+        send_node = _find_send_button(obs)
+        if send_node is not None:
+            return {
+                "thought": "消息已输入，当前找到发送按钮，直接发送。",
+                "action": "tap_node",
+                "args": {"node_id": send_node.id, "_locator_role": "send_button"},
+            }, "rule"
+        return None, "none"
+
+    if _last_success(history, "tap_node", locator_role="search_entry"):
+        cached_search_input = None if "search_input" in failed_cache_roles else locator_store.match("search_input", obs.nodes, target=target)
+        if cached_search_input is not None:
+            return {
+                "thought": "搜索入口已打开，命中缓存的搜索输入框 locator。",
+                "action": "input_text",
+                "args": {"node_id": cached_search_input.id, "text": target, "_locator_role": "search_input"},
+            }, "cache"
+        search_input = _find_search_input(obs)
+        if search_input is not None:
+            return {
+                "thought": "搜索入口已打开，找到搜索输入框，输入目标联系人。",
+                "action": "input_text",
+                "args": {"node_id": search_input.id, "text": target, "_locator_role": "search_input"},
+            }, "rule"
+        return None, "none"
+
+    cached_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target)
+    if cached_input is not None:
+        return {
+            "thought": "命中缓存的消息输入框 locator，直接输入目标文本。",
+            "action": "input_text",
+            "args": {"node_id": cached_input.id, "text": text, "_locator_role": "message_input"},
+        }, "cache"
+    editable = _find_message_input(obs)
+    if editable is not None:
+        return {
+            "thought": "当前已在聊天页并找到消息输入框，直接输入目标文本。",
+            "action": "input_text",
+            "args": {"node_id": editable.id, "text": text, "_locator_role": "message_input"},
+        }, "rule"
+
+    cached_target = None if "chat_target" in failed_cache_roles else locator_store.match("chat_target", obs.nodes, target=target)
+    if cached_target is not None:
+        return {
+            "thought": "命中缓存的会话列表 locator，直接打开目标会话。",
+            "action": "tap_node",
+            "args": {"node_id": cached_target.id, "_locator_role": "chat_target"},
+        }, "cache"
+    target_node = _find_text_node(obs, target)
+    if target_node is not None:
+        return {
+            "thought": "聊天列表中找到目标联系人节点，直接打开会话。",
+            "action": "tap_node",
+            "args": {"node_id": target_node.id, "_locator_role": "chat_target"},
+        }, "rule"
+
+    cached_search_entry = None if "search_entry" in failed_cache_roles else locator_store.match("search_entry", obs.nodes, target=target)
+    if cached_search_entry is not None:
+        return {
+            "thought": "首屏未找到目标联系人，命中缓存的搜索入口 locator。",
+            "action": "tap_node",
+            "args": {"node_id": cached_search_entry.id, "_locator_role": "search_entry"},
+        }, "cache"
+    search_entry = _find_search_entry(obs)
+    if search_entry is not None:
+        return {
+            "thought": "首屏未找到目标联系人，找到搜索入口，准备搜索。",
+            "action": "tap_node",
+            "args": {"node_id": search_entry.id, "_locator_role": "search_entry"},
+        }, "rule"
+
+    swipe_count = sum(1 for s in history if s.action == "swipe" and s.ok)
+    if swipe_count < 1 and _looks_like_list(obs):
+        return {
+            "thought": "未找到搜索入口且当前像列表，先小幅滚动一次继续查找。",
+            "action": "swipe",
+            "args": {"direction": "up"},
+        }, "rule"
+    return None, "none"
+
+
+def _is_wecom_tree(tree: str) -> bool:
+    header = tree.splitlines()[0] if tree else ""
+    return "pkg=com.tencent.wework" in header
+
+
+def _node_label(node: UiNode) -> str:
+    return (node.text or node.desc or "").strip()
+
+
+def _find_text_node(obs: _Observation, text: str) -> UiNode | None:
+    candidates = [
+        n for n in obs.nodes.values()
+        if _node_label(n) == text and len(n.bounds) == 4
+    ]
+    if not candidates:
+        return None
+    clickable = [n for n in candidates if n.clickable]
+    pool = clickable or candidates
+    return min(pool, key=lambda n: (n.bounds[1], n.bounds[0]))
+
+
+def _find_message_input(obs: _Observation) -> UiNode | None:
+    h = obs.screen_size[1] or 2200
+    candidates = [
+        n for n in obs.nodes.values()
+        if n.editable and len(n.bounds) == 4 and n.bounds[1] > h * 0.45
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda n: n.bounds[1])
+
+
+def _find_search_input(obs: _Observation) -> UiNode | None:
+    h = obs.screen_size[1] or 2200
+    candidates = [
+        n for n in obs.nodes.values()
+        if n.editable and len(n.bounds) == 4 and n.bounds[1] < h * 0.45
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda n: (n.bounds[1], n.bounds[0]))
+
+
+def _find_search_entry(obs: _Observation) -> UiNode | None:
+    candidates = []
+    for node in obs.nodes.values():
+        label = _node_label(node)
+        haystack = " ".join([node.view_id, node.cls, node.desc, node.text]).lower()
+        if label in {"搜索", "搜一搜", "Search"} or "搜索" in label or "search" in haystack:
+            if len(node.bounds) == 4:
+                candidates.append(node)
+    if not candidates:
+        return None
+    clickable = [n for n in candidates if n.clickable]
+    pool = clickable or candidates
+    return min(pool, key=lambda n: (n.bounds[1], n.bounds[0]))
+
+
+def _find_send_button(obs: _Observation) -> UiNode | None:
+    for label in ("发送", "Send"):
+        node = _find_text_node(obs, label)
+        if node is not None:
+            return node
+    return None
+
+
+def _looks_like_list(obs: _Observation) -> bool:
+    return any(n.scrollable for n in obs.nodes.values()) or "RecyclerView" in obs.tree
+
+
+def _last_success(
+    history: list[AgentStep],
+    action: str,
+    *,
+    contains_message: str | None = None,
+    locator_role: str | None = None,
+) -> bool:
+    for step in reversed(history):
+        if step.action != action:
+            continue
+        if not step.ok:
+            return False
+        if contains_message and contains_message not in step.message:
+            continue
+        if locator_role and step.args.get("_locator_role") != locator_role:
+            continue
+        return True
+    return False
 
 
 # ---- decide --------------------------------------------------------------
@@ -274,7 +626,13 @@ _SYSTEM_PROMPT = """你是一名移动端 UI 操作专家。给定一个目标�
 2. 节点没有可见文字（例如只是个 ImageView 图标）时，结合截图判断它的语义。
 3. 如果当前 root 包名不是 com.tencent.wework，第一步必须用 open_wecom。
 4. 找不到目标节点时，先 swipe 滚动；连续 2~3 步无进展则用 done(success=false) 退出，不要硬猜。
-5. 一次只输出一个动作。"""
+5. 一次只输出一个动作。
+6. 如果动作对应可复用 UI 位置，请在 args 里额外写 `_locator_role`，取值只能是：
+   - chat_target：目标联系人/搜索结果会话
+   - search_entry：搜索入口/搜索图标/搜索框占位入口
+   - search_input：搜索页输入框
+   - message_input：聊天页消息输入框
+   - send_button：发送按钮。"""
 
 
 async def _decide(
@@ -331,7 +689,7 @@ async def _execute(
         node = _lookup_node(obs, args.get("node_id"))
         if node is None:
             return False, f"node_id={args.get('node_id')} 不在 UI tree 中"
-        cx, cy = node.center()
+        cx, cy = node.center
         # Prefer accessibility ACTION_CLICK via tap_text if the node has a
         # distinctive text — more robust to small layout shifts. Otherwise
         # fall back to coordinate tap.
@@ -352,7 +710,7 @@ async def _execute(
             if not node.editable:
                 return False, f"node {node_id} 不可编辑（cls={node.cls}）"
             # Focus the input first (tap), then write text.
-            cx, cy = node.center()
+            cx, cy = node.center
             await device.tap_xy(cx, cy, timeout=step_timeout)
             await asyncio.sleep(0.25)
         ack = await device.input_text(text, timeout=step_timeout)
@@ -386,6 +744,68 @@ def _lookup_node(obs: _Observation, node_id: Any) -> UiNode | None:
     except (TypeError, ValueError):
         return None
     return obs.nodes.get(nid)
+
+
+def _infer_locator_role(
+    action: str,
+    args: dict[str, Any],
+    node: UiNode | None,
+    goal: str,
+    obs: _Observation,
+) -> str | None:
+    direct = role_for_decision(action, args, node, goal)
+    if direct or node is None:
+        return direct
+    parsed = parse_send_goal(goal)
+    if parsed is None or action != "tap_node":
+        return None
+    if _node_inside_with_label(obs, node, parsed.target):
+        return "chat_target"
+    if _node_inside_with_label(obs, node, "发送") or _node_inside_with_label(obs, node, "Send"):
+        return "send_button"
+    if _looks_like_search_node(node) or _node_inside_with_search_label(obs, node):
+        return "search_entry"
+    return None
+
+
+def _node_inside_with_label(obs: _Observation, parent: UiNode, label: str) -> bool:
+    return _node_with_label_inside(obs, parent, label) is not None
+
+
+def _node_with_label_inside(obs: _Observation, parent: UiNode, label: str) -> UiNode | None:
+    if len(parent.bounds) != 4:
+        return None
+    l, t, r, b = parent.bounds
+    for node in obs.nodes.values():
+        if _node_label(node) != label or len(node.bounds) != 4:
+            continue
+        nl, nt, nr, nb = node.bounds
+        if nl >= l and nt >= t and nr <= r and nb <= b:
+            return node
+    return None
+
+
+def _node_inside_with_search_label(obs: _Observation, parent: UiNode) -> bool:
+    return _search_node_inside(obs, parent) is not None
+
+
+def _search_node_inside(obs: _Observation, parent: UiNode) -> UiNode | None:
+    if len(parent.bounds) != 4:
+        return None
+    l, t, r, b = parent.bounds
+    for node in obs.nodes.values():
+        if len(node.bounds) != 4 or not _looks_like_search_node(node):
+            continue
+        nl, nt, nr, nb = node.bounds
+        if nl >= l and nt >= t and nr <= r and nb <= b:
+            return node
+    return None
+
+
+def _looks_like_search_node(node: UiNode) -> bool:
+    label = _node_label(node)
+    haystack = " ".join([node.view_id, node.cls, node.desc, node.text]).lower()
+    return label in {"搜索", "搜一搜", "Search"} or "搜索" in label or "search" in haystack
 
 
 def _swipe_coords(

@@ -441,22 +441,36 @@ class WeComAccessibilityService : AccessibilityService() {
         if (rows.isEmpty()) return
 
         if (!homeBaselineReady) {
-            for ((name, preview) in rows) homeListBaseline[name] = preview
+            var emittedUnread = 0
+            for (row in rows) {
+                homeListBaseline[row.name] = row.preview
+                if (!row.hasUnread) continue
+                if (row.preview.isEmpty()) continue
+                if (isOutboundPreview(row.preview)) continue
+                if (alreadySeen(row.name, row.preview)) continue
+                recent.addLast(Triple(row.name, row.preview, now))
+                cb(row.name, row.preview)
+                emittedUnread++
+            }
             homeBaselineReady = true
-            Log.d(tag, "home baseline primed rows=${rows.size}")
+            Log.d(tag, "home baseline primed rows=${rows.size} emittedUnread=$emittedUnread")
             return
         }
 
-        for ((name, preview) in rows) {
-            if (preview.isEmpty()) continue
-            if (isOutboundPreview(preview)) continue
-            val prev = homeListBaseline[name]
-            if (prev == preview) continue
-            homeListBaseline[name] = preview
-            if (alreadySeen(name, preview)) continue
-            recent.addLast(Triple(name, preview, now))
-            cb(name, preview)
-            Log.d(tag, "home harvest name=$name preview=${preview.take(60)}")
+        for (row in rows) {
+            if (row.preview.isEmpty()) continue
+            if (isOutboundPreview(row.preview)) continue
+            val prev = homeListBaseline[row.name]
+            val changed = prev != row.preview
+            if (!changed && !row.hasUnread) continue
+            homeListBaseline[row.name] = row.preview
+            if (alreadySeen(row.name, row.preview)) continue
+            recent.addLast(Triple(row.name, row.preview, now))
+            cb(row.name, row.preview)
+            Log.d(
+                tag,
+                "home harvest name=${row.name} unread=${row.hasUnread} changed=$changed preview=${row.preview.take(60)}",
+            )
         }
     }
 
@@ -480,11 +494,17 @@ class WeComAccessibilityService : AccessibilityService() {
         return found
     }
 
-    private fun collectListRows(root: AccessibilityNodeInfo): List<Pair<String, String>> {
+    private data class HomeListRow(
+        val name: String,
+        val preview: String,
+        val hasUnread: Boolean,
+    )
+
+    private fun collectListRows(root: AccessibilityNodeInfo): List<HomeListRow> {
         // Find the scrollable list (RecyclerView/ListView). It might be nested
         // a few levels deep — we just look for the first scrollable.
         val list = findFirstScrollable(root) ?: return emptyList()
-        val out = mutableListOf<Pair<String, String>>()
+        val out = mutableListOf<HomeListRow>()
         val headerCutoff = 200  // skip the top title bar
         val footerCutoff =
             resources.displayMetrics.heightPixels - 160  // skip the bottom tabs
@@ -495,7 +515,7 @@ class WeComAccessibilityService : AccessibilityService() {
             row.getBoundsInScreen(rowBounds)
             if (rowBounds.bottom < headerCutoff || rowBounds.top > footerCutoff) continue
 
-            val texts = mutableListOf<Pair<Int, String>>() // (y, text)
+            val texts = mutableListOf<Triple<Int, Int, String>>() // (y, x, text)
             fun walk(n: AccessibilityNodeInfo?) {
                 n ?: return
                 val cls = n.className?.toString().orEmpty()
@@ -504,7 +524,7 @@ class WeComAccessibilityService : AccessibilityService() {
                     if (t.isNotEmpty()) {
                         val r = android.graphics.Rect()
                         n.getBoundsInScreen(r)
-                        texts.add(r.centerY() to t)
+                        texts.add(Triple(r.centerY(), r.centerX(), t))
                     }
                 }
                 for (j in 0 until n.childCount) walk(n.getChild(j))
@@ -512,17 +532,27 @@ class WeComAccessibilityService : AccessibilityService() {
             walk(row)
             if (texts.size < 2) continue
 
-            texts.sortBy { it.first }
-            val name = texts.first().second
+            texts.sortWith(compareBy<Triple<Int, Int, String>> { it.first }.thenBy { it.second })
+            val name = texts
+                .map { it.third }
+                .firstOrNull { !looksLikeUnreadBadge(it) && !looksLikeTimestamp(it) }
+                ?: continue
             // The right-most/bottom-most text is usually a timestamp like
             // "昨天" / "16:43" — strip if it matches a time/date pattern.
-            val rest = texts.drop(1).map { it.second }.filterNot { looksLikeTimestamp(it) }
+            val rest = texts.map { it.third }
+                .filter { it != name }
+                .filterNot { looksLikeTimestamp(it) }
             if (rest.isEmpty()) continue
+            val hasUnread = texts.any { looksLikeUnreadBadge(it.third) }
             // The preview is typically the longest remaining text; numeric
             // unread badges ("1" / "9+" / "99") are short and noisy.
-            val preview = rest.maxByOrNull { it.length }!!.trim()
+            val preview = rest
+                .filterNot { looksLikeUnreadBadge(it) }
+                .maxByOrNull { it.length }
+                ?.trim()
+                ?: continue
             if (preview.length < 2) continue
-            out.add(name to preview)
+            out.add(HomeListRow(name = name, preview = preview, hasUnread = hasUnread))
         }
         return out
     }
@@ -541,6 +571,10 @@ class WeComAccessibilityService : AccessibilityService() {
         // 16:43, 昨天, 星期三, 03/05, 2024/03/05
         if (s == "昨天" || s.startsWith("星期")) return true
         return s.matches(Regex("""^\d{1,2}[:/-]\d{1,2}([:/-]\d{1,2})?$"""))
+    }
+
+    private fun looksLikeUnreadBadge(s: String): Boolean {
+        return s.matches(Regex("""^\d{1,3}\+?$"""))
     }
 
     private fun isOutboundPreview(p: String): Boolean {

@@ -43,6 +43,7 @@ async def android_ws(
 
     await ws.accept()
     await hub.connect_android(robot.robot_id, ws)
+    log.info("android ws connected robot=%s team=%s", robot.robot_id, robot.team_id)
 
     async with SessionLocal() as db:
         r = await db.get(Robot, robot.id)
@@ -63,6 +64,7 @@ async def android_ws(
         log.warning("android ws error: %s", e)
     finally:
         await hub.disconnect_android(robot.robot_id, ws)
+        log.info("android ws disconnected robot=%s", robot.robot_id)
         async with SessionLocal() as db:
             r = await db.get(Robot, robot.id)
             if r:
@@ -95,6 +97,12 @@ async def _handle_event(robot: Robot, data: dict) -> None:
 
     if event == "message.received":
         evt = AndroidMessageReceived.model_validate(payload)
+        log.info(
+            "android inbound robot=%s contact=%s content=%r",
+            robot.robot_id,
+            evt.contact.external_id,
+            (evt.content or "")[:80],
+        )
         async with SessionLocal() as db:
             r = await db.get(Robot, robot.id)
             if r:
@@ -119,14 +127,30 @@ async def _handle_event(robot: Robot, data: dict) -> None:
         dump = _save_ui_dump(robot, payload)
         await hub.broadcast_web(robot.team_id, "device.ui_dump", dump)
         # If this dump was the response to a ReAct agent request, deliver it.
-        hub.resolve_request(payload.get("request_id"), dump)
+        resolved = hub.resolve_request(payload.get("request_id"), dump)
+        log.info(
+            "device.ui_dump robot=%s request=%s resolved=%s nodes=%d",
+            robot.robot_id,
+            payload.get("request_id"),
+            resolved,
+            len(dump.get("nodes") or []),
+        )
         return
 
     if event == "device.command_result":
         # Generic ack-with-result channel used by the ReAct agent. The device
         # echoes `request_id` so we can correlate. Payload also carries
         # `command`, `ok`, `message`, and an optional `data` object.
-        hub.resolve_request(payload.get("request_id"), payload)
+        resolved = hub.resolve_request(payload.get("request_id"), payload)
+        log.info(
+            "device.command_result robot=%s command=%s ok=%s request=%s resolved=%s msg=%r",
+            robot.robot_id,
+            payload.get("command"),
+            payload.get("ok"),
+            payload.get("request_id"),
+            resolved,
+            payload.get("message"),
+        )
         await hub.broadcast_web(robot.team_id, "device.command_result", {
             "robot_id": robot.robot_id,
             **{k: v for k, v in payload.items() if k != "request_id"},

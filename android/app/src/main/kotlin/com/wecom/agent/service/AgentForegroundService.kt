@@ -78,6 +78,7 @@ class AgentForegroundService : Service() {
             ACTION_SET_A11Y_INGEST -> {
                 a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
                 broadcastLog("无障碍消息采集已即时更新为 $a11yInboundEnabled")
+                startMessageListScanners()
                 return START_STICKY
             }
         }
@@ -300,7 +301,12 @@ class AgentForegroundService : Service() {
     //    - WeCom isn't in the foreground (don't hijack other apps)
     //    - user isn't on the 消息 tab (don't scroll their 通讯录/工作台)
     private fun startMessageListScanners() {
-        if (scanTier1Job != null) return  // already running (sticky service)
+        if (scanTier1Job != null) {
+            Log.d(tag, "message list scanners already running")
+            return  // already running (sticky service)
+        }
+        Log.i(tag, "starting message list scanners a11yInbound=$a11yInboundEnabled")
+        broadcastLog("消息列表巡检已启动（a11y=$a11yInboundEnabled）")
         val scanner = MessageListScanner { msg -> broadcastLog("scan: $msg") }
 
         scanTier1Job = scope.launch {
@@ -309,7 +315,7 @@ class AgentForegroundService : Service() {
             while (isActive) {
                 if (a11yInboundEnabled) {
                     val r = scanner.scanVisible()
-                    if (r.ok) Log.d(tag, "tier1 ${r.message}")
+                    Log.d(tag, "scan tier1 ok=${r.ok} ${r.message}")
                 }
                 delay(30_000L)
             }
@@ -320,6 +326,7 @@ class AgentForegroundService : Service() {
             while (isActive) {
                 if (a11yInboundEnabled) {
                     val r = scanner.scanPagesDown(pages = 3)
+                    Log.d(tag, "scan tier2 ok=${r.ok} ${r.message}")
                     if (r.ok) broadcastLog("scan tier2: ${r.message}")
                 }
                 delay(5 * 60_000L)
@@ -332,6 +339,7 @@ class AgentForegroundService : Service() {
             while (isActive) {
                 if (a11yInboundEnabled) {
                     val r = scanner.scanToBottom(maxSwipes = 30)
+                    Log.d(tag, "scan tier3 ok=${r.ok} ${r.message}")
                     if (r.ok) broadcastLog("scan tier3: ${r.message}")
                 }
                 delay(30 * 60_000L)
