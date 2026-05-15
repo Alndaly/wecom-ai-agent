@@ -58,6 +58,15 @@ class Decision:
     kb_hit_ids: list[int] = field(default_factory=list)
     kb_context: str = ""
     memory_summary: str = ""
+    # Multi-reply: the agent may emit several short messages instead of one
+    # paragraph. When empty, callers should fall back to [text] for compat.
+    replies: list[str] = field(default_factory=list)
+
+    @property
+    def all_texts(self) -> list[str]:
+        if self.replies:
+            return self.replies
+        return [self.text] if self.text else []
 
 
 @dataclass
@@ -73,6 +82,11 @@ class AIState:
     # team-scoped runtime config (loaded once per request)
     context_window: int = 10
     confidence_threshold: float = 0.55
+    # All inbound messages from the customer that haven't been replied to yet —
+    # populated by `_load_unreplied_chain`. If the customer fired 5 messages
+    # while we weren't looking, the agent reasons over all 5 in one shot
+    # instead of producing 5 independent (and possibly contradictory) replies.
+    unreplied_chain: list[Message] = field(default_factory=list)
 
 
 async def handle_inbound(
@@ -103,7 +117,12 @@ async def handle_inbound(
     state.history = await _load_history(db, conv.id, state.context_window)
     state.prompt = await _load_prompt(db, conv.team_id, ai_cfg)
     state.memory_summary = await _load_memory(db, conv.contact_id)
-    state.retrieval = await _retrieve(db, conv.team_id, message.content)
+    state.unreplied_chain = await _load_unreplied_chain(db, conv.id)
+    # If the customer fired several messages in a row, run retrieval on the
+    # concatenated text so the KB step sees the full intent, not just the
+    # latest fragment ("还有，价格怎么算？" alone is uninformative).
+    retrieval_query = " ".join(m.content for m in state.unreplied_chain) or message.content
+    state.retrieval = await _retrieve(db, conv.team_id, retrieval_query)
 
     # 3. generate
     decision = await _generate(state, db)
@@ -133,6 +152,32 @@ async def handle_inbound(
 # ---------------------------------------------------------------------------
 # nodes
 # ---------------------------------------------------------------------------
+async def _load_unreplied_chain(db: AsyncSession, conversation_id: int) -> list[Message]:
+    """Return inbound messages newer than the last outbound — in chrono order.
+
+    If the bot/operator has never replied in this conversation, returns every
+    inbound (capped to avoid prompt blow-up).
+    """
+    last_out = (
+        await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id, Message.direction == "out")
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    stmt = (
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.direction == "in")
+        .order_by(Message.created_at.asc())
+        .limit(20)  # hard cap to keep prompt bounded
+    )
+    if last_out is not None:
+        stmt = stmt.where(Message.created_at > last_out.created_at)
+    rows = (await db.execute(stmt)).scalars().all()
+    return list(rows)
+
+
 async def _load_history(db: AsyncSession, conversation_id: int, limit: int) -> list[Message]:
     rows = (
         await db.execute(
@@ -254,6 +299,9 @@ async def _generate_via_agent(
         system_parts.append(kb_block)
     system_prompt = "\n\n".join(system_parts)
 
+    # Pass the full unreplied chain. The agent decides whether to answer
+    # them all in one message or split into several.
+    chain_texts = [m.content for m in state.unreplied_chain] or [state.inbound.content]
     res = await run_conv_agent(
         db=db,
         team_id=state.conv.team_id,
@@ -264,6 +312,7 @@ async def _generate_via_agent(
         system_prompt=system_prompt,
         profile_summary=state.memory_summary,
         history=state.history,
+        unreplied_chain=chain_texts,
         provider=provider,
         temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
         max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
@@ -292,6 +341,7 @@ async def _generate_via_agent(
     return Decision(
         action="reply",
         text=(res.text or "").strip(),
+        replies=list(res.replies or []),
         confidence=res.confidence,
         trace_id=state.trace_id,
         latency_ms=res.latency_ms,

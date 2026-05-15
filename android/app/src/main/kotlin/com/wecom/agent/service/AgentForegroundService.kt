@@ -64,6 +64,10 @@ class AgentForegroundService : Service() {
     private var executor: TaskExecutor? = null
     private var heartbeatJob: Job? = null
     private var screenStreamJob: Job? = null
+    // periodic message-list scanner — three tiers at different cadences
+    private var scanTier1Job: Job? = null
+    private var scanTier2Job: Job? = null
+    private var scanTier3Job: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
@@ -158,6 +162,7 @@ class AgentForegroundService : Service() {
             },
         ).also { it.start() }
 
+        startMessageListScanners()
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             while (!connected && isActive) delay(200L)
@@ -181,6 +186,9 @@ class AgentForegroundService : Service() {
     override fun onDestroy() {
         heartbeatJob?.cancel()
         screenStreamJob?.cancel()
+        scanTier1Job?.cancel(); scanTier1Job = null
+        scanTier2Job?.cancel(); scanTier2Job = null
+        scanTier3Job?.cancel(); scanTier3Job = null
         client?.stop()
         MessageNotificationListener.onMessage = null
         WeComAccessibilityService.onChatMessage = null
@@ -351,6 +359,53 @@ class AgentForegroundService : Service() {
                         broadcastLog("未知设备命令：$command")
                     }
                 }
+            }
+        }
+    }
+
+    // ----- periodic 消息 tab scanner ----------------------------------------
+    //  Notifications miss messages when WeCom is foregrounded (no system
+    //  notification fires). To catch those, we walk the conversation list at
+    //  three cadences. All three skip cleanly when:
+    //    - a11y ingest is off (user disabled the checkbox)
+    //    - WeCom isn't in the foreground (don't hijack other apps)
+    //    - user isn't on the 消息 tab (don't scroll their 通讯录/工作台)
+    private fun startMessageListScanners() {
+        if (scanTier1Job != null) return  // already running (sticky service)
+        val scanner = MessageListScanner { msg -> broadcastLog("scan: $msg") }
+
+        scanTier1Job = scope.launch {
+            // tier 1 — visible only, frequent. Cheap: no scrolling.
+            delay(15_000L)  // small offset so we don't fire during boot
+            while (isActive) {
+                if (a11yInboundEnabled) {
+                    val r = scanner.scanVisible()
+                    if (r.ok) Log.d(tag, "tier1 ${r.message}")
+                }
+                delay(30_000L)
+            }
+        }
+        scanTier2Job = scope.launch {
+            // tier 2 — 3-page scroll, medium frequency.
+            delay(60_000L)
+            while (isActive) {
+                if (a11yInboundEnabled) {
+                    val r = scanner.scanPagesDown(pages = 3)
+                    if (r.ok) broadcastLog("scan tier2: ${r.message}")
+                }
+                delay(5 * 60_000L)
+            }
+        }
+        scanTier3Job = scope.launch {
+            // tier 3 — full scroll, rare. Picks up old conversations buried at
+            // the bottom that haven't been re-promoted to the top.
+            delay(10 * 60_000L)
+            while (isActive) {
+                if (a11yInboundEnabled) {
+                    val r = scanner.scanToBottom(maxSwipes = 30)
+                    if (r.ok) broadcastLog("scan tier3: ${r.message}")
+                }
+                delay(30 * 60_000L)
             }
         }
     }

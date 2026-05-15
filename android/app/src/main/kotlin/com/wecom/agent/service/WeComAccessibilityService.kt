@@ -336,6 +336,33 @@ class WeComAccessibilityService : AccessibilityService() {
         }
     }
 
+    // ---- public hooks for the periodic message-list scanner -----------------
+    fun isWeComForeground(): Boolean {
+        val pkg = rootInActiveWindow?.packageName?.toString().orEmpty()
+        return pkg == "com.tencent.wework"
+    }
+
+    fun isOnMessagesTab(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        return isMessagesListVisible(root)
+    }
+
+    /** Force a harvest of whatever is currently visible. Same logic as the
+     *  WINDOW_CONTENT_CHANGED handler but driven externally. */
+    fun forceHarvestHomeList() {
+        maybeHarvestHomeList()
+    }
+
+    /** Returns the bounds (in screen px) of the conversation list, so the
+     *  caller can compute a swipe gesture inside it. */
+    fun getMessagesListBounds(): android.graphics.Rect? {
+        val root = rootInActiveWindow ?: return null
+        val list = findFirstScrollable(root) ?: return null
+        val r = android.graphics.Rect()
+        list.getBoundsInScreen(r)
+        return r
+    }
+
     // ---------------------------------------------------- harvest 消息 tab
     /**
      * Walk the conversation list under the 消息 tab and emit any row whose

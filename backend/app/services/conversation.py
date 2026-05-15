@@ -4,8 +4,44 @@ Handles the inbound side (Android → backend) and broadcasts to Web hub.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
+
+# Per-conversation lock. Serialises the AI reply path so that bursts of
+# inbound messages from the same customer don't kick off N concurrent agent
+# runs (which would each see a different subset of the unreplied chain and
+# duplicate replies). The first lock holder processes the whole chain; queued
+# arrivals re-enter, see "no unreplied tail" and exit cheaply.
+_CONV_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _lock_for(conv_id: int) -> asyncio.Lock:
+    lock = _CONV_LOCKS.get(conv_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CONV_LOCKS[conv_id] = lock
+    return lock
+
+
+async def _has_been_replied_after(
+    db: AsyncSession, conv_id: int, after: datetime
+) -> bool:
+    """True iff there's an outbound message in this conversation strictly after
+    `after`. Used to skip processing an inbound that a previous batch already
+    answered."""
+    row = (
+        await db.execute(
+            select(Message.id)
+            .where(
+                Message.conversation_id == conv_id,
+                Message.direction == "out",
+                Message.created_at > after,
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -137,31 +173,52 @@ async def ingest_inbound_message(
         ConversationOut.model_validate(conv).model_dump(mode="json"),
     )
 
-    # MVP2: trigger AI auto-reply when mode allows
+    # MVP2: trigger AI auto-reply when mode allows.
+    # Per-conversation lock: if a previous burst is still being processed, we
+    # queue here briefly and exit when the lock-holder has already covered our
+    # message (via the unreplied-chain mechanism).
     if conv.mode in ("ai", "mixed"):
-        try:
-            decision = await ai_workflow.handle_inbound(db, robot=robot, conv=conv, message=msg)
-        except Exception:
-            import logging
-            logging.exception("AI workflow failed")
-            decision = None
-
-        if decision is not None:
-            # always surface KB hits (right-panel "knowledge hits")
-            await ai_workflow.broadcast_kb_hits(robot.team_id, conv.id, decision)
-
-            if decision.action == "reply" and decision.text:
-                await create_and_dispatch_send_text(
-                    db,
-                    robot=robot,
-                    conv=conv,
-                    contact_external_id=contact.external_id,
-                    text=decision.text,
-                    sender_type="ai",
-                    sender_id=None,
+        lock = _lock_for(conv.id)
+        async with lock:
+            # Did the previous lock-holder already reply past this inbound?
+            # If yes, skip — our content is already covered in their batch.
+            if await _has_been_replied_after(db, conv.id, msg.created_at):
+                import logging
+                logging.info(
+                    "[conv %s] inbound msg %s already covered by a previous batch — skipping",
+                    conv.id, msg.id,
                 )
-            elif decision.action == "suggest":
-                await ai_workflow.broadcast_suggestion(robot.team_id, conv.id, decision)
+            else:
+                try:
+                    decision = await ai_workflow.handle_inbound(
+                        db, robot=robot, conv=conv, message=msg
+                    )
+                except Exception:
+                    import logging
+                    logging.exception("AI workflow failed")
+                    decision = None
+
+                if decision is not None:
+                    await ai_workflow.broadcast_kb_hits(robot.team_id, conv.id, decision)
+                    if decision.action == "reply":
+                        for text in decision.all_texts:
+                            await create_and_dispatch_send_text(
+                                db,
+                                robot=robot,
+                                conv=conv,
+                                contact_external_id=contact.external_id,
+                                text=text,
+                                sender_type="ai",
+                                sender_id=None,
+                            )
+                            # Tiny gap between bubbles so the device executor
+                            # doesn't try to nav→input→send all at once.
+                            if len(decision.all_texts) > 1:
+                                await asyncio.sleep(0.2)
+                    elif decision.action == "suggest":
+                        await ai_workflow.broadcast_suggestion(
+                            robot.team_id, conv.id, decision
+                        )
 
     # MVP3: refresh long-term memory in the background of the request
     try:

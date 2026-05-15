@@ -115,20 +115,39 @@ escalate_to_human = Tool(
 
 # ------------------------------------------------------- final_reply (done) -
 async def _final_reply(ctx: ToolContext, args: dict[str, Any]) -> str:
-    text = (args.get("text") or "").strip()
     confidence = float(args.get("confidence") or 0.7)
-    if not text:
-        return "ERROR: text 不能为空"
-    ctx.scratch["final_text"] = text
+    # Accept either a single `text` or a list `replies` — the agent picks
+    # whichever fits the situation (1 polite ack vs. 3 short bubbles to
+    # answer a multi-question dump).
+    replies_raw = args.get("replies")
+    replies: list[str] = []
+    if isinstance(replies_raw, list):
+        replies = [str(x).strip() for x in replies_raw if str(x).strip()]
+    elif isinstance(replies_raw, str) and replies_raw.strip():
+        replies = [replies_raw.strip()]
+    text = (args.get("text") or "").strip()
+    if text and not replies:
+        replies = [text]
+    if not replies:
+        return "ERROR: 必须给出 text 或非空 replies 列表"
+    if len(replies) > 6:
+        return "ERROR: replies 最多 6 条；请合并"
+    ctx.scratch["final_replies"] = replies
+    ctx.scratch["final_text"] = replies[0]  # back-compat for callers
     ctx.scratch["final_confidence"] = max(0.0, min(1.0, confidence))
-    return "OK: 最终回复已记录"
+    return f"OK: 已记录 {len(replies)} 条最终回复"
 
 
 final_reply = Tool(
     name="final_reply",
-    description="给出对客户的最终中文回复，并附置信度（0~1）。一旦调用本工具，本轮结束。",
+    description=(
+        "给出对客户的最终中文回复并附置信度（0~1）。一次调用即结束本轮。"
+        "默认用 `text` 单条回复；如果客户连发了多个独立问题、或你想把长答案拆成几段更自然的"
+        "对话气泡，可改用 `replies` 列表（最多 6 条）。"
+    ),
     params={
-        "text": {"type": "string", "desc": "给客户看的回复文本"},
+        "text": {"type": "string", "desc": "单条回复文本；如果用 replies 则可省略"},
+        "replies": {"type": "list[string]", "desc": "多条回复（按发送顺序）。和 text 二选一"},
         "confidence": {"type": "float", "desc": "0~1，越高越确信。无 KB 支撑应 < 0.55"},
     },
     call=_final_reply,
