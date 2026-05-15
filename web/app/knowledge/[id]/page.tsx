@@ -1,7 +1,17 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "next/navigation";
-import { Upload, Search, FileText, AlertCircle, RefreshCcw } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import {
+  Upload,
+  Search,
+  FileText,
+  AlertCircle,
+  RefreshCcw,
+  ArrowLeft,
+  Trash2,
+  Loader2,
+} from "lucide-react";
 import {
   api,
   apiForm,
@@ -23,6 +33,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 type SearchHit = {
   chunk_id: number;
@@ -33,21 +53,33 @@ type SearchHit = {
 };
 type GraphFact = { src: string; rel: string; dst: string };
 
+type PendingDelete =
+  | { kind: "kb" }
+  | { kind: "doc"; doc: KnowledgeDoc };
+
 export default function KBDetailPage() {
   const params = useParams<{ id: string }>();
+  const router = useRouter();
   const kbId = Number(params.id);
   const [kb, setKb] = useState<KnowledgeBase | null>(null);
   const [docs, setDocs] = useState<KnowledgeDoc[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
 
   const [pasteName, setPasteName] = useState("");
   const [pasteContent, setPasteContent] = useState("");
   const [busyPaste, setBusyPaste] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const [q, setQ] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [facts, setFacts] = useState<GraphFact[]>([]);
   const [searching, setSearching] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
+
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const reload = useCallback(async () => {
     const [kbRes, docsRes] = await Promise.all([
@@ -60,19 +92,48 @@ export default function KBDetailPage() {
 
   useEffect(() => {
     reload().catch(console.error);
-    const t = setInterval(reload, 2000); // simple poll for processing → ready
-    return () => clearInterval(t);
   }, [reload]);
+
+  // Only poll while there's a doc that's still processing.
+  const hasProcessing = docs.some(
+    (d) => d.status === "pending" || d.status === "processing"
+  );
+  useEffect(() => {
+    if (!hasProcessing) return;
+    const t = setInterval(() => {
+      reload().catch(console.error);
+    }, 2000);
+    return () => clearInterval(t);
+  }, [hasProcessing, reload]);
+
+  async function manualReload() {
+    setRefreshing(true);
+    try {
+      await reload();
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function uploadFile(file: File) {
     const fd = new FormData();
     fd.append("file", file);
+    setUploading(true);
     try {
       await apiForm(`/kb/${kbId}/docs`, fd);
-      toast.success("已上传,正在解析…");
+      toast.success(`已上传 ${file.name}，正在解析…`);
       reload();
     } catch (e: any) {
       toast.error("上传失败", { description: e?.message });
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function uploadFiles(files: FileList | File[]) {
+    const list = Array.from(files);
+    for (const f of list) {
+      await uploadFile(f);
     }
   }
 
@@ -85,7 +146,7 @@ export default function KBDetailPage() {
       fd.append("name", pasteName);
       fd.append("content", pasteContent);
       await apiForm(`/kb/${kbId}/docs/paste`, fd);
-      toast.success("已粘贴,正在解析…");
+      toast.success("已粘贴，正在解析…");
       setPasteName("");
       setPasteContent("");
       reload();
@@ -100,6 +161,7 @@ export default function KBDetailPage() {
     e?.preventDefault();
     if (!q.trim()) return;
     setSearching(true);
+    setHasSearched(true);
     try {
       const data = await api<{ hits: SearchHit[]; graph_facts: GraphFact[] }>(
         "/kb/search",
@@ -114,39 +176,137 @@ export default function KBDetailPage() {
     }
   }
 
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    try {
+      if (pendingDelete.kind === "kb") {
+        await api(`/kb/${kbId}`, { method: "DELETE" });
+        toast.success("已删除知识库");
+        router.push("/knowledge");
+      } else {
+        const doc = pendingDelete.doc;
+        await api(`/kb/${kbId}/docs/${doc.id}`, { method: "DELETE" });
+        toast.success(`已删除 ${doc.name}`);
+        setPendingDelete(null);
+        reload();
+      }
+    } catch (e: any) {
+      toast.error("删除失败", { description: e?.message });
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  const readyCount = docs.filter((d) => d.status === "ready").length;
+  const failedCount = docs.filter((d) => d.status === "failed").length;
+
   return (
     <div className="space-y-6">
+      {/* Header */}
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          {kb?.name || "知识库"}
-        </h1>
-        {kb && (
-          <p className="mt-1 text-xs text-muted-foreground">
-            {kb.description || "—"} · chunk_size={kb.chunk_size} · overlap={kb.chunk_overlap}
-          </p>
-        )}
+        <Link
+          href="/knowledge"
+          className="inline-flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          返回知识库列表
+        </Link>
+        <div className="mt-2 flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-2xl font-semibold tracking-tight">
+              {kb?.name || "知识库"}
+            </h1>
+            {kb && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                {kb.description || "暂无描述"}
+              </p>
+            )}
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+              <Badge variant="secondary">{docs.length} 文档</Badge>
+              <Badge variant="secondary">{readyCount} 就绪</Badge>
+              {hasProcessing && (
+                <Badge variant="secondary" className="gap-1">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  处理中
+                </Badge>
+              )}
+              {failedCount > 0 && (
+                <Badge variant="destructive">{failedCount} 失败</Badge>
+              )}
+              {kb && (
+                <span>
+                  chunk={kb.chunk_size} · overlap={kb.chunk_overlap} · v{kb.version}
+                </span>
+              )}
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0 text-destructive hover:bg-destructive/10 hover:text-destructive"
+            onClick={() => setPendingDelete({ kind: "kb" })}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            删除知识库
+          </Button>
+        </div>
       </div>
 
+      {/* Upload */}
       <div className="grid gap-4 md:grid-cols-2">
-        <Card>
+        <Card className="flex flex-col">
           <CardHeader>
             <CardTitle className="text-base">上传文档</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-3">
+          <CardContent className="flex-1">
             <input
               ref={fileRef}
               type="file"
               accept=".txt,.md,.pdf"
+              multiple
               className="hidden"
               onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) uploadFile(f);
+                const files = e.target.files;
+                if (files && files.length) uploadFiles(files);
                 if (e.target) e.target.value = "";
               }}
             />
-            <Button variant="outline" onClick={() => fileRef.current?.click()}>
-              <Upload className="h-4 w-4" /> 选择文件 (.txt / .md / .pdf)
-            </Button>
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={() => fileRef.current?.click()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") fileRef.current?.click();
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                if (e.dataTransfer.files?.length) uploadFiles(e.dataTransfer.files);
+              }}
+              className={`flex h-full cursor-pointer flex-col items-center justify-center rounded-md border-2 border-dashed py-8 text-center transition-colors ${
+                dragOver
+                  ? "border-foreground bg-accent/50"
+                  : "border-muted-foreground/25 hover:bg-accent/30"
+              }`}
+            >
+              {uploading ? (
+                <Loader2 className="mb-2 h-6 w-6 animate-spin text-muted-foreground" />
+              ) : (
+                <Upload className="mb-2 h-6 w-6 text-muted-foreground" />
+              )}
+              <p className="text-sm">
+                {uploading ? "上传中…" : "点击或拖拽文件到此处"}
+              </p>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                支持 .txt / .md / .pdf，可多选
+              </p>
+            </div>
           </CardContent>
         </Card>
 
@@ -165,57 +325,84 @@ export default function KBDetailPage() {
                 placeholder="粘贴你的产品说明 / FAQ ..."
                 value={pasteContent}
                 onChange={(e) => setPasteContent(e.target.value)}
-                className="min-h-[100px]"
+                className="min-h-[120px]"
               />
-              <Button type="submit" disabled={busyPaste || !pasteName.trim() || !pasteContent.trim()}>
-                提交
+              <Button
+                type="submit"
+                disabled={busyPaste || !pasteName.trim() || !pasteContent.trim()}
+              >
+                {busyPaste ? "提交中…" : "提交"}
               </Button>
             </form>
           </CardContent>
         </Card>
       </div>
 
+      {/* Documents */}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle className="text-base">文档</CardTitle>
-          <Button variant="ghost" size="icon" onClick={reload}>
-            <RefreshCcw className="h-4 w-4" />
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={manualReload}
+            disabled={refreshing}
+            aria-label="刷新"
+          >
+            <RefreshCcw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
           </Button>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-10">ID</TableHead>
                 <TableHead>名称</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>chunks</TableHead>
-                <TableHead>bytes</TableHead>
-                <TableHead>更新</TableHead>
+                <TableHead className="w-24">状态</TableHead>
+                <TableHead className="w-20">分片</TableHead>
+                <TableHead className="w-24">大小</TableHead>
+                <TableHead className="w-44">更新时间</TableHead>
+                <TableHead className="w-12"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {docs.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
-                    暂无文档
+                  <TableCell
+                    colSpan={6}
+                    className="py-10 text-center text-sm text-muted-foreground"
+                  >
+                    还没有文档，从上方上传或粘贴
                   </TableCell>
                 </TableRow>
               )}
               {docs.map((d) => (
                 <TableRow key={d.id}>
-                  <TableCell>{d.id}</TableCell>
-                  <TableCell className="flex items-center gap-1.5">
-                    <FileText className="h-3.5 w-3.5 text-muted-foreground" />
-                    {d.name}
+                  <TableCell className="max-w-[280px]">
+                    <div className="flex items-center gap-1.5">
+                      <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <span className="truncate" title={d.name}>{d.name}</span>
+                    </div>
                   </TableCell>
                   <TableCell>
                     <StatusBadge status={d.status} error={d.error} />
                   </TableCell>
                   <TableCell>{d.chunk_count}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{d.bytes}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {formatBytes(d.bytes)}
+                  </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {formatFull(d.updated_at)}
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => setPendingDelete({ kind: "doc", doc: d })}
+                      aria-label="删除文档"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
                   </TableCell>
                 </TableRow>
               ))}
@@ -224,6 +411,7 @@ export default function KBDetailPage() {
         </CardContent>
       </Card>
 
+      {/* Search */}
       <Card>
         <CardHeader>
           <CardTitle className="text-base">检索测试</CardTitle>
@@ -237,17 +425,20 @@ export default function KBDetailPage() {
               className="max-w-xl"
             />
             <Button type="submit" disabled={searching || !q.trim()}>
-              <Search className="h-4 w-4" /> 搜索
+              <Search className="h-4 w-4" /> {searching ? "搜索中…" : "搜索"}
             </Button>
           </form>
 
-          {hits.length === 0 && q && !searching && (
+          {hasSearched && hits.length === 0 && !searching && (
             <p className="text-xs text-muted-foreground">无命中</p>
           )}
 
           <div className="space-y-3">
             {hits.map((h, i) => (
-              <div key={h.chunk_id} className="rounded-md border bg-card p-3 text-sm">
+              <div
+                key={h.chunk_id}
+                className="rounded-md border bg-card p-3 text-sm"
+              >
                 <div className="mb-2 flex items-center justify-between">
                   <Badge variant="secondary">
                     #{i + 1} · score {h.score.toFixed(2)}
@@ -277,18 +468,64 @@ export default function KBDetailPage() {
           )}
         </CardContent>
       </Card>
+
+      <AlertDialog
+        open={!!pendingDelete}
+        onOpenChange={(o) => !o && !deleting && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {pendingDelete?.kind === "kb"
+                ? `删除知识库 ${kb?.name}？`
+                : `删除文档 ${pendingDelete?.kind === "doc" ? pendingDelete.doc.name : ""}？`}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete?.kind === "kb"
+                ? "此操作不可恢复。该知识库下所有文档、分片和向量都会被永久删除。"
+                : "此操作不可恢复。该文档对应的分片和向量也会被一并删除。"}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault();
+                confirmDelete();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
 
 function StatusBadge({ status, error }: { status: string; error: string | null }) {
-  if (status === "ready") return <Badge variant="success">ready</Badge>;
+  if (status === "ready") return <Badge variant="success">就绪</Badge>;
   if (status === "failed")
     return (
       <Badge variant="destructive" title={error ?? ""}>
         <AlertCircle className="mr-1 h-3 w-3" />
-        failed
+        失败
+      </Badge>
+    );
+  if (status === "processing")
+    return (
+      <Badge variant="secondary" className="gap-1">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        解析中
       </Badge>
     );
   return <Badge variant="secondary">{status}</Badge>;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }

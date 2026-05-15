@@ -243,6 +243,7 @@ class WeComAccessibilityService : AccessibilityService() {
             if (alreadySeen(title, content)) continue
             recent.addLast(Triple(title, content, now))
             cb(title, content)
+            Log.d(tag, "harvest chat=$title content=${content.take(60)}")
         }
     }
 

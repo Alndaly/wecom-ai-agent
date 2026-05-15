@@ -4,6 +4,7 @@ import android.app.Notification
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import android.os.Bundle
 
 /**
  * Primary inbound channel — fires for every incoming WeCom notification,
@@ -58,9 +59,17 @@ class MessageNotificationListener : NotificationListenerService() {
         if (sbn.packageName != wecomPkg) return
         val n: Notification = sbn.notification ?: return
         val extras = n.extras
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
-        if (title.isEmpty() || rawText.isEmpty()) return
+        val title = firstText(extras, Notification.EXTRA_TITLE, Notification.EXTRA_BIG_TEXT, Notification.EXTRA_SUB_TEXT)
+        val rawText = firstText(
+            extras,
+            Notification.EXTRA_TEXT,
+            Notification.EXTRA_BIG_TEXT,
+            Notification.EXTRA_TEXT_LINES,
+        )
+        if (title.isEmpty() || rawText.isEmpty()) {
+            Log.d(tag, "skip notif: missing title/text pkg=${sbn.packageName} extras=${extras.keySet()}")
+            return
+        }
 
         // ignore the persistent "您有 N 条未读消息" summary
         if (rawText.contains("未读消息") || rawText.contains("条新消息")) return
@@ -79,6 +88,14 @@ class MessageNotificationListener : NotificationListenerService() {
 
         Log.d(tag, "inbound: $sender :: ${content.take(60)}")
         onMessage?.invoke(sender, content, sbn.postTime)
+    }
+
+    private fun firstText(extras: Bundle, vararg keys: String): String {
+        for (key in keys) {
+            val v = extras.getCharSequence(key)?.toString()?.trim().orEmpty()
+            if (v.isNotEmpty()) return v
+        }
+        return ""
     }
 
     /**
