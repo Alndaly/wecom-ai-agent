@@ -32,13 +32,29 @@ class MilvusVectorStore(VectorStore):
         self.DataType = DataType
         self.client = MilvusClient(uri=uri)
         self.collection = collection
+        # `dim` from env is just an initial hint. The real dim is decided when
+        # the first vector arrives (so we don't bake mock-256 into a real
+        # 768/1536-dim deployment).
         self.dim = dim
-        self._ensure_collection()
+        if self.client.has_collection(self.collection):
+            # Detect existing dim so we don't try to mix dims silently.
+            try:
+                desc = self.client.describe_collection(self.collection)
+                for f in desc.get("fields", []):
+                    if f.get("name") == "vector":
+                        existing = int((f.get("params") or {}).get("dim") or 0)
+                        if existing:
+                            self.dim = existing
+                        break
+            except Exception:  # noqa: BLE001
+                log.exception("describe_collection failed; will reuse configured dim")
 
-    def _ensure_collection(self) -> None:
+    def _ensure_collection(self, actual_dim: int | None = None) -> None:
         DataType = self.DataType
         if self.client.has_collection(self.collection):
             return
+        if actual_dim:
+            self.dim = actual_dim
         schema = self.client.create_schema(auto_id=True, enable_dynamic_field=False)
         schema.add_field("id", DataType.INT64, is_primary=True)
         schema.add_field("vector", DataType.FLOAT_VECTOR, dim=self.dim)
@@ -64,6 +80,9 @@ class MilvusVectorStore(VectorStore):
         log.info("milvus: created collection %s dim=%s", self.collection, self.dim)
 
     async def upsert(self, ids, vectors, metas) -> None:
+        if vectors:
+            # Lazy-create the collection with the right dim on first write.
+            self._ensure_collection(actual_dim=len(vectors[0]))
         rows = [
             {
                 "vector": v,

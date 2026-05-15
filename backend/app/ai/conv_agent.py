@@ -1,0 +1,274 @@
+"""Conversational ReAct agent — replaces the single-shot `_generate` path
+in `workflow.py` when `agent_mode_enabled=True`.
+
+Loop (bounded by `max_steps`):
+  1. Render system prompt with tool catalogue + customer profile + history
+  2. Ask LLM to emit JSON `{thought, tool, args}` OR `{thought, tool: "final_reply", ...}`
+  3. Execute the tool, append observation to running context
+  4. If `final_reply` was called, stop
+
+Every step is logged (info-level + AIReplyLog row) so post-mortems are
+straightforward.
+
+Designed to be drop-in compatible with the existing `Decision` shape used by
+`workflow.py`.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from app.ai.providers import ChatMessage
+from app.ai.tools import ToolContext, get_registry
+
+# Per-step LLM timeout. If the upstream provider hangs we MUST not block the
+# inbound-message pipeline indefinitely — the customer is waiting on a reply.
+_STEP_LLM_TIMEOUT_SEC = 45.0
+# Per-tool execution timeout — protects against a misbehaving skill / MCP tool.
+_TOOL_TIMEOUT_SEC = 20.0
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentReplyResult:
+    text: str | None
+    confidence: float
+    model: str
+    latency_ms: int
+    steps: int
+    escalate: bool = False
+    escalate_reason: str = ""
+    kb_hit_ids: list[int] | None = None
+    kb_context: str = ""
+    trace: list[dict[str, Any]] | None = None
+
+
+_SYSTEM_TEMPLATE = """你是企业的私域客服智能体。请用工具一步步推理来回答客户问题。
+
+【系统设定】
+{system}
+
+【客户画像】
+{profile}
+
+【可用工具】
+{tools}
+
+【输出协议】
+- 每一步只输出严格 JSON：{{"thought": "中文思考...", "tool": "工具名", "args": {{...}}}}
+- 不要把 JSON 包在 ```代码块``` 里，不要在 JSON 之外多说一个字。
+
+【关于知识库检索】
+- 优先使用客户原话作为 query 调一次 kb_search（命中率最高）。
+- 如果第一次返回「未找到」，**再换 1~2 种措辞重试**（拆关键词、用同义说法）。
+- 命中知识库片段时，回复必须紧扣片段内容，不要凭空发挥；并把 confidence 设到 ≥ 0.7。
+
+【何时调用 escalate_to_human（重要）】
+- 客户明确要求「人工/转人工/人工客服」。
+- 涉及投诉、退款、合规、隐私、定价谈判等敏感事务。
+- **检索 2~3 次都没有相关知识** —— 这是一个私域客服 agent，知识库覆盖之外的问题**不能**用通用知识硬答，应当转人工，避免给出错误或臆造的产品信息。
+
+【其它】
+- 用 `set_profile_field` 记录客户透露的稳定偏好（行业/角色/预算 等）。
+- 准备好正式回复客户时调用 `final_reply`。
+- 最多 {max_steps} 步，高效推理，避免冗余工具调用。
+"""
+
+
+async def run_conv_agent(
+    *,
+    db,
+    team_id: int,
+    conversation_id: int,
+    contact_id: int,
+    inbound_text: str,
+    trace_id: str,
+    system_prompt: str,
+    profile_summary: str,
+    history,  # list[Message]
+    provider,
+    temperature: float = 0.3,
+    max_tokens: int = 8192,
+    max_steps: int = 5,
+) -> AgentReplyResult:
+    started = time.monotonic()
+    registry = get_registry()
+    catalog = registry.render_catalog()
+    log.info(
+        "[agent] enter team=%s conv=%s trace=%s tools=%d text=%r",
+        team_id, conversation_id, trace_id, len(registry.all()), _short(inbound_text, 80),
+    )
+    if not registry.all():
+        # No tools registered usually means the lifespan bootstrap didn't run —
+        # don't go into a 5-step empty-catalog loop, fall back fast.
+        log.warning("[agent] empty tool registry — aborting to fallback")
+        return AgentReplyResult(
+            text="稍等，我先核实一下再回您。",
+            confidence=0.2, model="", latency_ms=0, steps=0,
+        )
+    ctx = ToolContext(
+        db=db,
+        team_id=team_id,
+        conversation_id=conversation_id,
+        contact_id=contact_id,
+        inbound_text=inbound_text,
+        trace_id=trace_id,
+    )
+
+    system = _SYSTEM_TEMPLATE.format(
+        system=system_prompt.strip() or "（无）",
+        profile=profile_summary.strip() or "（暂无）",
+        tools=catalog or "（空）",
+        max_steps=max_steps,
+    )
+
+    base_msgs: list[ChatMessage] = [ChatMessage(role="system", content=system)]
+    for m in history:
+        role = "user" if m.direction == "in" else "assistant"
+        base_msgs.append(ChatMessage(role=role, content=m.content))
+    # The current inbound is the user's latest turn; the agent reasons over it.
+    base_msgs.append(ChatMessage(role="user", content=inbound_text))
+
+    trace: list[dict[str, Any]] = []
+    scratch_for_step: list[ChatMessage] = []
+    last_model = ""
+    final_text: str | None = None
+    final_confidence = 0.0
+
+    for step in range(1, max_steps + 1):
+        msgs = base_msgs + scratch_for_step
+        t_llm = time.monotonic()
+        # Cap temperature for the reasoning loop. The user-configured value is
+        # tuned for the final reply tone, but high temperature here breaks the
+        # strict-JSON / tool-naming contract.
+        agent_temp = min(float(temperature), 0.25)
+        try:
+            result = await asyncio.wait_for(
+                provider.chat(msgs, temperature=agent_temp, max_tokens=max_tokens),
+                timeout=_STEP_LLM_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "[agent] step %d LLM timeout after %ds", step, int(_STEP_LLM_TIMEOUT_SEC),
+            )
+            trace.append({"step": step, "error": f"llm_timeout_{int(_STEP_LLM_TIMEOUT_SEC)}s"})
+            break
+        except Exception as e:  # noqa: BLE001
+            log.exception("agent LLM call failed")
+            trace.append({"step": step, "error": f"llm_error: {e}"})
+            break
+        log.info(
+            "[agent] step %d LLM ok (%dms, %d tokens out approx)",
+            step, int((time.monotonic() - t_llm) * 1000), len(result.text or "") // 4,
+        )
+        last_model = result.model
+        decision = _parse_json(result.text)
+        tool_name = (decision.get("tool") or "").strip()
+        thought = (decision.get("thought") or "").strip()
+        args = decision.get("args") or {}
+        log.info(
+            "[agent] step %d/%d tool=%s thought=%s args=%s",
+            step, max_steps, tool_name, _short(thought, 80), _short(args, 200),
+        )
+        trace.append({"step": step, "tool": tool_name, "thought": thought, "args": args})
+
+        tool = registry.get(tool_name)
+        if tool is None:
+            obs = f"ERROR: 未知工具 {tool_name!r}。请改用工具表里列出的名字。"
+            scratch_for_step.append(
+                ChatMessage(role="assistant", content=json.dumps(decision, ensure_ascii=False))
+            )
+            scratch_for_step.append(
+                ChatMessage(role="user", content=f"[observation]\n{obs}")
+            )
+            trace[-1]["observation"] = obs
+            continue
+
+        try:
+            obs = await asyncio.wait_for(tool.call(ctx, args), timeout=_TOOL_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            obs = f"ERROR: tool {tool_name} 超过 {int(_TOOL_TIMEOUT_SEC)}s 未返回"
+            log.warning("[agent] tool %s timeout", tool_name)
+        except Exception as e:  # noqa: BLE001
+            log.exception("tool %s raised", tool_name)
+            obs = f"ERROR: tool 抛错: {e}"
+        log.info("[agent] step %d obs=%s", step, _short(obs, 200))
+        trace[-1]["observation"] = obs
+
+        # Terminal tools short-circuit the loop.
+        if tool_name == "final_reply" and "final_text" in ctx.scratch:
+            final_text = ctx.scratch["final_text"]
+            final_confidence = float(ctx.scratch.get("final_confidence", 0.7))
+            break
+        if tool_name == "escalate_to_human":
+            break
+
+        # Otherwise feed the LLM the action it picked + the observation, so it
+        # can continue reasoning.
+        scratch_for_step.append(
+            ChatMessage(role="assistant", content=json.dumps(decision, ensure_ascii=False))
+        )
+        scratch_for_step.append(
+            ChatMessage(role="user", content=f"[observation]\n{obs}")
+        )
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    escalate = bool(ctx.scratch.get("escalate"))
+
+    # If the LLM never reached final_reply (timeout / wandering), fall back to
+    # a polite stall — better than dropping the customer on the floor.
+    if final_text is None and not escalate:
+        final_text = "稍等一下，我帮您再核实一下。"
+        final_confidence = 0.3
+        log.warning("[agent] loop ended without final_reply; fallback used")
+
+    return AgentReplyResult(
+        text=final_text,
+        confidence=final_confidence,
+        model=last_model,
+        latency_ms=elapsed_ms,
+        steps=len(trace),
+        escalate=escalate,
+        escalate_reason=str(ctx.scratch.get("escalate_reason", "")),
+        kb_hit_ids=list(ctx.scratch.get("kb_hit_ids") or []),
+        kb_context=str(ctx.scratch.get("kb_context") or ""),
+        trace=trace,
+    )
+
+
+# ---- helpers --------------------------------------------------------------
+
+_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_json(s: str) -> dict[str, Any]:
+    s = (s or "").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    m = _JSON_BLOCK.search(s)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "thought": "LLM 输出无法解析为 JSON",
+        "tool": "final_reply",
+        "args": {"text": "抱歉，我这边出了点小问题。请稍后再试一次。", "confidence": 0.2},
+    }
+
+
+def _short(v: Any, n: int) -> str:
+    if isinstance(v, (dict, list)):
+        s = json.dumps(v, ensure_ascii=False)
+    else:
+        s = str(v)
+    return s if len(s) <= n else s[:n] + "…"

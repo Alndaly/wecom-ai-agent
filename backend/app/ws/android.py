@@ -145,6 +145,19 @@ async def _handle_event(robot: Robot, data: dict) -> None:
     if event == "device.ui_dump":
         dump = _save_ui_dump(robot, payload)
         await hub.broadcast_web(robot.team_id, "device.ui_dump", dump)
+        # If this dump was the response to a ReAct agent request, deliver it.
+        hub.resolve_request(payload.get("request_id"), dump)
+        return
+
+    if event == "device.command_result":
+        # Generic ack-with-result channel used by the ReAct agent. The device
+        # echoes `request_id` so we can correlate. Payload also carries
+        # `command`, `ok`, `message`, and an optional `data` object.
+        hub.resolve_request(payload.get("request_id"), payload)
+        await hub.broadcast_web(robot.team_id, "device.command_result", {
+            "robot_id": robot.robot_id,
+            **{k: v for k, v in payload.items() if k != "request_id"},
+        })
         return
 
     if event == "device.screen_frame":

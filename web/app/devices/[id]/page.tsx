@@ -1,8 +1,17 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ArrowLeft, Copy, FileSearch, Loader2, MonitorUp, Square } from "lucide-react";
+import {
+  ArrowLeft,
+  CheckCircle2,
+  Copy,
+  FileSearch,
+  Loader2,
+  MonitorUp,
+  Square,
+  XCircle,
+} from "lucide-react";
 import { api, type Robot, type RobotTaskLog } from "@/lib/api";
 import { formatFull } from "@/lib/datetime";
 import { useWebWs } from "@/lib/ws";
@@ -230,8 +239,8 @@ export default function DeviceDetailPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
-        <Card>
+      <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)_360px]">
+        <Card className="self-start">
           <CardHeader>
             <CardTitle className="text-base">设备信息</CardTitle>
           </CardHeader>
@@ -247,7 +256,7 @@ export default function DeviceDetailPage() {
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="min-w-0">
           <CardHeader>
             <CardTitle className="flex items-center justify-between gap-3 text-base">
               <span>实时屏幕</span>
@@ -278,27 +287,8 @@ export default function DeviceDetailPage() {
             )}
           </CardContent>
         </Card>
-      </div>
 
-      <div className="rounded-lg border bg-background">
-        <div className="border-b px-4 py-3">
-          <h2 className="text-sm font-semibold">任务日志</h2>
-        </div>
-        <div className="max-h-80 overflow-auto">
-          {logs.length === 0 ? (
-            <div className="px-4 py-6 text-sm text-muted-foreground">暂无日志</div>
-          ) : (
-            <div className="divide-y">
-              {logs.map((log) => (
-                <div key={log.id} className="grid grid-cols-[88px_1fr_auto] gap-3 px-4 py-2 text-sm">
-                  <div className="text-muted-foreground">{new Date(log.created_at).toLocaleTimeString()}</div>
-                  <div className={log.level === "error" ? "text-destructive" : ""}>{log.message}</div>
-                  <div className="text-xs text-muted-foreground">task #{log.task_id ?? "-"}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        <TaskLogPanel logs={logs} />
       </div>
 
       <Dialog open={!!uiDump} onOpenChange={(o) => !o && setUiDump(null)}>
@@ -345,5 +335,215 @@ function InfoRow({ label, value }: { label: string; value: string }) {
       <div className="text-muted-foreground">{label}</div>
       <div className="min-w-0 break-words">{value}</div>
     </div>
+  );
+}
+
+// ---- task log panel -------------------------------------------------------
+
+type ParsedLog =
+  | { kind: "react-step";       step: number; total: number; thought?: string; action?: string; args?: string }
+  | { kind: "react-result";     step: number; ok: boolean; msg: string; elapsedMs?: number }
+  | { kind: "react-final";      ok: boolean; summary: string; steps?: number }
+  | { kind: "react-goal";       goal: string }
+  | { kind: "plain";            text: string };
+
+const RE_STEP = /^\[react\]\s+step\s+(\d+)\/(\d+)\s+thought=(.+?)(?:\s+action=(\S+))?(?:\s+args=(\{.*\}))?$/;
+const RE_RESULT = /^\[react\]\s+step\s+(\d+)\s+→\s+ok=(True|False)\s+msg=(.+?)(?:\s+\((\d+)ms\))?$/;
+const RE_FINAL = /^\[react\]\s+result\s+ok=(True|False)\s+steps=(\d+)\s+summary=(.*)$/;
+const RE_GOAL = /^\[react\]\s+goal=(.+)$/;
+
+function parseLog(message: string): ParsedLog {
+  let m;
+  if ((m = message.match(RE_STEP))) {
+    return {
+      kind: "react-step",
+      step: Number(m[1]),
+      total: Number(m[2]),
+      thought: stripQuotes(m[3]),
+      action: m[4],
+      args: m[5],
+    };
+  }
+  if ((m = message.match(RE_RESULT))) {
+    return {
+      kind: "react-result",
+      step: Number(m[1]),
+      ok: m[2] === "True",
+      msg: stripQuotes(m[3]),
+      elapsedMs: m[4] ? Number(m[4]) : undefined,
+    };
+  }
+  if ((m = message.match(RE_FINAL))) {
+    return {
+      kind: "react-final",
+      ok: m[1] === "True",
+      steps: Number(m[2]),
+      summary: m[3],
+    };
+  }
+  if ((m = message.match(RE_GOAL))) {
+    return { kind: "react-goal", goal: stripQuotes(m[1]) };
+  }
+  return { kind: "plain", text: message };
+}
+
+function stripQuotes(s: string): string {
+  s = s.trim();
+  if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function TaskLogPanel({ logs }: { logs: RobotTaskLog[] }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Auto-scroll to bottom when new entries arrive — only if user is already near bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (nearBottom) el.scrollTop = el.scrollHeight;
+  }, [logs.length]);
+
+  return (
+    <Card className="flex max-h-[78vh] min-h-[520px] flex-col self-start">
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
+        <CardTitle className="text-base">任务日志</CardTitle>
+        <Badge variant="secondary" className="font-mono">{logs.length}</Badge>
+      </CardHeader>
+      <CardContent ref={scrollRef} className="min-h-0 flex-1 overflow-auto px-0 pt-0">
+        {logs.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm text-muted-foreground">暂无日志</div>
+        ) : (
+          <ul className="space-y-px">
+            {logs.map((log) => (
+              <LogRow key={log.id} log={log} />
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function LogRow({ log }: { log: RobotTaskLog }) {
+  const parsed = useMemo(() => parseLog(log.message), [log.message]);
+  const time = useMemo(
+    () => new Date(log.created_at).toLocaleTimeString(undefined, { hour12: false }),
+    [log.created_at]
+  );
+  const taskTag = log.task_id != null ? `#${log.task_id}` : null;
+  const isError = log.level === "error";
+  const isWarn = log.level === "warn";
+
+  let body: React.ReactNode;
+  switch (parsed.kind) {
+    case "react-goal":
+      body = (
+        <div className="rounded-md bg-amber-50 px-2 py-1.5 dark:bg-amber-950/30">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
+            目标
+          </div>
+          <div className="mt-0.5 line-clamp-3 text-foreground">{parsed.goal}</div>
+        </div>
+      );
+      break;
+    case "react-step":
+      body = (
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge variant="outline" className="h-5 px-1.5 font-mono text-[10px]">
+              step {parsed.step}/{parsed.total}
+            </Badge>
+            {parsed.action && (
+              <Badge className="h-5 bg-blue-600 px-1.5 font-mono text-[10px] text-white hover:bg-blue-600">
+                {parsed.action}
+              </Badge>
+            )}
+          </div>
+          {parsed.thought && (
+            <div className="line-clamp-3 text-muted-foreground">{parsed.thought}</div>
+          )}
+          {parsed.args && (
+            <pre className="overflow-hidden text-ellipsis rounded bg-muted px-1.5 py-1 font-mono text-[10.5px] leading-tight">
+              {parsed.args.length > 200 ? parsed.args.slice(0, 200) + "…" : parsed.args}
+            </pre>
+          )}
+        </div>
+      );
+      break;
+    case "react-result":
+      body = (
+        <div className="flex items-start gap-1.5">
+          {parsed.ok ? (
+            <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+          ) : (
+            <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+          )}
+          <div className="min-w-0 flex-1">
+            <span className="font-mono text-[10.5px] text-muted-foreground">
+              step {parsed.step} →{" "}
+            </span>
+            <span className={parsed.ok ? "" : "text-destructive"}>{parsed.msg}</span>
+            {parsed.elapsedMs != null && (
+              <span className="ml-1 text-[10.5px] text-muted-foreground">
+                ({parsed.elapsedMs}ms)
+              </span>
+            )}
+          </div>
+        </div>
+      );
+      break;
+    case "react-final":
+      body = (
+        <div
+          className={`rounded-md px-2 py-1.5 ${
+            parsed.ok
+              ? "bg-emerald-50 dark:bg-emerald-950/30"
+              : "bg-red-50 dark:bg-red-950/30"
+          }`}
+        >
+          <div className="flex items-center gap-1.5">
+            {parsed.ok ? (
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+            ) : (
+              <XCircle className="h-3.5 w-3.5 text-destructive" />
+            )}
+            <span
+              className={`text-[10px] font-semibold uppercase tracking-wider ${
+                parsed.ok
+                  ? "text-emerald-700 dark:text-emerald-400"
+                  : "text-destructive"
+              }`}
+            >
+              {parsed.ok ? "完成" : "失败"} · {parsed.steps} 步
+            </span>
+          </div>
+          {parsed.summary && (
+            <div className="mt-0.5 line-clamp-3 text-foreground">{parsed.summary}</div>
+          )}
+        </div>
+      );
+      break;
+    default:
+      body = (
+        <div
+          className={`break-words leading-snug ${
+            isError ? "text-destructive" : isWarn ? "text-amber-600" : ""
+          }`}
+        >
+          {parsed.text}
+        </div>
+      );
+  }
+
+  return (
+    <li className="border-b px-3 py-2 text-xs last:border-b-0">
+      <div className="mb-1 flex items-center justify-between gap-2 text-[10.5px] font-mono text-muted-foreground">
+        <span>{time}</span>
+        {taskTag && <span>task {taskTag}</span>}
+      </div>
+      {body}
+    </li>
   );
 }

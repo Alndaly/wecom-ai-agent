@@ -1,13 +1,24 @@
 """Task creation + dispatch to Android."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
+from app.core.db import SessionLocal
 from app.core.ws_manager import hub
 from app.models import Conversation, Message, Robot, RobotTask, RobotTaskLog
 from app.schemas import MessageOut, TaskOut
+
+log = logging.getLogger(__name__)
+
+
+# Marker prepended to task.last_error after the ReAct agent has finished —
+# prevents re-entry if the agent itself marks the task failed.
+_REACT_PREFIX = "[react] "
 
 
 async def create_and_dispatch_send_text(
@@ -103,6 +114,16 @@ async def update_task_on_callback(
         {"task_id": task.id, "status": task.status, "error": task.last_error},
     )
 
+    # Escalate failed deterministic tasks to the ReAct fallback agent — but
+    # only once, and only for tasks we know how to express as a goal.
+    if (
+        status in ("failed", "timeout")
+        and settings.react_fallback_enabled
+        and not (error or "").startswith(_REACT_PREFIX)
+        and task.type == "send_text"
+    ):
+        asyncio.create_task(_run_react_fallback(robot_id=robot.id, task_id=task.id))
+
 
 async def append_task_log(
     db: AsyncSession,
@@ -150,3 +171,87 @@ async def _broadcast_message_update(team_id: int, msg: Message) -> None:
 
 def _redispatch_payload(task: RobotTask) -> dict[str, Any]:
     return {"task_id": task.id, "type": task.type, "payload": task.payload_json}
+
+
+async def _run_react_fallback(*, robot_id: int, task_id: int) -> None:
+    """Background coroutine: when a deterministic task fails, run the ReAct
+    agent with the same goal and persist its trajectory into the task log.
+
+    Errors here must NOT raise into the caller — this is fire-and-forget.
+    """
+    # Late import to avoid circular dependency at module load time.
+    from app.ai.react_agent import run_react
+
+    async with SessionLocal() as db:
+        try:
+            task = await db.get(RobotTask, task_id)
+            if task is None:
+                return
+            robot = await db.get(Robot, robot_id)
+            if robot is None:
+                return
+
+            goal = _goal_for_task(task)
+            if goal is None:
+                return
+
+            async def _sink(level: str, message: str) -> None:
+                # Each step appended as its own log row + websocket broadcast.
+                async with SessionLocal() as inner:
+                    await append_task_log(
+                        inner, robot=robot, task_id=task.id,
+                        level=level if level in ("info", "warn", "error") else "info",
+                        message=message,
+                    )
+
+            log.info("react fallback start task=%s goal=%r", task.id, goal)
+            result = await run_react(
+                db, robot, goal,
+                max_steps=settings.react_max_steps,
+                step_timeout=settings.react_step_timeout_sec,
+                log_sink=_sink,
+            )
+            task = await db.get(RobotTask, task_id)
+            if task is None:
+                return
+
+            if result.ok:
+                task.status = "completed"
+                task.last_error = None
+                if task.message_id:
+                    msg = await db.get(Message, task.message_id)
+                    if msg:
+                        msg.status = "sent"
+            else:
+                task.status = "failed"
+                task.last_error = _REACT_PREFIX + result.summary
+            db.add(RobotTaskLog(
+                robot_id=robot.id, task_id=task.id,
+                level="info" if result.ok else "warn",
+                message=f"[react] result ok={result.ok} steps={len(result.steps)} summary={result.summary}",
+            ))
+            await db.commit()
+            await hub.broadcast_web(
+                robot.team_id, "task.updated",
+                {"task_id": task.id, "status": task.status, "error": task.last_error},
+            )
+            if task.message_id:
+                m = await db.get(Message, task.message_id)
+                if m:
+                    await _broadcast_message_update(robot.team_id, m)
+        except Exception as e:  # noqa: BLE001
+            log.exception("react fallback crashed: %s", e)
+
+
+def _goal_for_task(task: RobotTask) -> str | None:
+    if task.type == "send_text":
+        p = task.payload_json or {}
+        contact = p.get("conversation_external_id") or "目标联系人"
+        text = (p.get("text") or "").strip()
+        if not text:
+            return None
+        # Truncate for prompt budget; the LLM doesn't need the full text to
+        # decide *how* to navigate, only that it's a send-text intent.
+        snippet = text if len(text) <= 80 else text[:80] + "…"
+        return f"打开与「{contact}」的聊天，并发送下面这段文本：{snippet}"
+    return None

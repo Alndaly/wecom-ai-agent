@@ -293,6 +293,86 @@ class WeComAutomator(
         return null
     }
 
+    // ====================================================================
+    //  Primitive ops for the backend ReAct agent. Generic — no WeCom-specific
+    //  heuristics; the agent decides what to do based on UI tree + screenshot.
+    // ====================================================================
+
+    suspend fun reactTapText(text: String): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
+        val node = root.findFirst { matchesText(it, text) }
+            ?: return false to "未找到包含「$text」的节点"
+        var n: AccessibilityNodeInfo? = node
+        while (n != null && !n.isClickable) n = n.parent
+        val target = n ?: node
+        val ok = target.tap()
+        return ok to if (ok) "已点击「$text」" else "节点不可点击"
+    }
+
+    suspend fun reactTapXY(x: Int, y: Int): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val ok = gestureTap(svc, x.toFloat(), y.toFloat())
+        return ok to if (ok) "已在 ($x, $y) 点击" else "手势失败"
+    }
+
+    suspend fun reactSwipe(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Long = 300): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val ok = gestureSwipe(svc, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), durationMs)
+        return ok to if (ok) "已滑动 ($x1,$y1)→($x2,$y2)" else "手势失败"
+    }
+
+    suspend fun reactInputText(text: String): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val edit = findChatEditable(svc, timeoutMs = 2_000)
+            ?: svc.rootInActiveWindow?.findFirst { it.isEditable }
+            ?: return false to "未找到可编辑输入框"
+        return edit.replaceText(text).let { it to if (it) "已输入文本" else "ACTION_SET_TEXT 失败" }
+    }
+
+    suspend fun reactBack(): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val ok = svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        return ok to if (ok) "已返回" else "返回手势失败"
+    }
+
+    suspend fun reactHome(): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val ok = svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        return ok to if (ok) "已回主屏" else "Home 手势失败"
+    }
+
+    /** Return the current UI tree text + foreground package name. */
+    suspend fun reactDumpUiTree(): Triple<Boolean, String, String> {
+        val svc = a11y() ?: return Triple(false, "", "无障碍未启用")
+        val root = svc.rootInActiveWindow ?: return Triple(false, "", "无活动窗口")
+        val sb = StringBuilder()
+        sb.append("=== UI dump pkg=").append(root.packageName).append(" ===\n")
+        printNode(root, 0, sb)
+        return Triple(true, sb.toString(), root.packageName?.toString() ?: "")
+    }
+
+    private fun gestureTap(svc: AccessibilityService, x: Float, y: Float): Boolean {
+        val path = android.graphics.Path().apply { moveTo(x, y) }
+        val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, 80)
+        val gesture = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()
+        return svc.dispatchGesture(gesture, null, null)
+    }
+
+    private fun gestureSwipe(
+        svc: AccessibilityService,
+        x1: Float, y1: Float, x2: Float, y2: Float,
+        durationMs: Long,
+    ): Boolean {
+        val path = android.graphics.Path().apply {
+            moveTo(x1, y1)
+            lineTo(x2, y2)
+        }
+        val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, durationMs)
+        val gesture = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()
+        return svc.dispatchGesture(gesture, null, null)
+    }
+
     // -------------------------------------------------------- dump helper
     fun dumpTree(svc: AccessibilityService, reason: String) {
         val root = svc.rootInActiveWindow ?: run {

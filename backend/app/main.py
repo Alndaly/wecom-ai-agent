@@ -44,7 +44,92 @@ async def _ensure_seed() -> None:
 async def lifespan(_: FastAPI):
     await init_db()
     await _ensure_seed()
-    yield
+    await _bootstrap_agent_tools()
+    await _hydrate_vector_store()
+    try:
+        yield
+    finally:
+        # Close MCP sessions on shutdown so subprocesses don't linger.
+        try:
+            from app.ai.tools import mcp_adapter
+
+            await mcp_adapter.shutdown()
+        except Exception:  # noqa: BLE001
+            logging.exception("mcp shutdown failed")
+
+
+async def _hydrate_vector_store() -> None:
+    """Mirror SQL-stored embeddings into the active vector store.
+
+    The SQL `knowledge_chunks.embedding_json` is our source-of-truth for
+    embeddings (we write it at ingest time). This step lets two scenarios
+    "just work":
+      1. memory store, restart → repopulate the empty in-memory store.
+      2. switched from memory → milvus → fresh milvus collection has no data
+         but SQL still does. Upsert is idempotent so it's safe to run every
+         start; for already-populated milvus deployments it's a no-op write.
+
+    Failures here MUST NOT block startup.
+    """
+    try:
+        from app.kb.vectorstore import get_vector_store
+        from app.models import KnowledgeBase, KnowledgeChunk
+
+        store = get_vector_store()
+        async with SessionLocal() as db:
+            rows = (
+                await db.execute(
+                    select(KnowledgeChunk, KnowledgeBase.team_id)
+                    .join(KnowledgeBase, KnowledgeBase.id == KnowledgeChunk.kb_id)
+                    .where(KnowledgeChunk.embedding_json.is_not(None))
+                )
+            ).all()
+        if not rows:
+            logging.info("vector hydrate: no chunks to load")
+            return
+        ids: list[str] = []
+        vecs: list[list[float]] = []
+        metas: list[dict] = []
+        for chunk, team_id in rows:
+            ids.append(chunk.embedding_id or f"chunk-{chunk.id}")
+            vecs.append(chunk.embedding_json)
+            metas.append({
+                "team_id": team_id,
+                "kb_id": chunk.kb_id,
+                "doc_id": chunk.doc_id,
+                "chunk_id": chunk.id,
+                "text": chunk.text,
+            })
+        await store.upsert(ids, vecs, metas)
+        logging.info(
+            "vector hydrate: restored %d chunk(s) into %s store",
+            len(ids), settings.vector_store,
+        )
+    except Exception:
+        logging.exception("vector hydrate failed (continuing without it)")
+
+
+async def _bootstrap_agent_tools() -> None:
+    """Register built-in tools, load file skills, connect MCP servers.
+
+    Failures here MUST NOT block app startup — log and move on.
+    """
+    try:
+        from app.ai.tools import builtin, mcp_adapter, skills as skills_loader
+
+        builtin.register_builtins()
+        try:
+            skills_loader.load_skills_from_dir(settings.skills_dir)
+        except Exception:  # noqa: BLE001
+            logging.exception("skill loader crashed")
+        servers = mcp_adapter.parse_servers(settings.mcp_servers_json)
+        if servers:
+            try:
+                await mcp_adapter.connect_servers(servers)
+            except Exception:  # noqa: BLE001
+                logging.exception("mcp connect failed")
+    except Exception:  # noqa: BLE001
+        logging.exception("agent bootstrap failed")
 
 
 app = FastAPI(title="WeCom AI Agent", lifespan=lifespan)

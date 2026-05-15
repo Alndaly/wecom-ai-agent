@@ -37,6 +37,8 @@ type AIBehaviorCfg = {
   context_window: number;
   default_prompt: string;
   max_tokens: number;
+  agent_mode: boolean;
+  agent_max_steps: number;
 };
 type ParserCfg = {
   backend: "builtin" | "mineru_local" | "mineru_api";
@@ -620,6 +622,26 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
             className="min-h-[120px]"
             placeholder="留空则使用后端默认提示词"
           />
+        </div>
+        <div className="flex flex-wrap items-center gap-4 rounded-md border bg-muted/30 p-3 text-sm">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={v.agent_mode}
+              onChange={(e) => setV({ ...v, agent_mode: e.target.checked })}
+            />
+            <span>启用 ReAct 智能体（可调用 kb_search / 技能 / MCP 工具）</span>
+          </label>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="ams" className="m-0">agent_max_steps</Label>
+            <Input
+              id="ams"
+              type="number"
+              value={String(v.agent_max_steps)}
+              onChange={(e) => setV({ ...v, agent_max_steps: Number(e.target.value) })}
+              className="w-24"
+            />
+          </div>
         </div>
         <Button onClick={save} disabled={busy}>
           <Save className="h-4 w-4" /> 保存

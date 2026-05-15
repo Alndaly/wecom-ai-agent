@@ -29,7 +29,14 @@ _ALLOWED: dict[str, set[str]] = {
     "llm": {"provider", "model", "api_key", "base_url", "temperature"},
     "embedding": {"provider", "model", "api_key", "base_url", "dim"},
     "retrieval": {"top_k", "min_score"},
-    "ai": {"confidence_threshold", "context_window", "default_prompt", "max_tokens"},
+    "ai": {
+        "confidence_threshold",
+        "context_window",
+        "default_prompt",
+        "max_tokens",
+        "agent_mode",
+        "agent_max_steps",
+    },
     "parser": {
         "backend",
         "api_base",
@@ -66,6 +73,8 @@ def _env_defaults(scope: str) -> dict[str, Any]:
             "context_window": settings.ai_context_window,
             "default_prompt": settings.ai_default_prompt,
             "max_tokens": settings.ai_max_tokens,
+            "agent_mode": settings.agent_mode_enabled,
+            "agent_max_steps": settings.agent_max_steps,
         }
     if scope == "parser":
         return {

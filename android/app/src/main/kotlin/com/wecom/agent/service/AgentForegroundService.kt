@@ -337,6 +337,15 @@ class AgentForegroundService : Service() {
                         startScreenStream(intervalMs)
                     }
                     "screen_stop" -> stopScreenStream()
+                    "screenshot_once",
+                    "tap_text",
+                    "tap_xy",
+                    "swipe",
+                    "input_text",
+                    "back",
+                    "home" -> {
+                        scope.launch { handleReactCommand(command!!, obj) }
+                    }
                     else -> {
                         sendCommandAck(command ?: "unknown", false, "未知设备命令")
                         broadcastLog("未知设备命令：$command")
@@ -384,6 +393,85 @@ class AgentForegroundService : Service() {
         screenStreamJob = null
         sendCommandAck("screen_stop", true, "实时屏幕已关闭")
         broadcastLog("实时屏幕已关闭")
+    }
+
+    // ---------------------------------------------------------------- ReAct
+    //  Each primitive runs once and replies via `device.command_result`. The
+    //  backend agent correlates by `request_id` and decides the next action.
+    private suspend fun handleReactCommand(command: String, obj: kotlinx.serialization.json.JsonObject) {
+        val requestId = obj["request_id"]?.jsonPrimitive?.contentOrNull
+        if (requestId == null) {
+            broadcastLog("ReAct 命令缺少 request_id：$command")
+            sendCommandAck(command, false, "missing request_id")
+            return
+        }
+        broadcastLog("ReAct ← $command (req=${requestId.take(8)})")
+        val started = System.currentTimeMillis()
+        var data: kotlinx.serialization.json.JsonElement? = null
+        val automator = WeComAutomator(this) { msg -> broadcastLog("ReAct: $msg") }
+
+        val result: Pair<Boolean, String> = try {
+            when (command) {
+                "screenshot_once" -> {
+                    val svc = WeComAccessibilityService.instance
+                    if (svc == null) {
+                        Pair(false, "无障碍未启用")
+                    } else {
+                        val frame = svc.captureScreenJpegBase64(quality = 55)
+                        data = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
+                        Pair(frame.error == null, frame.error ?: "已截图")
+                    }
+                }
+                "tap_text" -> {
+                    val text = obj["text"]?.jsonPrimitive?.contentOrNull
+                    if (text.isNullOrBlank()) Pair(false, "缺少 text 参数")
+                    else automator.reactTapText(text)
+                }
+                "tap_xy" -> {
+                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    if (x == null || y == null) Pair(false, "缺少 x/y")
+                    else automator.reactTapXY(x, y)
+                }
+                "swipe" -> {
+                    val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y1 = obj["y1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val x2 = obj["x2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y2 = obj["y2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 300L
+                    if (x1 == null || y1 == null || x2 == null || y2 == null)
+                        Pair(false, "缺少 x1/y1/x2/y2")
+                    else automator.reactSwipe(x1, y1, x2, y2, dur)
+                }
+                "input_text" -> {
+                    val text = obj["text"]?.jsonPrimitive?.contentOrNull
+                    if (text == null) Pair(false, "缺少 text")
+                    else automator.reactInputText(text)
+                }
+                "back" -> automator.reactBack()
+                "home" -> automator.reactHome()
+                else -> Pair(false, "未知命令 $command")
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "react command $command failed", e)
+            Pair(false, e.message ?: e::class.java.simpleName)
+        }
+        val ok = result.first
+        val msg = result.second
+
+        val elapsed = System.currentTimeMillis() - started
+        broadcastLog("ReAct → $command ok=$ok msg=$msg (${elapsed}ms)")
+        val payload = json.encodeToJsonElement(
+            com.wecom.agent.model.DeviceCommandResultPayload.serializer(),
+            com.wecom.agent.model.DeviceCommandResultPayload(
+                command = command,
+                request_id = requestId,
+                ok = ok,
+                message = msg,
+                data = data,
+            ),
+        )
+        client?.sendEvent("device.command_result", payload)
     }
 
     private fun sendCommandAck(command: String, ok: Boolean, message: String? = null) {

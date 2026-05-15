@@ -23,7 +23,22 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     ai_confidence_threshold: float = 0.55  # below → escalate to human
     ai_context_window: int = 10  # how many recent messages to feed
-    ai_max_tokens: int = 4096  # output ceiling per reply
+    ai_max_tokens: int = 8192  # output ceiling per reply
+    # When a deterministic UI task fails, escalate to the ReAct fallback agent
+    # (observes UI tree, asks LLM, executes primitives). Off by default — it
+    # costs extra LLM calls per failure.
+    react_fallback_enabled: bool = True
+    react_max_steps: int = 6
+    react_step_timeout_sec: float = 12.0
+    # ---- Conversational agent (ReAct + Tools / Skills / MCP) ----
+    agent_mode_enabled: bool = True
+    agent_max_steps: int = 5
+    # Where to look for user-authored skill modules. Each *.py exports `tool`
+    # (or `tools: list[Tool]`); see app/ai/tools/skills.py for an example.
+    skills_dir: str = "skills"
+    # MCP servers to spawn at startup. JSON array, see
+    # app/ai/tools/mcp_adapter.py for the shape.
+    mcp_servers_json: str = ""
     ai_default_prompt: str = (
         "你是企业的私域客服助手。请用简洁、礼貌、不啰嗦的中文回复客户。"
         "如果你不确定答案,请回复一句简短的承接语并标注 confidence 较低。"
@@ -36,14 +51,14 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""             # fallback to llm_api_key
     embedding_base_url: str = ""
 
-    vector_store: str = "memory"            # memory | milvus
+    vector_store: str = "milvus"            # memory | milvus
     milvus_uri: str = "http://localhost:19530"
     milvus_collection: str = "kb_chunks"
 
-    graph_store: str = "memory"             # memory | neo4j
+    graph_store: str = "neo4j"              # memory | neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "neo4j"
+    neo4j_password: str = "12345678"  # matches the running neo4j container; override via env
 
     # ---- KB retrieval ----
     kb_top_k: int = 5

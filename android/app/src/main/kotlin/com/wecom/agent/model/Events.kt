@@ -73,3 +73,14 @@ data class DeviceCommandAckPayload(
     val ok: Boolean,
     val message: String? = null,
 )
+
+/** Carries the result of a remote primitive triggered by the ReAct agent.
+ *  `data` holds command-specific structured output (e.g. screenshot base64). */
+@Serializable
+data class DeviceCommandResultPayload(
+    val command: String,
+    val request_id: String,
+    val ok: Boolean,
+    val message: String? = null,
+    val data: JsonElement? = null,
+)

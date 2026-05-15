@@ -80,11 +80,17 @@ async def handle_inbound(
 ) -> Decision:
     """Entry point. Always returns a Decision; persists an AIReplyLog row."""
     state = AIState(conv=conv, robot=robot, inbound=message)
+    log.info(
+        "[workflow] inbound conv=%s mode=%s trace=%s text=%r",
+        conv.id, conv.mode, state.trace_id,
+        (message.content[:80] + "…") if len(message.content) > 80 else message.content,
+    )
 
     # 1. mode gate
     if conv.mode == "human":
         d = Decision(action="skip", reason="mode=human", trace_id=state.trace_id)
         await _finalize(db, state, d)
+        log.info("[workflow] skip (mode=human) trace=%s", state.trace_id)
         return d
 
     ai_cfg = await settings_service.get(db, conv.team_id, "ai")
@@ -117,6 +123,10 @@ async def handle_inbound(
         )
 
     await _finalize(db, state, decision)
+    log.info(
+        "[workflow] decision action=%s conf=%.2f model=%s latency=%dms reason=%s",
+        decision.action, decision.confidence, decision.model, decision.latency_ms, decision.reason,
+    )
     return decision
 
 
@@ -167,6 +177,11 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
     llm_cfg = await settings_service.get(db, team_id, "llm")
     ai_cfg = await settings_service.get(db, team_id, "ai")
 
+    # ReAct agent path: lets the model call tools (kb_search, set_profile_field,
+    # MCP, user skills) before producing the final reply.
+    if _agent_enabled(ai_cfg):
+        return await _generate_via_agent(state, db, provider, llm_cfg, ai_cfg)
+
     system_parts = [state.prompt]
     if state.memory_summary:
         system_parts.append(f"【客户画像】{state.memory_summary}")
@@ -210,6 +225,80 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
         trace_id=state.trace_id,
         latency_ms=result.latency_ms,
         model=result.model,
+    )
+
+
+def _agent_enabled(ai_cfg: dict) -> bool:
+    """Per-team toggle, falls back to env default. Stored under `ai.agent_mode`
+    so adding a UI switch later is a one-line settings change."""
+    val = ai_cfg.get("agent_mode")
+    if val is None:
+        return settings.agent_mode_enabled
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _generate_via_agent(
+    state: AIState, db: AsyncSession, provider, llm_cfg: dict, ai_cfg: dict
+) -> Decision:
+    from .conv_agent import run_conv_agent
+
+    system_parts = [state.prompt]
+    if state.memory_summary:
+        system_parts.append(f"【客户画像】{state.memory_summary}")
+    # Pre-retrieval context is still nice as a *hint*, but the agent is free
+    # to re-query via kb_search if it needs more.
+    kb_block = state.retrieval.to_context()
+    if kb_block:
+        system_parts.append(kb_block)
+    system_prompt = "\n\n".join(system_parts)
+
+    res = await run_conv_agent(
+        db=db,
+        team_id=state.conv.team_id,
+        conversation_id=state.conv.id,
+        contact_id=state.conv.contact_id,
+        inbound_text=state.inbound.content,
+        trace_id=state.trace_id,
+        system_prompt=system_prompt,
+        profile_summary=state.memory_summary,
+        history=state.history,
+        provider=provider,
+        temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
+        max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
+        max_steps=int(ai_cfg.get("agent_max_steps") or settings.agent_max_steps),
+    )
+
+    # Merge agent-discovered KB hits with the pre-retrieval set so the Web
+    # right-panel shows everything the agent actually read.
+    pre_ids = [h.chunk_id for h in state.retrieval.hits]
+    merged_ids = list(dict.fromkeys(pre_ids + (res.kb_hit_ids or [])))
+    state.retrieval.hits = state.retrieval.hits  # noqa — silences linter, semantics unchanged
+
+    if res.escalate:
+        return Decision(
+            action="suggest",
+            text=None,
+            confidence=0.0,
+            trace_id=state.trace_id,
+            reason=f"agent_escalate: {res.escalate_reason}",
+            latency_ms=res.latency_ms,
+            model=res.model,
+            kb_hit_ids=merged_ids,
+            kb_context=res.kb_context or state.retrieval.to_context(),
+        )
+
+    return Decision(
+        action="reply",
+        text=(res.text or "").strip(),
+        confidence=res.confidence,
+        trace_id=state.trace_id,
+        latency_ms=res.latency_ms,
+        model=res.model,
+        kb_hit_ids=merged_ids,
+        kb_context=res.kb_context or state.retrieval.to_context(),
+        reason=f"agent_steps={res.steps}",
     )
 
 
