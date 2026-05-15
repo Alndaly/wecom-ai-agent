@@ -61,6 +61,9 @@ class LLMIn(BaseModel):
     api_key: str = ""
     base_url: str = ""
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    # Tick this when the configured model accepts inline images (gpt-4o / qwen-vl
+    # / glm-4v). The ReAct device agent attaches the current screenshot when on.
+    supports_vision: bool = False
 
 
 class EmbeddingIn(BaseModel):

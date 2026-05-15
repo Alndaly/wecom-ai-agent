@@ -233,18 +233,22 @@ def _save_ui_dump(robot: Robot, payload: dict) -> dict:
     reason = (payload.get("reason") or "manual").replace("/", "_")[:64]
     page = (payload.get("current_page") or "UNKNOWN")[:32]
     tree = payload.get("tree") or ""
+    nodes = payload.get("nodes") or []
     base = Path("var/ui_dumps")
     base.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     fp = base / f"{robot.robot_id}-{ts}-{page}-{reason}.txt"
     fp.write_text(tree, encoding="utf-8")
-    log.info("ui_dump saved: %s (%d bytes)", fp, len(tree))
+    log.info("ui_dump saved: %s (%d bytes, %d nodes)", fp, len(tree), len(nodes))
     return {
         "request_id": request_id,
         "robot_id": robot.robot_id,
         "current_page": page,
         "reason": reason,
         "tree": tree,
+        "nodes": nodes,
+        "screen_width": payload.get("screen_width"),
+        "screen_height": payload.get("screen_height"),
         "path": str(fp),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }

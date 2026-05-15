@@ -56,6 +56,24 @@ data class UiDumpPayload(
     val request_id: String? = null,
     val current_page: String? = null,
     val tree: String,
+    val nodes: List<UiNode> = emptyList(),
+    val screen_width: Int? = null,
+    val screen_height: Int? = null,
+)
+
+@Serializable
+data class UiNode(
+    val id: Int,
+    val cls: String,
+    val view_id: String = "",
+    val text: String = "",
+    val desc: String = "",
+    val clickable: Boolean = false,
+    val focusable: Boolean = false,
+    val editable: Boolean = false,
+    val scrollable: Boolean = false,
+    // bounds in screen pixels [left, top, right, bottom]
+    val bounds: List<Int> = emptyList(),
 )
 
 @Serializable

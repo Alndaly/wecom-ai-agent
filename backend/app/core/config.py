@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = ""  # for openai-compatible endpoints
     llm_temperature: float = 0.7
+    # Set true when llm_model can read inline images (gpt-4o / qwen-vl / glm-4v).
+    # The ReAct device agent attaches the current screenshot to each step when
+    # this is on.
+    llm_supports_vision: bool = False
     ai_confidence_threshold: float = 0.55  # below → escalate to human
     ai_context_window: int = 10  # how many recent messages to feed
     ai_max_tokens: int = 8192  # output ceiling per reply

@@ -261,15 +261,32 @@ class AgentForegroundService : Service() {
             broadcastLog("无障碍服务未启用，无法采集 UI 树")
             return
         }
-        val tree = StringBuilder().also { svc.dumpToString(it) }.toString()
-        broadcastLog("UI 树共 ${tree.length} 字符，已写入 logcat 并尝试上传后端")
+        val result = svc.dumpTreeWithNodes()
+        broadcastLog("UI 树共 ${result.tree.length} 字符，${result.nodes.size} 个节点，已上报后端")
+        val metrics = resources.displayMetrics
         val payload = json.encodeToJsonElement(
             com.wecom.agent.model.UiDumpPayload.serializer(),
             com.wecom.agent.model.UiDumpPayload(
                 reason = reason,
                 request_id = requestId,
                 current_page = currentPage(),
-                tree = tree,
+                tree = result.tree,
+                screen_width = metrics.widthPixels,
+                screen_height = metrics.heightPixels,
+                nodes = result.nodes.map { n ->
+                    com.wecom.agent.model.UiNode(
+                        id = n.id,
+                        cls = n.cls,
+                        view_id = n.viewId,
+                        text = n.text,
+                        desc = n.desc,
+                        clickable = n.clickable,
+                        focusable = n.focusable,
+                        editable = n.editable,
+                        scrollable = n.scrollable,
+                        bounds = listOf(n.bounds.left, n.bounds.top, n.bounds.right, n.bounds.bottom),
+                    )
+                },
             ),
         )
         val ok = client?.sendEvent("device.ui_dump", payload) == true
@@ -351,7 +368,8 @@ class AgentForegroundService : Service() {
                     "swipe",
                     "input_text",
                     "back",
-                    "home" -> {
+                    "home",
+                    "open_wecom" -> {
                         scope.launch { handleReactCommand(command!!, obj) }
                     }
                     else -> {
@@ -505,6 +523,7 @@ class AgentForegroundService : Service() {
                 }
                 "back" -> automator.reactBack()
                 "home" -> automator.reactHome()
+                "open_wecom" -> automator.openWeCom()
                 else -> Pair(false, "未知命令 $command")
             }
         } catch (e: Exception) {

@@ -109,14 +109,86 @@ class WeComAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() = Unit
 
-    /** Print the active window's tree into [out]; used by calibration. */
+    /** Result of [dumpTreeWithNodes]: a human-readable tree string with `[N]`
+     *  prefixes, paired with a flat node list the backend uses to resolve
+     *  `tap_node(N)` decisions back into concrete coordinates. */
+    data class DumpResult(val tree: String, val nodes: List<DumpedNode>)
+
+    data class DumpedNode(
+        val id: Int,
+        val cls: String,
+        val viewId: String,
+        val text: String,
+        val desc: String,
+        val clickable: Boolean,
+        val focusable: Boolean,
+        val editable: Boolean,
+        val scrollable: Boolean,
+        val bounds: android.graphics.Rect,
+    )
+
+    /** Walk the active window's tree, assign a sequential id to every node, and
+     *  return both the indented text rendering and a flat list keyed by id. */
+    fun dumpTreeWithNodes(): DumpResult {
+        val root = rootInActiveWindow ?: return DumpResult(
+            "rootInActiveWindow is null (is WeCom in foreground?)\n",
+            emptyList(),
+        )
+        val sb = StringBuilder()
+        sb.append("=== UI dump pkg=").append(root.packageName)
+            .append(" page=").append(currentPage).append(" ===\n")
+        val nodes = mutableListOf<DumpedNode>()
+        walkNumbered(root, depth = 0, sb = sb, nodes = nodes)
+        return DumpResult(sb.toString(), nodes)
+    }
+
+    /** Back-compat: legacy single-string dump for the existing UI button. */
     fun dumpToString(out: StringBuilder) {
-        val root = rootInActiveWindow ?: run {
-            out.append("rootInActiveWindow is null (is WeCom in foreground?)")
-            return
+        out.append(dumpTreeWithNodes().tree)
+    }
+
+    private fun walkNumbered(
+        n: AccessibilityNodeInfo?,
+        depth: Int,
+        sb: StringBuilder,
+        nodes: MutableList<DumpedNode>,
+    ) {
+        n ?: return
+        val id = nodes.size + 1
+        val cls = n.className?.toString()?.substringAfterLast('.') ?: "?"
+        val viewId = n.viewIdResourceName?.substringAfterLast('/') ?: ""
+        val txt = (n.text?.toString() ?: "").take(60)
+        val desc = (n.contentDescription?.toString() ?: "").take(60)
+        val bounds = android.graphics.Rect().also { n.getBoundsInScreen(it) }
+        nodes.add(
+            DumpedNode(
+                id = id,
+                cls = cls,
+                viewId = viewId,
+                text = txt,
+                desc = desc,
+                clickable = n.isClickable,
+                focusable = n.isFocusable,
+                editable = n.isEditable,
+                scrollable = n.isScrollable,
+                bounds = bounds,
+            )
+        )
+        sb.append("  ".repeat(depth))
+        sb.append("[").append(id).append("] ")
+        sb.append("[").append(cls).append("]")
+        if (viewId.isNotEmpty()) sb.append(" id=").append(viewId)
+        if (txt.isNotEmpty()) sb.append(" txt=\"").append(txt).append("\"")
+        if (desc.isNotEmpty()) sb.append(" desc=\"").append(desc).append("\"")
+        val flags = buildString {
+            if (n.isClickable) append("C")
+            if (n.isFocusable) append("F")
+            if (n.isEditable) append("E")
+            if (n.isScrollable) append("S")
         }
-        out.append("=== UI dump pkg=").append(root.packageName).append(" page=").append(currentPage).append(" ===\n")
-        walk(root, 0, out)
+        if (flags.isNotEmpty()) sb.append(" ").append(flags)
+        sb.append('\n')
+        for (i in 0 until n.childCount) walkNumbered(n.getChild(i), depth + 1, sb, nodes)
     }
 
     suspend fun captureScreenJpegBase64(quality: Int = 55): ScreenFramePayload {
@@ -163,27 +235,6 @@ class WeComAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun walk(n: AccessibilityNodeInfo?, depth: Int, sb: StringBuilder) {
-        n ?: return
-        sb.append("  ".repeat(depth))
-        val cls = n.className?.toString()?.substringAfterLast('.') ?: "?"
-        val txt = (n.text?.toString() ?: "").take(40)
-        val desc = (n.contentDescription?.toString() ?: "").take(40)
-        val id = n.viewIdResourceName?.substringAfterLast('/') ?: ""
-        val flags = buildString {
-            if (n.isClickable) append("C")
-            if (n.isFocusable) append("F")
-            if (n.isEditable) append("E")
-            if (n.isScrollable) append("S")
-        }
-        sb.append("[$cls]")
-        if (id.isNotEmpty()) sb.append(" id=$id")
-        if (txt.isNotEmpty()) sb.append(" txt=\"$txt\"")
-        if (desc.isNotEmpty()) sb.append(" desc=\"$desc\"")
-        if (flags.isNotEmpty()) sb.append(" $flags")
-        sb.append('\n')
-        for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1, sb)
-    }
 
     override fun onDestroy() {
         if (instance === this) instance = null

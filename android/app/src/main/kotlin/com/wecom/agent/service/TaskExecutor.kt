@@ -25,42 +25,25 @@ class TaskExecutor(
 ) {
     private val tag = "TaskExecutor"
     private val mutex = Mutex()
-    private val automator = WeComAutomator(ctx, { msg -> logSink(msg) })
 
     @Volatile var dryRun: Boolean = false
 
     suspend fun run(task: TaskDispatchPayload): TaskResult = mutex.withLock {
         return when (task.type) {
-            "send_text" -> runSendText(task)
+            "send_text" -> {
+                // send_text is now executed end-to-end by the backend ReAct
+                // agent via `device.command` primitives — the old heuristic
+                // executor path has been removed. If a stale dispatch reaches
+                // us we surface a clear error rather than silently no-op.
+                val msg = "send_text 由后端 ReAct agent 直接执行，本路径已弃用"
+                Log.w(tag, msg)
+                logSink(msg)
+                TaskResult(false, msg)
+            }
             else -> {
                 Log.w(tag, "unknown task type=${task.type}")
                 TaskResult(false, "unknown task type: ${task.type}")
             }
-        }
-    }
-
-    private suspend fun runSendText(task: TaskDispatchPayload): TaskResult {
-        val payload = task.payload.jsonObject
-        val contactExternalId = payload["conversation_external_id"]?.jsonPrimitive?.content
-        val text = payload["text"]?.jsonPrimitive?.content
-        if (contactExternalId.isNullOrBlank() || text.isNullOrBlank()) {
-            return TaskResult(false, "missing fields")
-        }
-
-        logSink("执行 send_text，dry_run=$dryRun")
-        if (dryRun) {
-            logSink("[dry-run] send_text → $contactExternalId : $text")
-            Log.i(tag, "[dry-run] send_text → $contactExternalId : $text")
-            kotlinx.coroutines.delay(300)
-            return TaskResult(true)
-        }
-
-        logSink("发送消息 → $contactExternalId")
-        val err = automator.sendText(contactName = contactExternalId, text = text)
-        if (err == null) return TaskResult(true)
-        onTaskLog?.invoke(task.task_id, "error", err)
-        return TaskResult(false, err).also {
-            Log.w(tag, "send_text failed: $err")
         }
     }
 }

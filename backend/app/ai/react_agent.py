@@ -1,19 +1,23 @@
-"""ReAct-style fallback agent for Android UI automation.
+"""ReAct device agent — goal-oriented automation of the WeCom Android client.
 
-When the deterministic locators in `WeComAutomator` fail, this agent takes
-over: it observes the current UI tree, asks the LLM what to do next, executes
-one primitive (tap / swipe / type / back), then loops up to `max_steps`.
+Architecture:
+  - Caller passes a natural-language `goal` (e.g. "open chat with 七月 and send
+    'hello'") plus a robot reference.
+  - Each iteration:
+      1. Pull UI tree + screenshot from device.
+      2. Number every node; format tree text with `[N]` prefixes.
+      3. Send tree (+ optional screenshot for vision models) to LLM with a
+         strict JSON tool-use protocol.
+      4. LLM picks an action by *node id*, not coordinates. The backend
+         resolves the id to bounds and dispatches the right primitive to the
+         device.
+  - Loop until `done(success/fail)` or `max_steps`.
 
-Design:
-  - Strictly bounded: every run honours `max_steps` (default 6). Logs every
-    iteration with thought / action / result for offline post-mortems.
-  - JSON-only protocol with the LLM — no function-calling magic, works with
-    any OpenAI-compatible backend.
-  - Tools map 1:1 to the Android primitives in `AgentForegroundService`.
-  - Each step is persisted to the task log if `task_id` is supplied, so the
-    web UI's task drawer can replay the whole trajectory.
-
-Returns an `AgentResult` describing the outcome and step count.
+The LLM never sees raw screen pixels of node positions — it picks nodes from
+a numbered list. The backend computes the centre of the node's bounds and
+sends `tap_xy` / `input_text` / `swipe` to the device. This keeps the agent's
+reasoning anchored to the UI tree (which we can audit) while still letting
+vision models compensate for icon-only buttons by looking at the screenshot.
 """
 from __future__ import annotations
 
@@ -28,40 +32,69 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers import ChatMessage, get_provider
+from app.core.config import settings
 from app.core.ws_manager import hub
 from app.models import Robot
+from app.services import settings_service
 
 log = logging.getLogger(__name__)
 
 
 # ---- tool catalogue --------------------------------------------------------
-# Kept here (not in a schema lib) so it's trivially editable. The descriptions
-# are what the LLM sees — keep them tight and unambiguous.
+# Action names + descriptions exposed to the LLM. The LLM picks nodes by id
+# from the numbered tree; coordinates are never the LLM's concern.
 TOOL_SCHEMA = {
-    "tap_text": {
-        "desc": "点击包含给定文本的节点（会自动向上找可点击容器）。",
-        "args": {"text": "string，要匹配的可见文本或 contentDescription"},
-    },
-    "tap_xy": {
-        "desc": "在屏幕坐标 (x, y) 处点击。仅当 tap_text 找不到时使用。",
-        "args": {"x": "int 像素", "y": "int 像素"},
-    },
-    "swipe": {
-        "desc": "从 (x1,y1) 滑到 (x2,y2)，常用于上下滚动列表。",
-        "args": {"x1": "int", "y1": "int", "x2": "int", "y2": "int",
-                  "duration_ms": "int 可选，默认 300"},
+    "tap_node": {
+        "desc": "点击编号为 node_id 的 UI 节点（看 UI tree 里的 [N] 前缀）。优先用本工具。",
+        "args": {"node_id": "int — UI tree 中节点的编号"},
     },
     "input_text": {
-        "desc": "把文本写入当前聚焦的输入框（必须先 tap 到输入框上）。",
-        "args": {"text": "string"},
+        "desc": "在编号为 node_id 的可编辑节点里输入文本。",
+        "args": {"node_id": "int — 必须是可编辑的输入框节点", "text": "string"},
     },
-    "back": {"desc": "执行系统返回（等同 BACK 键）。", "args": {}},
-    "home": {"desc": "回到主屏。", "args": {}},
+    "swipe": {
+        "desc": "滑屏。方向四选一：up / down / left / right。一般用于滚动列表。",
+        "args": {"direction": "up|down|left|right", "node_id": "可选 int — 在某节点内滑（默认全屏）"},
+    },
+    "back": {"desc": "系统返回键。", "args": {}},
+    "home": {"desc": "回主屏。", "args": {}},
+    "open_wecom": {
+        "desc": "把企业微信 (com.tencent.wework) 切到前台。如果你看到的不是 WeCom 应用，**先调用本工具**。",
+        "args": {},
+    },
     "done": {
-        "desc": "认为目标已经达成，结束本次会话。",
-        "args": {"success": "bool", "summary": "string，给运营看的一句话总结"},
+        "desc": "认为目标已达成或确认无法完成时调用，结束本轮。",
+        "args": {"success": "bool", "summary": "string — 给运营看的一句话总结"},
     },
 }
+
+
+# ---- types ----------------------------------------------------------------
+@dataclass
+class _Node:
+    id: int
+    cls: str
+    view_id: str
+    text: str
+    desc: str
+    clickable: bool
+    focusable: bool
+    editable: bool
+    scrollable: bool
+    bounds: tuple[int, int, int, int]  # l, t, r, b
+
+    def center(self) -> tuple[int, int]:
+        l, t, r, b = self.bounds
+        return (l + r) // 2, (t + b) // 2
+
+
+@dataclass
+class _Observation:
+    tree: str
+    nodes: dict[int, _Node]
+    screen_size: tuple[int, int]
+    screenshot_b64: str | None = None  # JPEG base64 if available
+    screenshot_mime: str = "image/jpeg"
 
 
 @dataclass
@@ -83,9 +116,9 @@ class AgentResult:
 
 
 LogSink = Callable[[str, str], Awaitable[None]] | None
-# (level, message) -> awaitable. Level ∈ {"info","warn","error"}.
 
 
+# ---- top-level loop -------------------------------------------------------
 async def run_react(
     db: AsyncSession,
     robot: Robot,
@@ -95,18 +128,10 @@ async def run_react(
     step_timeout: float = 12.0,
     log_sink: LogSink = None,
 ) -> AgentResult:
-    """Top-level entry. Caller passes the high-level goal in natural Chinese.
-
-    `log_sink(level, msg)` is invoked for each iteration so the foreground
-    service / task log table sees the trajectory in near-real-time. Errors are
-    caught and returned as a failed `AgentResult` rather than re-raised — the
-    caller should always get a clean dataclass back.
-    """
     started = time.monotonic()
     steps: list[AgentStep] = []
 
     async def _log(level: str, msg: str) -> None:
-        # Mirror to logger and (best-effort) the supplied sink.
         getattr(log, level if level != "warn" else "warning")(msg)
         if log_sink is not None:
             try:
@@ -116,23 +141,23 @@ async def run_react(
 
     await _log("info", f"[react] goal={goal!r} max_steps={max_steps}")
     provider = await get_provider(db, robot.team_id)
+    llm_cfg = await settings_service.get(db, robot.team_id, "llm")
+    use_vision = _vision_enabled(llm_cfg)
 
     for i in range(1, max_steps + 1):
         # ---- observe ----
         try:
-            observation = await _observe(robot)
+            obs = await _observe(robot, want_screenshot=use_vision)
         except TimeoutError as e:
             await _log("error", f"[react] step {i} observe timeout: {e}")
-            return AgentResult(
-                ok=False, summary=f"observe 超时：{e}", steps=steps
-            )
+            return AgentResult(ok=False, summary=f"observe 超时：{e}", steps=steps)
         except Exception as e:  # noqa: BLE001
             await _log("error", f"[react] step {i} observe failed: {e}")
             return AgentResult(ok=False, summary=f"observe 失败：{e}", steps=steps)
 
         # ---- decide ----
         try:
-            decision = await _decide(provider, goal, observation, steps)
+            decision = await _decide(provider, goal, obs, steps, use_vision=use_vision)
         except Exception as e:  # noqa: BLE001
             await _log("error", f"[react] step {i} llm failed: {e}")
             return AgentResult(ok=False, summary=f"LLM 调用失败：{e}", steps=steps)
@@ -153,19 +178,12 @@ async def run_react(
 
         if action not in TOOL_SCHEMA:
             await _log("warn", f"[react] unknown action {action!r}, aborting")
-            return AgentResult(
-                ok=False, summary=f"未知动作 {action}", steps=steps
-            )
+            return AgentResult(ok=False, summary=f"未知动作 {action}", steps=steps)
 
-        # ---- act ----
+        # ---- act (resolve node_id → device primitive) ----
         t0 = time.monotonic()
         try:
-            ack = await asyncio.wait_for(
-                hub.send_request(robot.robot_id, "device.command", {"command": action, **args}),
-                timeout=step_timeout,
-            )
-            ok = bool(ack.get("ok"))
-            msg = str(ack.get("message") or "")
+            ok, msg = await _execute(robot, action, args, obs, step_timeout=step_timeout)
         except TimeoutError as e:
             ok, msg = False, f"timeout: {e}"
         except Exception as e:  # noqa: BLE001
@@ -176,40 +194,76 @@ async def run_react(
             f"[react] step {i} → ok={ok} msg={msg!r} ({elapsed}ms)",
         )
         steps.append(AgentStep(i, thought, action, args, ok, msg, elapsed))
-
-        # Small breather so the UI can settle before the next observation.
         await asyncio.sleep(0.4)
 
     total = int((time.monotonic() - started) * 1000)
     await _log("warn", f"[react] hit max_steps={max_steps} after {total}ms")
-    return AgentResult(
-        ok=False, summary=f"达到最大步数 {max_steps}，未完成目标", steps=steps
-    )
+    return AgentResult(ok=False, summary=f"达到最大步数 {max_steps}，未完成目标", steps=steps)
 
 
-# ---------------------------------------------------------------- observe ---
-async def _observe(robot: Robot) -> dict[str, Any]:
-    """Pull the current UI tree from the device. We use the existing dump_ui
-    pathway so we get the same `device.ui_dump` event the manual button uses.
-    """
-    res = await hub.send_request(
+# ---- observation ---------------------------------------------------------
+async def _observe(robot: Robot, *, want_screenshot: bool) -> _Observation:
+    dump = await hub.send_request(
         robot.robot_id,
         "device.command",
         {"command": "dump_ui", "reason": "react"},
         timeout=8.0,
     )
-    return {
-        "current_page": res.get("current_page"),
-        "tree": _shrink_tree(res.get("tree") or ""),
-    }
+    nodes_payload = dump.get("nodes") or []
+    nodes: dict[int, _Node] = {}
+    for raw in nodes_payload:
+        bounds = raw.get("bounds") or [0, 0, 0, 0]
+        if len(bounds) != 4:
+            continue
+        n = _Node(
+            id=int(raw["id"]),
+            cls=str(raw.get("cls") or ""),
+            view_id=str(raw.get("view_id") or ""),
+            text=str(raw.get("text") or ""),
+            desc=str(raw.get("desc") or ""),
+            clickable=bool(raw.get("clickable")),
+            focusable=bool(raw.get("focusable")),
+            editable=bool(raw.get("editable")),
+            scrollable=bool(raw.get("scrollable")),
+            bounds=(int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])),
+        )
+        nodes[n.id] = n
+
+    screen_w = int(dump.get("screen_width") or 0)
+    screen_h = int(dump.get("screen_height") or 0)
+
+    screenshot_b64: str | None = None
+    screenshot_mime = "image/jpeg"
+    if want_screenshot:
+        try:
+            shot = await hub.send_request(
+                robot.robot_id,
+                "device.command",
+                {"command": "screenshot_once"},
+                timeout=10.0,
+            )
+            data = (shot.get("data") or {}) if isinstance(shot, dict) else {}
+            screenshot_b64 = data.get("image") if isinstance(data, dict) else None
+            if isinstance(data, dict):
+                screenshot_mime = str(data.get("mime") or "image/jpeg")
+        except Exception:  # noqa: BLE001
+            log.debug("[react] screenshot fetch failed; falling back to tree-only")
+
+    return _Observation(
+        tree=_shrink_tree(dump.get("tree") or ""),
+        nodes=nodes,
+        screen_size=(screen_w, screen_h),
+        screenshot_b64=screenshot_b64,
+        screenshot_mime=screenshot_mime,
+    )
 
 
-_MAX_TREE_CHARS = 3500
+_MAX_TREE_CHARS = 4500
 
 
 def _shrink_tree(tree: str) -> str:
-    """Drop empty / decorative nodes to keep the prompt small. We keep lines
-    that have text/desc/id or are clickable — the rest is structural noise."""
+    """Keep only informative lines: numbered nodes that have text/desc/id or
+    are clickable/editable. Pure structural FrameLayouts are dropped."""
     keep: list[str] = []
     for line in tree.splitlines():
         s = line.strip()
@@ -218,7 +272,13 @@ def _shrink_tree(tree: str) -> str:
         if s.startswith("==="):
             keep.append(line)
             continue
-        if "txt=" in line or "desc=" in line or " id=" in line or " C" in line or " E" in line:
+        # Numbered lines are `[N] [Class] ...` — we want the ones with content.
+        if "txt=" in line or "desc=" in line or " id=" in line:
+            keep.append(line)
+            continue
+        # Even content-less nodes are kept if they look clickable/editable —
+        # the LLM might need them (e.g. an icon-only search button).
+        if re.search(r"\b[CFES]+$", s):
             keep.append(line)
     out = "\n".join(keep)
     if len(out) > _MAX_TREE_CHARS:
@@ -226,7 +286,15 @@ def _shrink_tree(tree: str) -> str:
     return out
 
 
-# ----------------------------------------------------------------- decide ---
+# ---- decide --------------------------------------------------------------
+def _vision_enabled(llm_cfg: dict) -> bool:
+    """Vision is on when either env default or per-team override says so."""
+    cfg_val = llm_cfg.get("supports_vision")
+    if cfg_val is None:
+        return bool(settings.llm_supports_vision)
+    return bool(cfg_val)
+
+
 def _tools_block() -> str:
     parts = []
     for name, meta in TOOL_SCHEMA.items():
@@ -235,69 +303,190 @@ def _tools_block() -> str:
     return "\n".join(parts)
 
 
-_SYSTEM_PROMPT = """你是一名移动端 UI 操作专家。给定一个目标和当前屏幕的可访问性树（UI tree），你要选出**下一步要执行的单个动作**让我们更接近目标。
+_SYSTEM_PROMPT = """你是一名移动端 UI 操作专家。给定一个目标和当前屏幕的可访问性树（UI tree），按节点编号选出下一步动作。
 
 可用工具：
 {tools}
 
-返回严格 JSON，**不要任何额外文字**，结构如下：
+返回严格 JSON（**不要 Markdown 代码块、不要多余文字**）：
 {{
-  "thought": "用一句中文说明你为什么这么做",
-  "action": "上面工具表里的某一个名字",
-  "args": {{ ...对应该 action 的参数... }}
+  "thought": "中文思考",
+  "action": "工具名",
+  "args": {{ ... }}
 }}
 
-注意：
-1. 不要凭空臆想节点，先在 UI tree 里找；找不到再考虑切换 tab / 返回 / 搜索。
-2. 已完成目标或确认无法完成时使用 done 并给出 success/summary。
-3. 一次只输出一个动作。"""
-
-
-def _user_prompt(goal: str, obs: dict[str, Any], history: list[AgentStep]) -> str:
-    hist_lines = []
-    for s in history[-5:]:  # most recent 5 only; older context rots
-        hist_lines.append(
-            f"#{s.index} action={s.action} args={_short(s.args)} ok={s.ok} msg={s.message!r}"
-        )
-    hist = "\n".join(hist_lines) if hist_lines else "（无）"
-    return (
-        f"【目标】{goal}\n\n"
-        f"【最近的执行历史】\n{hist}\n\n"
-        f"【当前页面 hint】{obs.get('current_page')}\n"
-        f"【UI tree】\n{obs.get('tree')}\n"
-    )
+规则：
+1. 只操作 UI tree 里已经列出的节点。优先用 tap_node(node_id) 而不是猜测坐标。
+2. 节点没有可见文字（例如只是个 ImageView 图标）时，结合截图判断它的语义。
+3. 如果当前 root 包名不是 com.tencent.wework，第一步必须用 open_wecom。
+4. 找不到目标节点时，先 swipe 滚动；连续 2~3 步无进展则用 done(success=false) 退出，不要硬猜。
+5. 一次只输出一个动作。"""
 
 
 async def _decide(
     provider,
     goal: str,
-    obs: dict[str, Any],
+    obs: _Observation,
     history: list[AgentStep],
+    *,
+    use_vision: bool,
 ) -> dict[str, Any]:
     sys = _SYSTEM_PROMPT.format(tools=_tools_block())
+    hist_lines = []
+    for s in history[-5:]:
+        hist_lines.append(
+            f"#{s.index} action={s.action} args={_short(s.args)} ok={s.ok} msg={s.message!r}"
+        )
+    hist = "\n".join(hist_lines) if hist_lines else "（无）"
+    user_text = (
+        f"【目标】{goal}\n\n"
+        f"【最近的执行历史】\n{hist}\n\n"
+        f"【屏幕尺寸】{obs.screen_size[0]} x {obs.screen_size[1]}\n"
+        f"【UI tree（节点已编号）】\n{obs.tree}\n"
+    )
+
+    images: list[tuple[str, str]] = []
+    if use_vision and obs.screenshot_b64:
+        images.append((obs.screenshot_mime, obs.screenshot_b64))
+
     msgs = [
         ChatMessage(role="system", content=sys),
-        ChatMessage(role="user", content=_user_prompt(goal, obs, history)),
+        ChatMessage(role="user", content=user_text, images=images),
     ]
     result = await provider.chat(msgs, temperature=0.1, max_tokens=8192)
     text = (result.text or "").strip()
     if not text:
-        log.warning("[react] LLM returned empty body; model=%s latency=%dms", result.model, result.latency_ms)
+        log.warning("[react] LLM returned empty body; model=%s", result.model)
     parsed = _parse_json(text)
     if parsed.get("action") == "done" and parsed.get("args", {}).get("summary", "").startswith("bad_json"):
-        # Log the raw text so we can see what gemma/qwen/etc actually emitted.
         log.warning("[react] bad_json raw=%r model=%s", text[:400], result.model)
     return parsed
 
 
+# ---- execute (resolve node → device primitive) --------------------------
+async def _execute(
+    robot: Robot,
+    action: str,
+    args: dict[str, Any],
+    obs: _Observation,
+    *,
+    step_timeout: float,
+) -> tuple[bool, str]:
+    if action == "tap_node":
+        node = _lookup_node(obs, args.get("node_id"))
+        if node is None:
+            return False, f"node_id={args.get('node_id')} 不在 UI tree 中"
+        cx, cy = node.center()
+        # Prefer accessibility ACTION_CLICK via tap_text if the node has a
+        # distinctive text — more robust to small layout shifts. Otherwise
+        # fall back to coordinate tap.
+        if node.text and len(node.text) >= 2:
+            ack = await hub.send_request(
+                robot.robot_id, "device.command",
+                {"command": "tap_text", "text": node.text},
+                timeout=step_timeout,
+            )
+            if bool(ack.get("ok")):
+                return True, f"tap_text({node.text!r}) -> {ack.get('message') or 'ok'}"
+        ack = await hub.send_request(
+            robot.robot_id, "device.command",
+            {"command": "tap_xy", "x": cx, "y": cy},
+            timeout=step_timeout,
+        )
+        return bool(ack.get("ok")), f"tap_xy({cx},{cy}) -> {ack.get('message') or ''}"
+
+    if action == "input_text":
+        node_id = args.get("node_id")
+        text = args.get("text") or ""
+        if node_id is not None:
+            node = _lookup_node(obs, node_id)
+            if node is None:
+                return False, f"node_id={node_id} 不在 UI tree 中"
+            if not node.editable:
+                return False, f"node {node_id} 不可编辑（cls={node.cls}）"
+            # Focus the input first (tap), then write text.
+            cx, cy = node.center()
+            await hub.send_request(
+                robot.robot_id, "device.command",
+                {"command": "tap_xy", "x": cx, "y": cy},
+                timeout=step_timeout,
+            )
+            await asyncio.sleep(0.25)
+        ack = await hub.send_request(
+            robot.robot_id, "device.command",
+            {"command": "input_text", "text": text},
+            timeout=step_timeout,
+        )
+        return bool(ack.get("ok")), ack.get("message") or ""
+
+    if action == "swipe":
+        direction = (args.get("direction") or "up").lower()
+        target_node = _lookup_node(obs, args.get("node_id"))
+        x1, y1, x2, y2 = _swipe_coords(direction, obs, target_node)
+        ack = await hub.send_request(
+            robot.robot_id, "device.command",
+            {"command": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": 280},
+            timeout=step_timeout,
+        )
+        return bool(ack.get("ok")), ack.get("message") or ""
+
+    if action == "back":
+        ack = await hub.send_request(robot.robot_id, "device.command", {"command": "back"}, timeout=step_timeout)
+        return bool(ack.get("ok")), ack.get("message") or ""
+
+    if action == "home":
+        ack = await hub.send_request(robot.robot_id, "device.command", {"command": "home"}, timeout=step_timeout)
+        return bool(ack.get("ok")), ack.get("message") or ""
+
+    if action == "open_wecom":
+        ack = await hub.send_request(robot.robot_id, "device.command", {"command": "open_wecom"}, timeout=step_timeout)
+        return bool(ack.get("ok")), ack.get("message") or ""
+
+    return False, f"unhandled action: {action}"
+
+
+def _lookup_node(obs: _Observation, node_id: Any) -> _Node | None:
+    try:
+        nid = int(node_id)
+    except (TypeError, ValueError):
+        return None
+    return obs.nodes.get(nid)
+
+
+def _swipe_coords(
+    direction: str, obs: _Observation, target: _Node | None
+) -> tuple[int, int, int, int]:
+    """Pick reasonable swipe endpoints. If `target` is given we swipe inside
+    its bounds (e.g. scrolling a specific list), otherwise the full screen."""
+    if target is not None:
+        l, t, r, b = target.bounds
+    else:
+        w, h = obs.screen_size
+        if w == 0 or h == 0:
+            w, h = 1080, 2200
+        l, t, r, b = 0, int(h * 0.15), w, int(h * 0.85)
+    cx = (l + r) // 2
+    cy = (t + b) // 2
+    dx = (r - l) // 3
+    dy = (b - t) // 3
+    if direction == "up":
+        return cx, cy + dy, cx, cy - dy
+    if direction == "down":
+        return cx, cy - dy, cx, cy + dy
+    if direction == "left":
+        return cx + dx, cy, cx - dx, cy
+    if direction == "right":
+        return cx - dx, cy, cx + dx, cy
+    # default: up
+    return cx, cy + dy, cx, cy - dy
+
+
+# ---- helpers --------------------------------------------------------------
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _parse_json(s: str) -> dict[str, Any]:
-    """Tolerant JSON parser — strips Markdown fences and grabs the first
-    `{...}` block. Returns a `done(success=false)` shaped dict on parse fail
-    so the loop terminates cleanly rather than crashing."""
-    s = s.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    s = (s or "").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
         return json.loads(s)
     except Exception:
@@ -315,14 +504,9 @@ def _parse_json(s: str) -> dict[str, Any]:
     }
 
 
-def _short(d: dict[str, Any]) -> str:
-    """Compact dict repr for log lines."""
-    if not d:
-        return "{}"
-    out = {}
-    for k, v in d.items():
-        if isinstance(v, str) and len(v) > 40:
-            out[k] = v[:40] + "…"
-        else:
-            out[k] = v
-    return json.dumps(out, ensure_ascii=False)
+def _short(v: Any, n: int = 200) -> str:
+    if isinstance(v, (dict, list)):
+        s = json.dumps(v, ensure_ascii=False)
+    else:
+        s = str(v)
+    return s if len(s) <= n else s[:n] + "…"

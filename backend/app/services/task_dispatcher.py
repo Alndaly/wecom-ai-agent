@@ -63,22 +63,20 @@ async def create_and_dispatch_send_text(
     await db.refresh(msg)
     await db.refresh(task)
 
-    await _try_dispatch(db, robot, task)
+    # No more `task.dispatch` to Android for send_text — the backend ReAct
+    # agent drives the device directly via `device.command` primitives. This
+    # replaces the old hard-coded WeComAutomator heuristics entirely.
+    task.status = "dispatched"
+    db.add(RobotTaskLog(
+        robot_id=robot.id, task_id=task.id,
+        level="info", message="dispatched to ReAct agent",
+    ))
+    await db.commit()
+    await db.refresh(task)
+
+    asyncio.create_task(_run_send_via_react(robot_id=robot.id, task_id=task.id))
     await _broadcast_message_new(robot.team_id, conv.id, msg)
     return msg, task
-
-
-async def _try_dispatch(db: AsyncSession, robot: Robot, task: RobotTask) -> None:
-    delivered = await hub.send_android(
-        robot.robot_id,
-        "task.dispatch",
-        {"task_id": task.id, "type": task.type, "payload": task.payload_json},
-    )
-    if delivered:
-        task.status = "dispatched"
-        db.add(RobotTaskLog(robot_id=robot.id, task_id=task.id, level="info", message="task dispatched to android"))
-        await db.commit()
-        await db.refresh(task)
 
 
 async def update_task_on_callback(
@@ -115,16 +113,11 @@ async def update_task_on_callback(
         "task.updated",
         {"task_id": task.id, "status": task.status, "error": task.last_error},
     )
-
-    # Escalate failed deterministic tasks to the ReAct fallback agent — but
-    # only once, and only for tasks we know how to express as a goal.
-    if (
-        status in ("failed", "timeout")
-        and settings.react_fallback_enabled
-        and not (error or "").startswith(_REACT_PREFIX)
-        and task.type == "send_text"
-    ):
-        asyncio.create_task(_run_react_fallback(robot_id=robot.id, task_id=task.id))
+    # Note: there used to be a "fallback to ReAct on failure" branch here.
+    # ReAct is now the *primary* path for send_text (see
+    # `_run_send_via_react`), so re-firing it on every task.failed callback
+    # would create infinite loops. The callback path now only services
+    # task types still dispatched the old way (none, for now).
 
 
 async def append_task_log(
@@ -186,9 +179,13 @@ def _redispatch_payload(task: RobotTask) -> dict[str, Any]:
     return {"task_id": task.id, "type": task.type, "payload": task.payload_json}
 
 
-async def _run_react_fallback(*, robot_id: int, task_id: int) -> None:
-    """Background coroutine: when a deterministic task fails, run the ReAct
-    agent with the same goal and persist its trajectory into the task log.
+async def _run_send_via_react(*, robot_id: int, task_id: int) -> None:
+    """Background coroutine: drive a send_text task end-to-end via the ReAct
+    agent. ReAct is now the only execution path for send_text (no more
+    hard-coded WeComAutomator heuristics).
+
+    Best-effort opens WeCom before reasoning so the agent's first observation
+    isn't of the launcher / a random app.
 
     Errors here must NOT raise into the caller — this is fire-and-forget.
     """
@@ -217,7 +214,21 @@ async def _run_react_fallback(*, robot_id: int, task_id: int) -> None:
                         message=message,
                     )
 
-            log.info("react fallback start task=%s goal=%r", task.id, goal)
+            log.info("react send start task=%s goal=%r", task.id, goal)
+            # Pre-flight: bring WeCom to foreground. Best-effort — if it
+            # fails the agent will still observe whatever is on screen and
+            # decide what to do.
+            try:
+                await asyncio.wait_for(
+                    hub.send_request(
+                        robot.robot_id, "device.command", {"command": "open_wecom"}
+                    ),
+                    timeout=6.0,
+                )
+                await asyncio.sleep(0.6)
+            except Exception:  # noqa: BLE001
+                log.debug("open_wecom pre-flight failed; continuing")
+
             result = await run_react(
                 db, robot, goal,
                 max_steps=settings.react_max_steps,

@@ -26,7 +26,7 @@ from app.models import TeamSetting
 # inject arbitrary attributes (defence-in-depth, the schema layer is the
 # primary gate).
 _ALLOWED: dict[str, set[str]] = {
-    "llm": {"provider", "model", "api_key", "base_url", "temperature"},
+    "llm": {"provider", "model", "api_key", "base_url", "temperature", "supports_vision"},
     "embedding": {"provider", "model", "api_key", "base_url", "dim"},
     "retrieval": {"top_k", "min_score"},
     "ai": {
@@ -56,6 +56,7 @@ def _env_defaults(scope: str) -> dict[str, Any]:
             "api_key": settings.llm_api_key,
             "base_url": settings.llm_base_url,
             "temperature": settings.llm_temperature,
+            "supports_vision": settings.llm_supports_vision,
         }
     if scope == "embedding":
         return {
