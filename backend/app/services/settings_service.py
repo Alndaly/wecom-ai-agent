@@ -29,7 +29,15 @@ _ALLOWED: dict[str, set[str]] = {
     "llm": {"provider", "model", "api_key", "base_url", "temperature"},
     "embedding": {"provider", "model", "api_key", "base_url", "dim"},
     "retrieval": {"top_k", "min_score"},
-    "ai": {"confidence_threshold", "context_window", "default_prompt"},
+    "ai": {"confidence_threshold", "context_window", "default_prompt", "max_tokens"},
+    "parser": {
+        "backend",
+        "api_base",
+        "api_key",
+        "model_version",
+        "local_cmd",
+        "local_extra_args",
+    },
 }
 
 
@@ -57,6 +65,16 @@ def _env_defaults(scope: str) -> dict[str, Any]:
             "confidence_threshold": settings.ai_confidence_threshold,
             "context_window": settings.ai_context_window,
             "default_prompt": settings.ai_default_prompt,
+            "max_tokens": settings.ai_max_tokens,
+        }
+    if scope == "parser":
+        return {
+            "backend": settings.parser_backend,
+            "api_base": settings.mineru_api_base,
+            "api_key": settings.mineru_api_token,
+            "model_version": settings.mineru_model_version,
+            "local_cmd": settings.mineru_local_cmd,
+            "local_extra_args": settings.mineru_local_extra_args,
         }
     return {}
 

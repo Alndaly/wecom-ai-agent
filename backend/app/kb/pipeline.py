@@ -41,7 +41,7 @@ async def ingest_document(db: AsyncSession, *, doc_id: int) -> None:
         if data is None:
             raise RuntimeError("no pending bytes for doc")
 
-        text = parsers.parse(doc.name, doc.mime, data)
+        text = await parsers.parse_for_team(db, kb.team_id, doc.name, doc.mime, data)
         if not text.strip():
             raise RuntimeError("empty document after parsing")
 

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import SessionLocal, get_db
 from app.deps import current_user
 from app.kb import pipeline
+from app.kb.graphstore import get_graph_store
 from app.kb.retriever import retrieve
 from app.kb.vectorstore import get_vector_store
 from app.models import KnowledgeBase, KnowledgeChunk, KnowledgeDocument, User
@@ -126,8 +127,13 @@ async def get_kb(kb_id: int, user: User = Depends(current_user), db: AsyncSessio
 @router.delete("/{kb_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_kb(kb_id: int, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     kb = await _get_kb(db, kb_id, user.team_id)
+    chunk_ids = (
+        await db.execute(select(KnowledgeChunk.id).where(KnowledgeChunk.kb_id == kb.id))
+    ).scalars().all()
     vs = get_vector_store()
+    gs = get_graph_store()
     await vs.delete_by_meta("kb_id", kb.id)
+    await gs.delete_chunks(user.team_id, list(chunk_ids))
     await db.execute(sa_delete(KnowledgeChunk).where(KnowledgeChunk.kb_id == kb.id))
     await db.execute(sa_delete(KnowledgeDocument).where(KnowledgeDocument.kb_id == kb.id))
     await db.delete(kb)
@@ -225,8 +231,13 @@ async def delete_doc(
     doc = await db.get(KnowledgeDocument, doc_id)
     if not doc or doc.kb_id != kb_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "doc not found")
+    chunk_ids = (
+        await db.execute(select(KnowledgeChunk.id).where(KnowledgeChunk.doc_id == doc.id))
+    ).scalars().all()
     vs = get_vector_store()
+    gs = get_graph_store()
     await vs.delete_by_meta("doc_id", doc.id)
+    await gs.delete_chunks(user.team_id, list(chunk_ids))
     await db.execute(sa_delete(KnowledgeChunk).where(KnowledgeChunk.doc_id == doc.id))
     await db.delete(doc)
     await db.commit()

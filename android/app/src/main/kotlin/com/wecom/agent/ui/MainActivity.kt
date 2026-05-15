@@ -122,8 +122,8 @@ class MainActivity : Activity() {
             }
         }
         a11yIngestCb = CheckBox(this).apply {
-            text = "无障碍采集聊天消息（实验性，默认关闭）"
-            isChecked = prefs.getBoolean("a11y_ingest", false)
+            text = "无障碍采集聊天消息（WeCom 前台时必须开启，否则在应用内收到的消息不会触发 AI）"
+            isChecked = prefs.getBoolean("a11y_ingest", true)
             setOnCheckedChangeListener { _, checked ->
                 prefs.edit().putBoolean("a11y_ingest", checked).apply()
                 val intent = Intent(this@MainActivity, AgentForegroundService::class.java).apply {

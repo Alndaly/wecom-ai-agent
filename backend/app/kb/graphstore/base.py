@@ -40,3 +40,12 @@ class GraphStore(ABC):
     async def find_nodes(
         self, team_id: int, names: list[str]
     ) -> list[Node]: ...
+
+    async def delete_chunks(self, team_id: int, chunk_ids: list[int]) -> None:
+        """Remove Chunk nodes (and their incident edges) for the given ids.
+
+        Default no-op so older adapters keep working; concrete stores override.
+        Entity nodes are left in place — they may be referenced by other
+        chunks or knowledge bases under the same team.
+        """
+        return None

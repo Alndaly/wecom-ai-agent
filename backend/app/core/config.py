@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     ai_confidence_threshold: float = 0.55  # below → escalate to human
     ai_context_window: int = 10  # how many recent messages to feed
+    ai_max_tokens: int = 4096  # output ceiling per reply
     ai_default_prompt: str = (
         "你是企业的私域客服助手。请用简洁、礼貌、不啰嗦的中文回复客户。"
         "如果你不确定答案,请回复一句简短的承接语并标注 confidence 较低。"
@@ -52,6 +53,17 @@ class Settings(BaseSettings):
     kb_min_score: float = 0.05
     kb_chunk_size: int = 400
     kb_chunk_overlap: int = 60
+
+    # ---- Document parser (MinerU) ----
+    # builtin: pypdf + plain text. mineru_local: invoke the `mineru` CLI on the
+    # backend host. mineru_api: hit mineru.net cloud API with a bearer token.
+    parser_backend: str = "builtin"  # builtin | mineru_local | mineru_api
+    mineru_api_base: str = "https://mineru.net/api/v4"
+    mineru_api_token: str = ""
+    mineru_model_version: str = "vlm"  # vlm | pipeline
+    mineru_local_cmd: str = "mineru"
+    mineru_local_extra_args: str = ""  # e.g. "-b pipeline" for CPU-only
+    mineru_timeout_sec: int = 600
 
     # ---- Long-term memory ----
     memory_summary_every: int = 10  # generate / refresh summary every N inbound msgs

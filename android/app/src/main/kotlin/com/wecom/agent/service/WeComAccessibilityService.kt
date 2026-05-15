@@ -48,6 +48,11 @@ class WeComAccessibilityService : AccessibilityService() {
     private val recentTtlMs = 10 * 60_000L
     private var baselineChatTitle: String? = null
     private var baselineReady = false
+    /** Snapshot of the message-list rows seen the first time we land on it; we
+     *  only emit rows whose preview *changes* compared to this baseline so we
+     *  don't re-fire all history on startup. */
+    private val homeListBaseline = HashMap<String, String>()
+    private var homeBaselineReady = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -60,10 +65,46 @@ class WeComAccessibilityService : AccessibilityService() {
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> updatePage(event)
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                if (currentPage == Page.CHAT) maybeHarvestChat()
+                // Dispatch by *current root content* rather than the cached
+                // `currentPage`. WeCom switches tabs inside a single activity,
+                // so WINDOW_STATE_CHANGED doesn't fire and the cache stays stale
+                // (often UNKNOWN), which used to suppress harvest entirely.
+                val root = rootInActiveWindow ?: return
+                if (root.packageName?.toString() != "com.tencent.wework") return
+                if (isMessagesListVisible(root)) {
+                    maybeHarvestHomeList()
+                } else if (looksLikeChatPage(root)) {
+                    maybeHarvestChat()
+                }
             }
             else -> Unit
         }
+    }
+
+    private fun looksLikeChatPage(root: AccessibilityNodeInfo): Boolean {
+        // Cheap signal: a focusable+editable below the mid-line is the chat
+        // input. The top is also a TextView (chat title) but we don't gate
+        // on it — we just need to know we're inside *some* conversation.
+        val screenH = resources.displayMetrics.heightPixels
+        var found = false
+        fun walk(n: AccessibilityNodeInfo?) {
+            if (n == null || found) return
+            if (n.isEditable && n.isFocusable) {
+                val r = android.graphics.Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() > screenH * 0.55) {
+                    found = true
+                    return
+                }
+            }
+            for (i in 0 until n.childCount) walk(n.getChild(i))
+        }
+        walk(root)
+        if (found && currentChatTitle.isNullOrEmpty()) {
+            // Make sure maybeHarvestChat has a title to dedupe against.
+            currentChatTitle = inferChatTitle()
+        }
+        return found
     }
 
     override fun onInterrupt() = Unit
@@ -174,6 +215,12 @@ class WeComAccessibilityService : AccessibilityService() {
         } else {
             baselineChatTitle = null
             baselineReady = false
+        }
+        if (currentPage != Page.HOME) {
+            // re-prime the home-list baseline on next entry to avoid replaying
+            // stale previews after a navigation away.
+            homeListBaseline.clear()
+            homeBaselineReady = false
         }
     }
 
@@ -287,5 +334,140 @@ class WeComAccessibilityService : AccessibilityService() {
         while (recent.isNotEmpty() && now - recent.first().third > recentTtlMs) {
             recent.removeFirst()
         }
+    }
+
+    // ---------------------------------------------------- harvest 消息 tab
+    /**
+     * Walk the conversation list under the 消息 tab and emit any row whose
+     * preview text changed since the last observation. Covers the case where
+     * WeCom is foreground (no system notification fires) but the user is not
+     * yet inside the specific chat.
+     *
+     * Heuristics:
+     *  - We must be on the 消息 tab itself — i.e. there is a TextView "消息"
+     *    near the top header.
+     *  - A row is any clickable view-group inside the scrollable list that
+     *    contains ≥ 2 non-empty TextViews. The top one is the contact name,
+     *    the rest joined form the preview.
+     *  - Outbound previews (prefixed with "我:" / "我：" / "[草稿]") are skipped.
+     */
+    private fun maybeHarvestHomeList() {
+        val cb = onChatMessage ?: return
+        val root = rootInActiveWindow ?: return
+        if (!isMessagesListVisible(root)) return
+
+        val now = System.currentTimeMillis()
+        gc(now)
+
+        val rows = collectListRows(root)
+        if (rows.isEmpty()) return
+
+        if (!homeBaselineReady) {
+            for ((name, preview) in rows) homeListBaseline[name] = preview
+            homeBaselineReady = true
+            Log.d(tag, "home baseline primed rows=${rows.size}")
+            return
+        }
+
+        for ((name, preview) in rows) {
+            if (preview.isEmpty()) continue
+            if (isOutboundPreview(preview)) continue
+            val prev = homeListBaseline[name]
+            if (prev == preview) continue
+            homeListBaseline[name] = preview
+            if (alreadySeen(name, preview)) continue
+            recent.addLast(Triple(name, preview, now))
+            cb(name, preview)
+            Log.d(tag, "home harvest name=$name preview=${preview.take(60)}")
+        }
+    }
+
+    private fun isMessagesListVisible(root: AccessibilityNodeInfo): Boolean {
+        // The 消息 tab shows a "消息" title at the top of the screen.
+        var found = false
+        fun walk(n: AccessibilityNodeInfo?) {
+            if (n == null || found) return
+            val t = n.text?.toString().orEmpty()
+            if (t == "消息") {
+                val r = android.graphics.Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() < 180) {
+                    found = true
+                    return
+                }
+            }
+            for (i in 0 until n.childCount) walk(n.getChild(i))
+        }
+        walk(root)
+        return found
+    }
+
+    private fun collectListRows(root: AccessibilityNodeInfo): List<Pair<String, String>> {
+        // Find the scrollable list (RecyclerView/ListView). It might be nested
+        // a few levels deep — we just look for the first scrollable.
+        val list = findFirstScrollable(root) ?: return emptyList()
+        val out = mutableListOf<Pair<String, String>>()
+        val headerCutoff = 200  // skip the top title bar
+        val footerCutoff =
+            resources.displayMetrics.heightPixels - 160  // skip the bottom tabs
+
+        for (i in 0 until list.childCount) {
+            val row = list.getChild(i) ?: continue
+            val rowBounds = android.graphics.Rect()
+            row.getBoundsInScreen(rowBounds)
+            if (rowBounds.bottom < headerCutoff || rowBounds.top > footerCutoff) continue
+
+            val texts = mutableListOf<Pair<Int, String>>() // (y, text)
+            fun walk(n: AccessibilityNodeInfo?) {
+                n ?: return
+                val cls = n.className?.toString().orEmpty()
+                if (cls.contains("TextView", true)) {
+                    val t = n.text?.toString().orEmpty().trim()
+                    if (t.isNotEmpty()) {
+                        val r = android.graphics.Rect()
+                        n.getBoundsInScreen(r)
+                        texts.add(r.centerY() to t)
+                    }
+                }
+                for (j in 0 until n.childCount) walk(n.getChild(j))
+            }
+            walk(row)
+            if (texts.size < 2) continue
+
+            texts.sortBy { it.first }
+            val name = texts.first().second
+            // The right-most/bottom-most text is usually a timestamp like
+            // "昨天" / "16:43" — strip if it matches a time/date pattern.
+            val rest = texts.drop(1).map { it.second }.filterNot { looksLikeTimestamp(it) }
+            if (rest.isEmpty()) continue
+            // The preview is typically the longest remaining text; numeric
+            // unread badges ("1" / "9+" / "99") are short and noisy.
+            val preview = rest.maxByOrNull { it.length }!!.trim()
+            if (preview.length < 2) continue
+            out.add(name to preview)
+        }
+        return out
+    }
+
+    private fun findFirstScrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (n.isScrollable) return n
+        for (i in 0 until n.childCount) {
+            val c = n.getChild(i) ?: continue
+            findFirstScrollable(c)?.let { return it }
+        }
+        return null
+    }
+
+    private fun looksLikeTimestamp(s: String): Boolean {
+        if (s.length > 8) return false
+        // 16:43, 昨天, 星期三, 03/05, 2024/03/05
+        if (s == "昨天" || s.startsWith("星期")) return true
+        return s.matches(Regex("""^\d{1,2}[:/-]\d{1,2}([:/-]\d{1,2})?$"""))
+    }
+
+    private fun isOutboundPreview(p: String): Boolean {
+        if (p.startsWith("我:") || p.startsWith("我：")) return true
+        if (p.startsWith("[草稿]") || p.startsWith("[Draft]")) return true
+        return false
     }
 }

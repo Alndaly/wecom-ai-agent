@@ -165,6 +165,7 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
     team_id = state.conv.team_id
     provider = await get_provider(db, team_id)
     llm_cfg = await settings_service.get(db, team_id, "llm")
+    ai_cfg = await settings_service.get(db, team_id, "ai")
 
     system_parts = [state.prompt]
     if state.memory_summary:
@@ -182,7 +183,9 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
         msgs.append(ChatMessage(role=role, content=m.content))
     try:
         result = await provider.chat(
-            msgs, temperature=float(llm_cfg.get("temperature", settings.llm_temperature))
+            msgs,
+            temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
+            max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
         )
     except Exception as e:
         log.exception("LLM error")

@@ -78,6 +78,17 @@ class Neo4jGraphStore(GraphStore):
                 )
         return out
 
+    async def delete_chunks(self, team_id: int, chunk_ids: list[int]) -> None:
+        if not chunk_ids:
+            return
+        names = [f"chunk-{cid}" for cid in chunk_ids]
+        async with self.driver.session() as s:
+            await s.run(
+                "MATCH (c:Entity {team_id:$tid, label:'Chunk'}) "
+                "WHERE c.name IN $names DETACH DELETE c",
+                tid=team_id, names=names,
+            )
+
     async def find_nodes(self, team_id, names):
         lowers = [n.lower() for n in names]
         async with self.driver.session() as s:

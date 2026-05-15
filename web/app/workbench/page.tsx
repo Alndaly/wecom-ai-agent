@@ -360,7 +360,7 @@ export default function WorkbenchPage() {
                     <span>#{i + 1}</span>
                     <span>chunk_id={c.id}</span>
                   </div>
-                  <p className="line-clamp-5">{c.text}</p>
+                  <p className="line-clamp-5 break-all">{c.text}</p>
                 </div>
               ))}
             </Section>

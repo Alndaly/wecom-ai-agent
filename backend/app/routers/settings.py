@@ -34,7 +34,7 @@ from app.services import settings_service
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
-Scope = Literal["llm", "embedding", "retrieval", "ai"]
+Scope = Literal["llm", "embedding", "retrieval", "ai", "parser"]
 
 
 # ---------- masking ----------
@@ -80,6 +80,17 @@ class AIBehaviorIn(BaseModel):
     confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     context_window: int = Field(default=10, ge=1, le=50)
     default_prompt: str = ""
+    max_tokens: int = Field(default=4096, ge=64, le=16384)
+
+
+class ParserIn(BaseModel):
+    backend: Literal["builtin", "mineru_local", "mineru_api"] = "builtin"
+    api_base: str = "https://mineru.net/api/v4"
+    # Empty / "********" means "keep saved value" (same as llm.api_key).
+    api_key: str = ""
+    model_version: Literal["vlm", "pipeline"] = "vlm"
+    local_cmd: str = "mineru"
+    local_extra_args: str = ""
 
 
 # ---------- read all ----------
@@ -88,9 +99,9 @@ async def read_all(
     user: User = Depends(current_user), db: AsyncSession = Depends(get_db)
 ) -> dict[str, Any]:
     out = {}
-    for scope in ("llm", "embedding", "retrieval", "ai"):
+    for scope in ("llm", "embedding", "retrieval", "ai", "parser"):
         v = await settings_service.get(db, user.team_id, scope)
-        if scope in ("llm", "embedding"):
+        if scope in ("llm", "embedding", "parser"):
             v = _mask_api_key(v)
         out[scope] = v
     # also surface the read-only infra config so the UI can show it
@@ -156,6 +167,16 @@ async def write_ai_behavior(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     ver = await _upsert(db, user.team_id, "ai", body.model_dump())
+    return {"version": ver}
+
+
+@router.put("/parser")
+async def write_parser(
+    body: ParserIn,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    ver = await _upsert(db, user.team_id, "parser", body.model_dump())
     return {"version": ver}
 
 
@@ -289,6 +310,99 @@ async def test_vector_store(user: User = Depends(current_user)) -> ProbeOut:
         return ProbeOut(ok=True, detail=f"backend={store.name}")
     except Exception as e:  # noqa: BLE001
         return ProbeOut(ok=False, detail=str(e)[:300])
+
+
+@router.post("/test/parser", response_model=ProbeOut)
+async def test_parser(
+    body: ParserIn | None = None,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProbeOut:
+    """Probe the configured document parser.
+
+    For mineru_local we just check the binary exists (--version). For
+    mineru_api we hit a cheap endpoint with the bearer token. builtin is
+    always OK.
+    """
+    import asyncio
+    import shlex
+    import time
+
+    saved = await settings_service.get(db, user.team_id, "parser")
+    cfg = _merge_for_test(saved, body.model_dump() if body else None)
+    backend = (cfg.get("backend") or "builtin").strip()
+    started = time.monotonic()
+
+    if backend == "builtin":
+        return ProbeOut(ok=True, detail="builtin: text + pypdf", model="builtin")
+
+    if backend == "mineru_local":
+        cmd = (cfg.get("local_cmd") or "mineru").strip()
+        try:
+            argv = [*shlex.split(cmd), "--version"]
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode != 0:
+                err = (stderr or stdout or b"").decode("utf-8", errors="replace")
+                return ProbeOut(ok=False, detail=f"`{cmd} --version` exit={proc.returncode}: {err[:200]}")
+            ver = (stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
+            head = ver[0] if ver else "(no output)"
+            return ProbeOut(
+                ok=True,
+                detail=head[:200],
+                model=f"mineru_local · {cmd}",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+        except FileNotFoundError:
+            return ProbeOut(ok=False, detail=f"未找到命令: {cmd}（请先 pip install -U mineru[all]）")
+        except Exception as e:  # noqa: BLE001
+            return ProbeOut(ok=False, detail=str(e)[:300])
+
+    if backend == "mineru_api":
+        token = (cfg.get("api_key") or "").strip()
+        if not token:
+            return ProbeOut(ok=False, detail="api_key 为空（请填写 mineru.net 的 Bearer Token）")
+        api_base = (cfg.get("api_base") or env_settings.mineru_api_base).rstrip("/")
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                # Cheap call: just submitting an empty `files` list returns a
+                # validation error from the server, which is enough to verify
+                # auth + connectivity. A 200 with code != 0 means auth worked.
+                r = await client.post(
+                    f"{api_base}/file-urls/batch",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "files": [{"name": "probe.pdf"}],
+                        "model_version": cfg.get("model_version") or "vlm",
+                    },
+                )
+            if r.status_code == 401:
+                return ProbeOut(ok=False, detail="401 unauthorized（token 无效或已过期）")
+            if r.status_code >= 500:
+                return ProbeOut(ok=False, detail=f"{r.status_code} {r.text[:200]}")
+            env = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            code = env.get("code")
+            msg = env.get("msg") or env.get("message") or ""
+            ok = code in (0, 200) or "ok" in str(msg).lower()
+            return ProbeOut(
+                ok=bool(ok),
+                detail=f"code={code} msg={msg or '(empty)'}"[:200],
+                model=f"mineru_api · {cfg.get('model_version') or 'vlm'}",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+        except Exception as e:  # noqa: BLE001
+            return ProbeOut(ok=False, detail=str(e)[:300])
+
+    return ProbeOut(ok=False, detail=f"unknown backend: {backend}")
 
 
 @router.post("/test/graph_store", response_model=ProbeOut)

@@ -90,6 +90,17 @@ class WeComAutomator(
 
         if (classifyUi(svc, contactName) == UiPlace.TARGET_CHAT) return true
 
+        // We're on HOME but the user may be parked on 通讯录 / 工作台 / 邮件 /
+        // 文档. Conversation list lives under the 消息 tab — switch to it first.
+        if (!isOnMessagesTab(svc)) {
+            if (clickBottomTab(svc, "消息")) {
+                delay(600)
+                if (classifyUi(svc, contactName) == UiPlace.TARGET_CHAT) return true
+            } else {
+                log("未找到底部「消息」Tab，尝试直接在当前页面查找会话")
+            }
+        }
+
         if (clickVisibleConversation(svc, contactName)) {
             delay(700)
             if (classifyUi(svc, contactName) == UiPlace.TARGET_CHAT) return true
@@ -97,6 +108,26 @@ class WeComAutomator(
 
         log("未能可靠确认目标聊天页，停止在搜索/更多按钮猜测链路上继续操作")
         return classifyUi(svc, contactName) == UiPlace.TARGET_CHAT
+    }
+
+    private fun isOnMessagesTab(svc: AccessibilityService): Boolean {
+        val root = svc.rootInActiveWindow ?: return false
+        // The 消息 tab shows the title text "消息" near the top of the screen.
+        return root.findFirst { matchesText(it, "消息") && it.boundsCenterY() < 180 } != null
+    }
+
+    private suspend fun clickBottomTab(svc: AccessibilityService, label: String): Boolean {
+        val root = svc.rootInActiveWindow ?: return false
+        val screenH = ctx.resources.displayMetrics.heightPixels
+        val tabText = root.findFirst {
+            matchesText(it, label) && it.boundsCenterY() > screenH * 0.75
+        } ?: return false
+        // The TextView itself usually isn't clickable — walk up to its clickable container.
+        var n: AccessibilityNodeInfo? = tabText
+        while (n != null && !n.isClickable) n = n.parent
+        val clicked = (n?.tap() == true) || tabText.tap()
+        if (clicked) log("已切换到底部 Tab → $label")
+        return clicked
     }
 
     private suspend fun backToHomeOrTargetChat(

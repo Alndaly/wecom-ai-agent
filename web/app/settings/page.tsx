@@ -36,6 +36,15 @@ type AIBehaviorCfg = {
   confidence_threshold: number;
   context_window: number;
   default_prompt: string;
+  max_tokens: number;
+};
+type ParserCfg = {
+  backend: "builtin" | "mineru_local" | "mineru_api";
+  api_base: string;
+  api_key: string;
+  model_version: "vlm" | "pipeline";
+  local_cmd: string;
+  local_extra_args: string;
 };
 type InfraCfg = {
   vector_store: string;
@@ -70,6 +79,7 @@ export default function SettingsPage() {
   const [embed, setEmbed] = useState<EmbedCfg | null>(null);
   const [retrieval, setRetrieval] = useState<RetrievalCfg | null>(null);
   const [ai, setAI] = useState<AIBehaviorCfg | null>(null);
+  const [parser, setParser] = useState<ParserCfg | null>(null);
   const [infra, setInfra] = useState<InfraCfg | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
 
@@ -84,6 +94,7 @@ export default function SettingsPage() {
     setEmbed(data.embedding);
     setRetrieval(data.retrieval);
     setAI(data.ai);
+    setParser(data.parser);
     setInfra(data.infra);
   }
   useEffect(() => {
@@ -92,7 +103,7 @@ export default function SettingsPage() {
       .finally(() => setInitialLoading(false));
   }, []);
 
-  if (initialLoading || !llm || !embed || !retrieval || !ai || !infra)
+  if (initialLoading || !llm || !embed || !retrieval || !ai || !parser || !infra)
     return <p className="text-sm text-muted-foreground">加载中…</p>;
 
   return (
@@ -107,6 +118,7 @@ export default function SettingsPage() {
 
       <LLMCard value={llm} onSaved={reload} />
       <EmbeddingCard value={embed} onSaved={reload} />
+      <ParserCard value={parser} onSaved={reload} />
       <RetrievalCard value={retrieval} onSaved={reload} />
       <AIBehaviorCard value={ai} onSaved={reload} />
       <InfraCard value={infra} />
@@ -363,6 +375,152 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
   );
 }
 
+function ParserCard({ value, onSaved }: { value: ParserCfg; onSaved: () => void }) {
+  const hasSavedKey = value.api_key === "********";
+  const [v, setV] = useState<ParserCfg>({ ...value, api_key: "" });
+  const [busy, setBusy] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [probe, setProbe] = useState<ProbeResult | null>(null);
+
+  async function save() {
+    setBusy(true);
+    try {
+      await api("/settings/parser", { method: "PUT", body: JSON.stringify(v) });
+      toast.success("文档解析配置已保存");
+      setV((cur) => ({ ...cur, api_key: "" }));
+      onSaved();
+    } catch (e: any) {
+      toast.error("保存失败", { description: e?.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function test() {
+    setProbing(true);
+    setProbe(null);
+    try {
+      const r = await api<ProbeResult>("/settings/test/parser", {
+        method: "POST",
+        body: JSON.stringify(v),
+      });
+      setProbe(r);
+    } catch (e: any) {
+      setProbe({ ok: false, detail: e?.message ?? String(e) });
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">文档解析（MinerU）</CardTitle>
+        <CardDescription>
+          上传 PDF / Office / 图片 文档时使用的解析后端。
+          <br />
+          <span className="text-foreground">builtin</span>：仅文本 + pypdf，零依赖。
+          {" · "}
+          <span className="text-foreground">mineru_local</span>：调用本机的 <code>mineru</code> 命令（需 <code>pip install -U &quot;mineru[all]&quot;</code>）。
+          {" · "}
+          <span className="text-foreground">mineru_api</span>：调用 mineru.net 官方云端 API（需在
+          {" "}
+          <a
+            href="https://mineru.net/apiManage"
+            target="_blank"
+            rel="noreferrer"
+            className="underline"
+          >
+            mineru.net
+          </a>
+          {" "}
+          申请 Token）。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-2">
+          <Label>backend</Label>
+          <Select
+            value={v.backend}
+            onValueChange={(x) => setV({ ...v, backend: x as ParserCfg["backend"] })}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="builtin">builtin（文本 + pypdf）</SelectItem>
+              <SelectItem value="mineru_local">mineru_local（本地 CLI）</SelectItem>
+              <SelectItem value="mineru_api">mineru_api（官方云端）</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        {v.backend === "mineru_local" && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="local_cmd"
+              value={v.local_cmd}
+              onChange={(x) => setV({ ...v, local_cmd: x })}
+              placeholder="mineru"
+            />
+            <Field
+              label="local_extra_args"
+              value={v.local_extra_args}
+              onChange={(x) => setV({ ...v, local_extra_args: x })}
+              placeholder="如 -b pipeline （CPU 模式）"
+            />
+          </div>
+        )}
+
+        {v.backend === "mineru_api" && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="api_base"
+              value={v.api_base}
+              onChange={(x) => setV({ ...v, api_base: x })}
+              placeholder="https://mineru.net/api/v4"
+              full
+            />
+            <Field
+              label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 token）" : ""}`}
+              value={v.api_key}
+              onChange={(x) => setV({ ...v, api_key: x })}
+              placeholder={hasSavedKey ? "已配置 ✓ — 留空则保持，填写则覆盖" : "粘贴 Bearer Token"}
+              type="password"
+              full
+            />
+            <div className="space-y-2">
+              <Label>model_version</Label>
+              <Select
+                value={v.model_version}
+                onValueChange={(x) =>
+                  setV({ ...v, model_version: x as ParserCfg["model_version"] })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="vlm">vlm（推荐，精度更高）</SelectItem>
+                  <SelectItem value="pipeline">pipeline（传统流水线）</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        )}
+
+        <ActionRow
+          probe={probe}
+          probing={probing}
+          busy={busy}
+          onTest={test}
+          onSave={save}
+        />
+      </CardContent>
+    </Card>
+  );
+}
+
 function RetrievalCard({ value, onSaved }: { value: RetrievalCfg; onSaved: () => void }) {
   const [v, setV] = useState<RetrievalCfg>(value);
   const [busy, setBusy] = useState(false);
@@ -430,11 +588,11 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
       <CardHeader>
         <CardTitle className="text-base">AI 行为</CardTitle>
         <CardDescription>
-          system prompt + 置信度阈值(混合模式下低于此值会转人工建议) + 历史窗口大小。
+          system prompt + 置信度阈值（混合模式下低于此值会转人工建议）+ 历史窗口大小 + 单次回复 token 上限。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 sm:grid-cols-3">
           <Field
             label="confidence_threshold"
             value={String(v.confidence_threshold)}
@@ -445,6 +603,12 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
             label="context_window"
             value={String(v.context_window)}
             onChange={(x) => setV({ ...v, context_window: Number(x) })}
+            type="number"
+          />
+          <Field
+            label="max_tokens"
+            value={String(v.max_tokens)}
+            onChange={(x) => setV({ ...v, max_tokens: Number(x) })}
             type="number"
           />
         </div>

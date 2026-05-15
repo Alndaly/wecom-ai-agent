@@ -1,6 +1,7 @@
 package com.wecom.agent.service
 
 import android.app.*
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -347,14 +348,35 @@ class AgentForegroundService : Service() {
 
     private fun startScreenStream(intervalMs: Long) {
         screenStreamJob?.cancel()
+        // Authoritative check: read the system setting rather than rely solely
+        // on the service singleton, which can be momentarily null right after
+        // the user enables accessibility.
+        if (!isAccessibilityServiceEnabled()) {
+            sendCommandAck("screen_start", false, "无障碍服务未启用，请在系统设置中开启后重试")
+            broadcastLog("拒绝开启实时屏幕：无障碍服务未启用")
+            return
+        }
         sendCommandAck("screen_start", true, "实时屏幕已开启")
         screenStreamJob = scope.launch {
             broadcastLog("实时屏幕已开启，间隔 ${intervalMs}ms")
             while (isActive) {
-                sendScreenFrame()
+                val ok = sendScreenFrame()
+                if (!ok) {
+                    broadcastLog("实时屏幕已停止：无障碍服务不可用")
+                    screenStreamJob = null
+                    break
+                }
                 delay(intervalMs)
             }
         }
+    }
+
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        val cn = ComponentName(this, WeComAccessibilityService::class.java).flattenToString()
+        val enabled = Settings.Secure.getString(
+            contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ).orEmpty()
+        return enabled.split(':').any { it.equals(cn, ignoreCase = true) }
     }
 
     private fun stopScreenStream() {
@@ -372,16 +394,29 @@ class AgentForegroundService : Service() {
         client?.sendEvent("device.command_ack", payload)
     }
 
-    private suspend fun sendScreenFrame() {
+    /**
+     * Capture one frame and forward to backend.
+     *
+     * @return false if the accessibility service is unavailable — caller should
+     *  stop the stream loop instead of polling and flooding identical errors.
+     */
+    private suspend fun sendScreenFrame(): Boolean {
         val svc = WeComAccessibilityService.instance
-        val frame = if (svc == null) {
-            ScreenFramePayload(error = "无障碍服务未启用，无法截图")
-        } else {
-            svc.captureScreenJpegBase64(quality = 55)
+        if (svc == null) {
+            // Either accessibility was just toggled off, or the service hasn't
+            // finished onServiceConnected yet. Bail; the caller stops the loop.
+            val payload = json.encodeToJsonElement(
+                ScreenFramePayload.serializer(),
+                ScreenFramePayload(error = "无障碍服务未启用，无法截图"),
+            )
+            client?.sendEvent("device.screen_frame", payload)
+            return false
         }
+        val frame = svc.captureScreenJpegBase64(quality = 55)
         val payload = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
         val ok = client?.sendEvent("device.screen_frame", payload) == true
         if (!ok) broadcastLog("屏幕帧上传失败（未连接后端）")
+        return true
     }
 
     private fun forwardInboundMessage(

@@ -56,6 +56,26 @@ class MemoryGraphStore(GraphStore):
                 break
         return out
 
+    async def delete_chunks(self, team_id: int, chunk_ids: list[int]) -> None:
+        if not chunk_ids:
+            return
+        keys = {("Chunk", f"chunk-{cid}") for cid in chunk_ids}
+        async with self._lock:
+            nodes = self._nodes.get(team_id)
+            if nodes:
+                for k in keys:
+                    nodes.pop(k, None)
+            adj = self._adj.get(team_id)
+            if adj:
+                # drop outgoing edges from removed chunks
+                for k in keys:
+                    adj.pop(k, None)
+                # drop incoming edges that point at removed chunks
+                for src, edges in list(adj.items()):
+                    adj[src] = [
+                        (rel, dst_key) for rel, dst_key in edges if dst_key not in keys
+                    ]
+
     async def find_nodes(self, team_id: int, names: list[str]) -> list[Node]:
         lower = {n.lower() for n in names}
         return [
