@@ -54,9 +54,51 @@ _AGG_PREFIX_RX = re.compile(r"^\s*\[\s*\d+\s*条\s*]\s*")
 _BOT_ECHO_RX = re.compile(r"^\s*收到您说的[「\"']")
 _TIME_ONLY_RX = re.compile(r"^\s*(上午|下午)?\s*\d{1,2}:\d{2}\s*$")
 
+# WeCom internal system messages — these are platform notifications (weekly
+# summary, app announcements, password reset, etc.) that look like normal chat
+# bubbles but are NOT customer questions. Replying to them is embarrassing and
+# wastes LLM quota. We drop them entirely (no DB row, no AI trigger).
+#
+# Names cover the most common system "senders" both ZH/EN. Content patterns
+# catch the weekly summary banner and other recurring platform pushes.
+_SYSTEM_CONTACT_NAMES: set[str] = {
+    "微信团队",
+    "企业微信",
+    "企业微信团队",
+    "腾讯企业微信",
+    "腾讯客服",
+    "系统消息",
+    "系统通知",
+    "微信",
+    "Weixin Team",
+    "WeCom",
+    "WeCom Team",
+    "Tencent",
+}
+
+_SYSTEM_CONTENT_PATTERNS = [
+    re.compile(r"查收.{0,4}企业微信.{0,4}(周|月|日)小结"),
+    re.compile(r"^.{0,10}企业微信.{0,10}(更新|升级|发版|版本).{0,30}$"),
+    re.compile(r"^.{0,10}(登录提醒|安全提醒|异地登录).{0,40}$"),
+    re.compile(r"^.{0,10}(账号|密码).{0,4}(修改|重置|变更).{0,30}$"),
+    re.compile(r"群发助手|审批结果|打卡提醒|日报提醒"),
+]
+
 
 def _clean_content(text: str) -> str:
     return _AGG_PREFIX_RX.sub("", text or "").strip()
+
+
+def _is_wecom_system_message(sender_name: str, content: str) -> bool:
+    name = (sender_name or "").strip()
+    if name in _SYSTEM_CONTACT_NAMES:
+        return True
+    if not content:
+        return False
+    for rx in _SYSTEM_CONTENT_PATTERNS:
+        if rx.search(content):
+            return True
+    return False
 
 from app.ai import workflow as ai_workflow
 from app.core.ws_manager import hub
@@ -137,6 +179,14 @@ async def ingest_inbound_message(
         return None  # chat timestamp separators are not customer messages
     if _BOT_ECHO_RX.match(cleaned):
         return None  # our own confirmation template echoed back from UI scraping
+    if _is_wecom_system_message(evt.contact.nickname, cleaned):
+        # WeCom platform notification — don't persist, don't reply.
+        import logging
+        logging.info(
+            "skip WeCom system message from %r: %r",
+            evt.contact.nickname, cleaned[:60],
+        )
+        return None
     msg = Message(
         conversation_id=conv.id,
         direction="in",

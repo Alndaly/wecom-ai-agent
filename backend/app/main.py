@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -46,9 +47,17 @@ async def lifespan(_: FastAPI):
     await _ensure_seed()
     await _bootstrap_agent_tools()
     await _hydrate_vector_store()
+    # background retention sweeper — cancel on shutdown
+    from app.services import retention
+    retention_task = asyncio.create_task(retention.run_loop(), name="retention-loop")
     try:
         yield
     finally:
+        retention_task.cancel()
+        try:
+            await retention_task
+        except (asyncio.CancelledError, Exception):
+            pass
         # Close MCP sessions on shutdown so subprocesses don't linger.
         try:
             from app.ai.tools import mcp_adapter

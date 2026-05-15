@@ -82,6 +82,10 @@ class Settings(BaseSettings):
 
     # ---- Long-term memory ----
     memory_summary_every: int = 10  # generate / refresh summary every N inbound msgs
+    # ---- Message retention ----
+    # Daily sweep deletes messages older than this. Set to 0 to disable.
+    message_retention_days: int = 30
+    retention_sweep_interval_sec: int = 6 * 60 * 60  # 6h
 
     @property
     def cors_origin_list(self) -> list[str]:

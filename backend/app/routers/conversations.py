@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import desc, select
+from sqlalchemy import delete as sa_delete, desc, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.ws_manager import hub
 from app.deps import current_user
-from app.models import Contact, Conversation, Message, Robot, User
+from app.models import AIReplyLog, Contact, Conversation, Message, Robot, RobotTask, User
 from app.schemas import (
     ConversationOut,
     ConversationPatch,
@@ -104,6 +105,59 @@ async def list_messages(
     stmt = stmt.order_by(desc(Message.created_at)).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     return list(reversed(rows))
+
+
+@router.delete("/{cid}/messages/{mid}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    cid: int,
+    mid: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete a single message. Detaches any FK references first."""
+    await _get_conv(db, cid, user.team_id)
+    msg = await db.get(Message, mid)
+    if msg is None or msg.conversation_id != cid:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "message not found")
+
+    # AIReplyLog.message_id → set NULL (preserve the log, drop the ref)
+    await db.execute(
+        sa_update(AIReplyLog).where(AIReplyLog.message_id == mid).values(message_id=None)
+    )
+    await db.delete(msg)
+    await db.commit()
+    await hub.broadcast_web(
+        user.team_id,
+        "message.deleted",
+        {"conversation_id": cid, "message_id": mid},
+    )
+
+
+@router.delete("/{cid}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    cid: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete a conversation and ALL its messages, tasks and AI logs."""
+    conv = await _get_conv(db, cid, user.team_id)
+    # 1. AIReplyLog ← message_id (FK) — wipe entire conv
+    await db.execute(sa_delete(AIReplyLog).where(AIReplyLog.conversation_id == cid))
+    # 2. Messages reference robot_tasks via FK; tasks reference conv via FK too.
+    #    Order: clear Message.task_id (FK), delete RobotTask rows for this conv,
+    #    delete messages, then the conversation row.
+    await db.execute(
+        sa_update(Message).where(Message.conversation_id == cid).values(task_id=None)
+    )
+    await db.execute(sa_delete(RobotTask).where(RobotTask.conversation_id == cid))
+    await db.execute(sa_delete(Message).where(Message.conversation_id == cid))
+    await db.delete(conv)
+    await db.commit()
+    await hub.broadcast_web(
+        user.team_id,
+        "conversation.deleted",
+        {"conversation_id": cid},
+    )
 
 
 @router.post("/{cid}/messages", response_model=MessageSendOut)
