@@ -43,13 +43,14 @@ async def _kb_search(ctx: ToolContext, args: dict[str, Any]) -> str:
 
     if not hits:
         return f"未在知识库中找到与「{query}」相关的内容。"
+    visible_hits = hits[:6]
     lines = [
-        f"针对「{query}」的混合检索结果（Milvus 语义召回 + Neo4j 图谱扩展，top {len(hits)}）:"
+        f"针对「{query}」的混合检索结果（Milvus 语义召回 + Neo4j 图谱扩展，top {len(visible_hits)}/{len(hits)}）:"
     ]
-    for i, h in enumerate(hits, 1):
+    for i, h in enumerate(visible_hits, 1):
         snippet = (h.text or "").replace("\n", " ").strip()
-        if len(snippet) > 700:
-            snippet = snippet[:700] + "…"
+        if len(snippet) > 450:
+            snippet = snippet[:450] + "…"
         source = getattr(h, "source", "vector")
         lines.append(
             f"[{i}] source={source} score={h.score:.2f} chunk={h.chunk_id} · {snippet}"

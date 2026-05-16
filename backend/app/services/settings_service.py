@@ -26,8 +26,14 @@ from app.models import TeamSetting
 # inject arbitrary attributes (defence-in-depth, the schema layer is the
 # primary gate).
 _ALLOWED: dict[str, set[str]] = {
-    "llm": {"provider", "model", "api_key", "base_url", "temperature", "supports_vision"},
-    "embedding": {"provider", "model", "api_key", "base_url", "dim"},
+    "llm": {
+        "provider", "model", "api_key", "base_url", "temperature", "supports_vision",
+        "profiles", "active_profile", "fallback_profile", "fallback_enabled",
+    },
+    "embedding": {
+        "provider", "model", "api_key", "base_url", "dim",
+        "profiles", "active_profile",
+    },
     "retrieval": {"top_k", "min_score"},
     "ai": {
         "confidence_threshold",
@@ -89,6 +95,60 @@ def _env_defaults(scope: str) -> dict[str, Any]:
     return {}
 
 
+def _default_profile_id(scope: str) -> str:
+    return "default"
+
+
+def _profile_scalar_keys(scope: str) -> tuple[str, ...]:
+    if scope == "llm":
+        return ("provider", "model", "api_key", "base_url", "temperature", "supports_vision")
+    if scope == "embedding":
+        return ("provider", "model", "api_key", "base_url", "dim")
+    return ()
+
+
+def _normalise_profiles(scope: str, value: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    if scope not in ("llm", "embedding"):
+        return value
+
+    scalar_keys = _profile_scalar_keys(scope)
+    legacy_profile = {k: value.get(k, base.get(k)) for k in scalar_keys if value.get(k, base.get(k)) is not None}
+    legacy_profile.setdefault("id", _default_profile_id(scope))
+    legacy_profile.setdefault("name", "默认模型" if scope == "llm" else "默认向量模型")
+
+    raw_profiles = value.get("profiles")
+    profiles: list[dict[str, Any]] = []
+    if isinstance(raw_profiles, list):
+        for i, item in enumerate(raw_profiles):
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id") or f"profile_{i+1}").strip()
+            if not pid:
+                continue
+            profile = {k: item.get(k) for k in scalar_keys if item.get(k) is not None}
+            profile["id"] = pid
+            profile["name"] = str(item.get("name") or pid)
+            profiles.append(profile)
+
+    if not profiles:
+        profiles = [legacy_profile]
+
+    active = str(value.get("active_profile") or profiles[0].get("id") or _default_profile_id(scope))
+    if not any(p.get("id") == active for p in profiles):
+        active = str(profiles[0].get("id") or _default_profile_id(scope))
+    active_profile = next(p for p in profiles if p.get("id") == active)
+
+    out = dict(base)
+    out.update({k: active_profile.get(k) for k in scalar_keys if active_profile.get(k) is not None})
+    out["profiles"] = profiles
+    out["active_profile"] = active
+    if scope == "llm":
+        fallback = str(value.get("fallback_profile") or "")
+        out["fallback_profile"] = fallback if any(p.get("id") == fallback for p in profiles) else ""
+        out["fallback_enabled"] = bool(value.get("fallback_enabled", bool(out["fallback_profile"])))
+    return out
+
+
 async def get(db: AsyncSession, team_id: int, scope: str) -> dict[str, Any]:
     base = _env_defaults(scope)
     row = (
@@ -96,11 +156,28 @@ async def get(db: AsyncSession, team_id: int, scope: str) -> dict[str, Any]:
             select(TeamSetting).where(TeamSetting.team_id == team_id, TeamSetting.key == scope)
         )
     ).scalar_one_or_none()
+    raw_value = {}
     if row and row.value_json:
+        raw_value = dict(row.value_json)
         for k, v in row.value_json.items():
             if k in _ALLOWED.get(scope, ()) and v is not None and v != "":
                 base[k] = v
-    return base
+    return _normalise_profiles(scope, raw_value or base, base)
+
+
+async def get_profile(db: AsyncSession, team_id: int, scope: str, profile_id: str | None) -> dict[str, Any]:
+    cfg = await get(db, team_id, scope)
+    if scope not in ("llm", "embedding") or not profile_id:
+        return cfg
+    for profile in cfg.get("profiles") or []:
+        if isinstance(profile, dict) and profile.get("id") == profile_id:
+            out = dict(cfg)
+            for k in _profile_scalar_keys(scope):
+                if profile.get(k) is not None:
+                    out[k] = profile[k]
+            out["active_profile"] = profile_id
+            return out
+    return cfg
 
 
 async def version(db: AsyncSession, team_id: int, scope: str) -> int:

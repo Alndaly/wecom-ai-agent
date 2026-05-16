@@ -31,7 +31,7 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.providers import ChatMessage, get_provider
+from app.ai.providers import ChatMessage, get_fallback_provider, get_provider
 from app.ai.react_locators import LocatorStore, parse_send_goal, role_for_decision
 from app.core.config import settings
 from app.device import DeviceClient, UiNode
@@ -124,6 +124,7 @@ async def run_react(
 
     await _log("info", f"[react] goal={goal!r} max_steps={max_steps}")
     provider = await get_provider(db, robot.team_id)
+    fallback_provider = await get_fallback_provider(db, robot.team_id)
     llm_cfg = await settings_service.get(db, robot.team_id, "llm")
     use_vision = _vision_enabled(llm_cfg)
     locator_store = LocatorStore(robot)
@@ -157,9 +158,21 @@ async def run_react(
             )
             try:
                 decision = await _decide(provider, goal, obs, steps, use_vision=use_vision)
+                if fallback_provider is not None and decision.get("action") == "done" and not decision.get("args", {}).get("success", True):
+                    await _log("info", "[react] primary model gave failure; trying fallback model")
+                    fallback_decision = await _decide(fallback_provider, goal, obs, steps, use_vision=use_vision)
+                    if not (fallback_decision.get("action") == "done" and not fallback_decision.get("args", {}).get("success", True)):
+                        decision = fallback_decision
             except Exception as e:  # noqa: BLE001
-                await _log("error", f"[react] step {i} llm failed: {e}")
-                return AgentResult(ok=False, summary=f"LLM 调用失败：{e}", steps=steps)
+                if fallback_provider is None:
+                    await _log("error", f"[react] step {i} llm failed: {e}")
+                    return AgentResult(ok=False, summary=f"LLM 调用失败：{e}", steps=steps)
+                await _log("warn", f"[react] primary llm failed, trying fallback: {e}")
+                try:
+                    decision = await _decide(fallback_provider, goal, obs, steps, use_vision=use_vision)
+                except Exception as fallback_e:  # noqa: BLE001
+                    await _log("error", f"[react] fallback llm failed: {fallback_e}")
+                    return AgentResult(ok=False, summary=f"LLM 调用失败：{e}; fallback={fallback_e}", steps=steps)
 
         thought = decision.get("thought") or ""
         action = (decision.get("action") or "").strip()

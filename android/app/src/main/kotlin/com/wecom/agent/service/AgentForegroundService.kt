@@ -57,6 +57,7 @@ class AgentForegroundService : Service() {
     private var scanTier1Job: Job? = null
     private var scanTier2Job: Job? = null
     private var scanTier3Job: Job? = null
+    private var chatScanJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
@@ -100,9 +101,9 @@ class AgentForegroundService : Service() {
         MessageNotificationListener.onMessage = { sender, content, postTime ->
             forwardInboundMessage(sender, content, postTime, viaNotification = true)
         }
-        WeComAccessibilityService.onChatMessage = { sender, content ->
+        WeComAccessibilityService.onChatMessage = { sender, content, fromSelf ->
             if (a11yInboundEnabled) {
-                forwardInboundMessage(sender, content, System.currentTimeMillis(), viaNotification = false)
+                forwardChatMessage(sender, content, System.currentTimeMillis(), fromSelf = fromSelf)
             }
         }
 
@@ -149,6 +150,7 @@ class AgentForegroundService : Service() {
         scanTier1Job?.cancel(); scanTier1Job = null
         scanTier2Job?.cancel(); scanTier2Job = null
         scanTier3Job?.cancel(); scanTier3Job = null
+        chatScanJob?.cancel(); chatScanJob = null
         client?.stop()
         MessageNotificationListener.onMessage = null
         WeComAccessibilityService.onChatMessage = null
@@ -345,6 +347,15 @@ class AgentForegroundService : Service() {
                 delay(30 * 60_000L)
             }
         }
+        chatScanJob = scope.launch {
+            delay(3_000L)
+            while (isActive) {
+                if (a11yInboundEnabled) {
+                    WeComAccessibilityService.instance?.forceHarvestCurrentChat()
+                }
+                delay(2_000L)
+            }
+        }
     }
 
     private fun startScreenStream(intervalMs: Long) {
@@ -506,21 +517,40 @@ class AgentForegroundService : Service() {
         postTimeMs: Long,
         viaNotification: Boolean,
     ) {
+        forwardMessage(sender, content, postTimeMs, senderType = "customer", src = if (viaNotification) "notif" else "a11y")
+    }
+
+    private fun forwardChatMessage(
+        sender: String,
+        content: String,
+        postTimeMs: Long,
+        fromSelf: Boolean,
+    ) {
+        forwardMessage(sender, content, postTimeMs, senderType = if (fromSelf) "human" else "customer", src = if (fromSelf) "a11y-self" else "a11y")
+    }
+
+    private fun forwardMessage(
+        sender: String,
+        content: String,
+        postTimeMs: Long,
+        senderType: String,
+        src: String,
+    ) {
         val payload = MessageReceivedPayload(
             contact = Contact(external_id = sender, nickname = sender),
             external_msg_id = "rt_${postTimeMs}_${UUID.randomUUID().toString().take(8)}",
             type = "text",
             content = content,
+            sender_type = senderType,
             sent_at = Instant.ofEpochMilli(postTimeMs).toString(),
         )
         val element = json.encodeToJsonElement(MessageReceivedPayload.serializer(), payload)
         val sent = client?.sendEvent("message.received", element) == true
-        val src = if (viaNotification) "notif" else "a11y"
         broadcastLog(
-            if (sent) "上报新消息[$src] $sender :: ${content.take(40)}"
-            else "上报失败(未连接)[$src] $sender :: ${content.take(40)}"
+            if (sent) "上报消息[$src/$senderType] $sender :: ${content.take(40)}"
+            else "上报失败(未连接)[$src/$senderType] $sender :: ${content.take(40)}"
         )
-        Log.i(tag, "inbound[$src] sent=$sent sender=$sender content=${content.take(60)}")
+        Log.i(tag, "message[$src/$senderType] sent=$sent sender=$sender content=${content.take(60)}")
     }
 
     private fun ensureChannel() {

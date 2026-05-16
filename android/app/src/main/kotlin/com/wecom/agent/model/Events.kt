@@ -19,6 +19,7 @@ data class MessageReceivedPayload(
     val external_msg_id: String? = null,
     val type: String = "text",
     val content: String,
+    val sender_type: String = "customer",
     val sent_at: String? = null,
 )
 

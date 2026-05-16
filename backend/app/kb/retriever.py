@@ -91,31 +91,8 @@ def _looks_like_toc(text: str) -> bool:
     return page_refs >= 3 or (section_refs >= 5 and dot_count >= 12)
 
 
-def _query_variants(query: str) -> list[str]:
-    variants = [query]
-    swaps = [
-        ("安装", "安裝"),
-        ("安裝", "安装"),
-        ("步骤", "步驟"),
-        ("步驟", "步骤"),
-        ("主板", "主機板"),
-        ("主機板", "主板"),
-    ]
-    for src, dst in swaps:
-        if src in query:
-            variants.append(query.replace(src, dst))
-
-    cleaned = query.strip(" ？?。.")
-    if any(word in cleaned for word in ("安装", "安裝", "装机")):
-        variants.extend(
-            [
-                f"{cleaned} 步骤",
-                f"{cleaned} 注意事项",
-                "安装主板 步骤 接线 固定",
-                "安裝主板 步驟 接線 固定",
-            ]
-        )
-
+def _normalised_queries(query: str) -> list[str]:
+    variants = [query, " ".join(query.split()), query.strip(" \t\r\n？?。.")]
     out: list[str] = []
     seen: set[str] = set()
     for variant in variants:
@@ -123,7 +100,44 @@ def _query_variants(query: str) -> list[str]:
         if variant and variant not in seen:
             seen.add(variant)
             out.append(variant)
-    return out[:5]
+    return out
+
+
+_ASCII_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.+-]*", re.I)
+_CJK_RE = re.compile(r"[\u3400-\u9fff]+")
+
+
+def _lexical_terms(text: str) -> set[str]:
+    """Build domain-neutral lexical signals from text."""
+    lowered = (text or "").lower()
+    terms = {m.group(0) for m in _ASCII_TOKEN_RE.finditer(lowered) if len(m.group(0)) >= 2}
+    for match in _CJK_RE.finditer(lowered):
+        run = match.group(0)
+        if len(run) <= 4:
+            terms.add(run)
+            continue
+        terms.update(run[i : i + 2] for i in range(len(run) - 1))
+        terms.update(run[i : i + 3] for i in range(len(run) - 2))
+    return terms
+
+
+def _lexical_adjustment(query: str, text: str) -> float:
+    query_terms = _lexical_terms(query)
+    if not query_terms:
+        return 0.0
+
+    text_terms = _lexical_terms(text)
+    if not text_terms:
+        return 0.0
+
+    overlap = len(query_terms & text_terms) / len(query_terms)
+    score = min(0.12, overlap * 0.12)
+
+    compact_query = re.sub(r"\s+", "", (query or "").lower().strip(" ？?。."))
+    compact_text = re.sub(r"\s+", "", (text or "").lower())
+    if len(compact_query) >= 4 and compact_query in compact_text:
+        score += 0.04
+    return score
 
 
 async def _load_chunks(db: AsyncSession, chunk_ids: list[int]) -> dict[int, KnowledgeChunk]:
@@ -183,7 +197,7 @@ async def retrieve(
     vector_store = get_vector_store()
     search_k = max(k * 3, k + 8)
     merged: dict[int, Hit] = {}
-    for variant in _query_variants(query):
+    for variant in _normalised_queries(query):
         embed = await embedder.embed_one(variant)
         vector_hits = await vector_store.search(
             embed, top_k=search_k, filter_={"team_id": team_id}
@@ -193,7 +207,11 @@ async def retrieve(
             if cid is None:
                 continue
             text = str(vh.meta.get("text") or "")
-            adjusted_score = float(vh.score) - (0.12 if _looks_like_toc(text) else 0.0)
+            adjusted_score = (
+                float(vh.score)
+                + _lexical_adjustment(query, text)
+                - (0.12 if _looks_like_toc(text) else 0.0)
+            )
             if adjusted_score < floor:
                 continue
             chunk_id = int(cid)

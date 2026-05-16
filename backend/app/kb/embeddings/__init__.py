@@ -4,6 +4,8 @@ Resolution: DB team_settings("embedding") → env defaults → mock.
 """
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import settings_service
@@ -19,7 +21,8 @@ __all__ = [
     "reset_cache",
 ]
 
-_cache: dict[tuple[int, int], EmbeddingProvider] = {}
+_cache: dict[tuple[int, int, str], EmbeddingProvider] = {}
+log = logging.getLogger(__name__)
 
 
 def build_embedding_provider(cfg: dict) -> EmbeddingProvider:
@@ -38,12 +41,14 @@ def build_embedding_provider(cfg: dict) -> EmbeddingProvider:
 async def get_embedding_provider(db: AsyncSession, team_id: int) -> EmbeddingProvider:
     cfg = await settings_service.get(db, team_id, "embedding")
     ver = await settings_service.version(db, team_id, "embedding")
-    key = (team_id, ver)
+    profile = str(cfg.get("active_profile") or "default")
+    key = (team_id, ver, profile)
     cached = _cache.get(key)
     if cached is not None:
         return cached
     inst = build_embedding_provider(cfg)
     _cache[key] = inst
+    log.info("embedding provider built team=%s profile=%s provider=%s", team_id, profile, getattr(inst, "name", "?"))
     return inst
 
 

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Per-conversation lock. Serialises the AI reply path so that bursts of
 # inbound messages from the same customer don't kick off N concurrent agent
@@ -37,6 +37,24 @@ async def _has_been_replied_after(
                 Message.conversation_id == conv_id,
                 Message.direction == "out",
                 Message.created_at > after,
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+async def _has_recent_outbound_same_content(
+    db: AsyncSession, conv_id: int, content: str, now: datetime
+) -> bool:
+    row = (
+        await db.execute(
+            select(Message.id)
+            .where(
+                Message.conversation_id == conv_id,
+                Message.direction == "out",
+                Message.content == content,
+                Message.created_at > now - timedelta(minutes=3),
             )
             .limit(1)
         )
@@ -115,7 +133,12 @@ from app.services.send_orchestrator import create_and_dispatch_send_text
 async def ingest_inbound_message(
     db: AsyncSession, robot: Robot, evt: AndroidMessageReceived
 ) -> Message | None:
-    """Persist an inbound message; returns the Message or None if duplicate."""
+    """Persist an Android-observed chat message; returns Message or None if duplicate.
+
+    Customer messages are inbound and may trigger AI. Human/self messages are
+    outbound conversation history only; they are persisted so future answers
+    see the full chat, but they never kick off an auto-reply.
+    """
     # dedupe by external_msg_id when provided
     if evt.external_msg_id:
         existing = (
@@ -172,13 +195,14 @@ async def ingest_inbound_message(
     # MUST NOT be used for ordering.
     now = utcnow()
     cleaned = _clean_content(evt.content)
+    from_customer = evt.sender_type == "customer"
     if not cleaned:
         return None  # nothing left after stripping notification noise
     if _TIME_ONLY_RX.match(cleaned):
         return None  # chat timestamp separators are not customer messages
-    if _BOT_ECHO_RX.match(cleaned):
+    if from_customer and _BOT_ECHO_RX.match(cleaned):
         return None  # our own confirmation template echoed back from UI scraping
-    if _is_wecom_system_message(evt.contact.nickname, cleaned):
+    if from_customer and _is_wecom_system_message(evt.contact.nickname, cleaned):
         # WeCom platform notification — don't persist, don't reply.
         import logging
         logging.info(
@@ -186,10 +210,19 @@ async def ingest_inbound_message(
             evt.contact.nickname, cleaned[:60],
         )
         return None
+    if not from_customer and await _has_recent_outbound_same_content(db, conv.id, cleaned, now):
+        import logging
+        logging.info(
+            "skip self echo already recorded conv=%s contact=%s content=%r",
+            conv.id,
+            evt.contact.external_id,
+            cleaned[:60],
+        )
+        return None
     msg = Message(
         conversation_id=conv.id,
-        direction="in",
-        sender_type="customer",
+        direction="in" if from_customer else "out",
+        sender_type="customer" if from_customer else "human",
         type=evt.type,
         content=cleaned,
         external_msg_id=evt.external_msg_id,
@@ -197,7 +230,8 @@ async def ingest_inbound_message(
     )
     db.add(msg)
 
-    conv.unread_count = (conv.unread_count or 0) + 1
+    if from_customer:
+        conv.unread_count = (conv.unread_count or 0) + 1
     conv.last_message_at = now
     conv.last_message_preview = cleaned[:200]
 
@@ -226,7 +260,7 @@ async def ingest_inbound_message(
     # Per-conversation lock: if a previous burst is still being processed, we
     # queue here briefly and exit when the lock-holder has already covered our
     # message (via the unreplied-chain mechanism).
-    if conv.mode in ("ai", "mixed"):
+    if from_customer and conv.mode in ("ai", "mixed"):
         lock = _lock_for(conv.id)
         async with lock:
             # Did the previous lock-holder already reply past this inbound?

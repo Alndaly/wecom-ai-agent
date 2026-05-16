@@ -1,6 +1,18 @@
 "use client";
-import { useEffect, useState } from "react";
-import { Save, Wand2, AlertCircle, CheckCircle2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  AlertCircle,
+  Bot,
+  CheckCircle2,
+  Database,
+  FileText,
+  Plus,
+  Save,
+  Server,
+  SlidersHorizontal,
+  Trash2,
+  Wand2,
+} from "lucide-react";
 import { api } from "@/lib/api";
 import { toast } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
@@ -16,6 +28,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 
 type LlmCfg = {
   provider: "mock" | "openai";
@@ -23,6 +43,11 @@ type LlmCfg = {
   api_key: string;
   base_url: string;
   temperature: number;
+  supports_vision?: boolean;
+  profiles?: ModelProfile[];
+  active_profile?: string;
+  fallback_profile?: string;
+  fallback_enabled?: boolean;
 };
 type EmbedCfg = {
   provider: "mock" | "openai";
@@ -30,6 +55,19 @@ type EmbedCfg = {
   api_key: string;
   base_url: string;
   dim: number;
+  profiles?: ModelProfile[];
+  active_profile?: string;
+};
+type ModelProfile = {
+  id: string;
+  name: string;
+  provider: "mock" | "openai";
+  model: string;
+  api_key: string;
+  base_url: string;
+  temperature?: number;
+  supports_vision?: boolean;
+  dim?: number;
 };
 type RetrievalCfg = { top_k: number; min_score: number };
 type AIBehaviorCfg = {
@@ -56,6 +94,7 @@ type InfraCfg = {
   neo4j_uri: string;
 };
 type ProbeResult = { ok: boolean; detail: string; latency_ms?: number; model?: string; dim?: number };
+type SettingsSection = "models" | "parser" | "retrieval" | "behavior" | "infra";
 
 const LLM_PRESETS: { label: string; provider: "openai" | "mock"; model: string; base_url: string }[] = [
   { label: "OpenAI · gpt-4o-mini", provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1" },
@@ -84,6 +123,7 @@ export default function SettingsPage() {
   const [parser, setParser] = useState<ParserCfg | null>(null);
   const [infra, setInfra] = useState<InfraCfg | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
+  const [section, setSection] = useState<SettingsSection>("models");
 
   // Two distinct flows:
   //   - first mount → show a loading state until we know the values
@@ -108,22 +148,73 @@ export default function SettingsPage() {
   if (initialLoading || !llm || !embed || !retrieval || !ai || !parser || !infra)
     return <p className="text-sm text-muted-foreground">加载中…</p>;
 
+  const activeLlm = (llm.profiles || []).find((p) => p.id === llm.active_profile);
+  const fallbackLlm = (llm.profiles || []).find((p) => p.id === llm.fallback_profile);
+  const activeEmbed = (embed.profiles || []).find((p) => p.id === embed.active_profile);
+  const nav: { id: SettingsSection; label: string; icon: any; detail: string }[] = [
+    { id: "models", label: "模型", icon: Bot, detail: activeLlm?.name || llm.model },
+    { id: "parser", label: "文档解析", icon: FileText, detail: parser.backend },
+    { id: "retrieval", label: "检索", icon: Database, detail: `top ${retrieval.top_k}` },
+    { id: "behavior", label: "AI 行为", icon: SlidersHorizontal, detail: `${ai.confidence_threshold}` },
+    { id: "infra", label: "基础设施", icon: Server, detail: infra.vector_store },
+  ];
+
   return (
-    <div className="max-w-3xl space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">模型配置</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          这里的 LLM / Embedding 配置会即时生效（修改保存后,所有新对话和入库流程会立刻使用新配置）。
-          基础设施（Milvus / Neo4j）通过 docker-compose 部署,在下方只读展示。
-        </p>
+    <div className="mx-auto max-w-7xl space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">系统设置</h1>
+          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+            配置会在保存后对新的对话、入库和自动任务生效。常用入口放在左侧，右侧只展示当前要处理的内容。
+          </p>
+        </div>
+        <div className="grid min-w-[280px] gap-1 rounded-md border bg-muted/30 p-3 text-xs">
+          <StatusLine label="主模型" value={activeLlm?.name || llm.model} />
+          <StatusLine label="兜底" value={llm.fallback_enabled && fallbackLlm ? fallbackLlm.name : "未启用"} />
+          <StatusLine label="向量" value={activeEmbed?.name || embed.model} />
+        </div>
       </div>
 
-      <LLMCard value={llm} onSaved={reload} />
-      <EmbeddingCard value={embed} onSaved={reload} />
-      <ParserCard value={parser} onSaved={reload} />
-      <RetrievalCard value={retrieval} onSaved={reload} />
-      <AIBehaviorCard value={ai} onSaved={reload} />
-      <InfraCard value={infra} />
+      <div className="grid gap-5 lg:grid-cols-[240px_minmax(0,1fr)]">
+        <aside className="self-start rounded-md border bg-background p-2">
+          {nav.map((item) => {
+            const Icon = item.icon;
+            const active = section === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setSection(item.id)}
+                className={cn(
+                  "flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors",
+                  active ? "bg-primary text-primary-foreground" : "hover:bg-muted",
+                )}
+              >
+                <Icon className="h-4 w-4 shrink-0" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium">{item.label}</span>
+                  <span className={cn("block truncate text-xs", active ? "text-primary-foreground/75" : "text-muted-foreground")}>
+                    {item.detail}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </aside>
+
+        <div className="min-w-0 space-y-5">
+          {section === "models" && (
+            <>
+              <LLMCard value={llm} onSaved={reload} />
+              <EmbeddingCard value={embed} onSaved={reload} />
+            </>
+          )}
+          {section === "parser" && <ParserCard value={parser} onSaved={reload} />}
+          {section === "retrieval" && <RetrievalCard value={retrieval} onSaved={reload} />}
+          {section === "behavior" && <AIBehaviorCard value={ai} onSaved={reload} />}
+          {section === "infra" && <InfraCard value={infra} />}
+        </div>
+      </div>
     </div>
   );
 }
@@ -131,18 +222,23 @@ export default function SettingsPage() {
 function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
   // Never carry the masked "********" into form state — start api_key blank
   // and let the backend keep its saved value when we send empty.
-  const hasSavedKey = value.api_key === "********";
-  const [v, setV] = useState<LlmCfg>({ ...value, api_key: "" });
+  const [v, setV] = useState<LlmCfg>(() => normaliseLlm(value));
   const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(false);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [editingId, setEditingId] = useState(value.active_profile || value.profiles?.[0]?.id || "default");
 
   async function save() {
     setBusy(true);
     try {
       await api("/settings/llm", { method: "PUT", body: JSON.stringify(v) });
       toast.success("LLM 配置已保存");
-      setV((cur) => ({ ...cur, api_key: "" }));
+      setV((cur) => ({
+        ...cur,
+        api_key: "",
+        profiles: (cur.profiles || []).map((p) => ({ ...p, api_key: "" })),
+      }));
       onSaved();
     } catch (e: any) {
       toast.error("保存失败", { description: e?.message });
@@ -170,103 +266,173 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
   function applyPreset(label: string) {
     const p = LLM_PRESETS.find((x) => x.label === label);
     if (!p) return;
-    setV({ ...v, provider: p.provider, model: p.model, base_url: p.base_url });
+    updateProfile(v, setV, editingId, { provider: p.provider, model: p.model, base_url: p.base_url });
+  }
+
+  const profiles = v.profiles || [];
+  const active = profiles.find((p) => p.id === editingId) || profiles.find((p) => p.id === v.active_profile) || profiles[0];
+  const hasSavedKey = active?.api_key === "********";
+  function patchActive(patch: Partial<ModelProfile>) {
+    updateProfile(v, setV, active?.id, patch);
+  }
+  function addProfile(profile?: Partial<ModelProfile>) {
+    const id = `llm_${Date.now()}`;
+    setV({
+      ...v,
+      profiles: [
+        ...profiles,
+        {
+          id,
+          name: profile?.name || "新模型",
+          provider: profile?.provider || "openai",
+          model: profile?.model || "gpt-4o-mini",
+          base_url: profile?.base_url || "https://api.openai.com/v1",
+          api_key: "",
+          temperature: profile?.temperature ?? 0.3,
+          supports_vision: profile?.supports_vision,
+        },
+      ],
+    });
+    setEditingId(id);
+  }
+  function removeActive() {
+    if (profiles.length <= 1 || !active) return;
+    const next = profiles.filter((p) => p.id !== active.id);
+    setV({
+      ...v,
+      profiles: next,
+      active_profile: v.active_profile === active.id ? next[0].id : v.active_profile,
+      fallback_profile: v.fallback_profile === active.id ? "" : v.fallback_profile,
+      fallback_enabled: v.fallback_profile === active.id ? false : v.fallback_enabled,
+    });
+    setEditingId(next[0].id);
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">LLM（生成）</CardTitle>
-        <CardDescription>
-          兼容 OpenAI API 的服务都能直接用：OpenAI / DeepSeek / 通义 / 智谱 / 自部署 Ollama …
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="space-y-2">
-          <Label>预设</Label>
-          <Select onValueChange={applyPreset}>
-            <SelectTrigger>
-              <SelectValue placeholder="选择一个预设快速填写" />
-            </SelectTrigger>
-            <SelectContent>
-              {LLM_PRESETS.map((p) => (
-                <SelectItem key={p.label} value={p.label}>
-                  {p.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label>provider</Label>
-            <Select
-              value={v.provider}
-              onValueChange={(x) => setV({ ...v, provider: x as any })}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="openai">openai 兼容端</SelectItem>
-                <SelectItem value="mock">mock</SelectItem>
-              </SelectContent>
-            </Select>
+    <Card className="overflow-hidden">
+      <CardHeader className="border-b">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle className="text-base">LLM（生成）</CardTitle>
+            <CardDescription>配置主模型和二层兜底模型。左侧选模型，右侧编辑详情。</CardDescription>
           </div>
-          <Field
-            label="model"
-            value={v.model}
-            onChange={(x) => setV({ ...v, model: x })}
-          />
-          <Field
-            label="base_url"
-            value={v.base_url}
-            onChange={(x) => setV({ ...v, base_url: x })}
-            placeholder="https://api.openai.com/v1"
-            full
-          />
-          <Field
-            label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 key）" : ""}`}
-            value={v.api_key}
-            onChange={(x) => setV({ ...v, api_key: x })}
-            placeholder={hasSavedKey ? "已配置 ✓ — 留空则保持，填写则覆盖" : "sk-..."}
-            type="password"
-            full
-          />
-          <Field
-            label="temperature"
-            value={String(v.temperature)}
-            onChange={(x) => setV({ ...v, temperature: Number(x) })}
-            type="number"
-          />
+          <Button variant="outline" onClick={() => setAddOpen(true)}>
+            <Plus className="h-4 w-4" /> 新增模型
+          </Button>
         </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="grid min-h-[420px] lg:grid-cols-[280px_minmax(0,1fr)]">
+          <div className="border-b bg-muted/20 p-4 lg:border-b-0 lg:border-r">
+            <div className="space-y-4">
+              <ModelRoleSelect
+                label="主模型"
+                value={v.active_profile || ""}
+                profiles={profiles}
+                onChange={(id) => {
+                  setV({ ...v, active_profile: id });
+                  setEditingId(id);
+                }}
+              />
+              <ModelRoleSelect
+                label="二层兜底"
+                value={v.fallback_profile || "__none"}
+                profiles={profiles}
+                allowNone
+                onChange={(id) =>
+                  setV({
+                    ...v,
+                    fallback_profile: id === "__none" ? "" : id,
+                    fallback_enabled: id !== "__none",
+                  })
+                }
+              />
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>模型列表</Label>
+                  <Badge variant="secondary">{profiles.length}</Badge>
+                </div>
+                <ProfileList
+                  profiles={profiles}
+                  activeId={active?.id}
+                  mainId={v.active_profile}
+                  fallbackId={v.fallback_enabled ? v.fallback_profile : ""}
+                  onSelect={setEditingId}
+                />
+                <Button
+                  variant="outline"
+                  className="w-full text-destructive hover:text-destructive"
+                  onClick={removeActive}
+                  disabled={profiles.length <= 1}
+                >
+                  <Trash2 className="h-4 w-4" /> 删除当前模型
+                </Button>
+              </div>
+            </div>
+          </div>
 
-        <ActionRow
-          probe={probe}
-          probing={probing}
-          busy={busy}
-          onTest={test}
-          onSave={save}
-        />
+          <div className="space-y-5 p-4">
+            <PresetSelect label="套用预设到当前模型" presets={LLM_PRESETS} onApply={applyPreset} />
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="名称" value={active?.name || ""} onChange={(x) => patchActive({ name: x })} />
+              <ProviderSelect value={active?.provider} onChange={(x) => patchActive({ provider: x as any })} />
+              <Field label="model" value={active?.model || ""} onChange={(x) => patchActive({ model: x })} />
+              <Field
+                label="temperature"
+                value={String(active?.temperature ?? 0.3)}
+                onChange={(x) => patchActive({ temperature: Number(x) })}
+                type="number"
+              />
+              <Field
+                label="base_url"
+                value={active?.base_url || ""}
+                onChange={(x) => patchActive({ base_url: x })}
+                placeholder="https://api.openai.com/v1"
+                full
+              />
+              <Field
+                label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 key）" : ""}`}
+                value={active?.api_key === "********" ? "" : active?.api_key || ""}
+                onChange={(x) => patchActive({ api_key: x })}
+                placeholder={hasSavedKey ? "已配置，留空保持不变" : "sk-..."}
+                type="password"
+                full
+              />
+            </div>
+            <ActionRow probe={probe} probing={probing} busy={busy} onTest={test} onSave={save} />
+          </div>
+        </div>
       </CardContent>
+      <AddProfileDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        title="新增 LLM 模型"
+        presets={LLM_PRESETS}
+        defaultName="新模型"
+        onCreate={(profile) => addProfile(profile)}
+      />
     </Card>
   );
 }
 
 function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => void }) {
-  const hasSavedKey = value.api_key === "********";
-  const [v, setV] = useState<EmbedCfg>({ ...value, api_key: "" });
+  const [v, setV] = useState<EmbedCfg>(() => normaliseEmbed(value));
   const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(false);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [editingId, setEditingId] = useState(value.active_profile || value.profiles?.[0]?.id || "default");
 
   async function save() {
     setBusy(true);
     try {
       await api("/settings/embedding", { method: "PUT", body: JSON.stringify(v) });
       toast.success("Embedding 配置已保存");
-      setV((cur) => ({ ...cur, api_key: "" }));
+      setV((cur) => ({
+        ...cur,
+        api_key: "",
+        profiles: (cur.profiles || []).map((p) => ({ ...p, api_key: "" })),
+      }));
       onSaved();
     } catch (e: any) {
       toast.error("保存失败", { description: e?.message });
@@ -293,86 +459,131 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
   function applyPreset(label: string) {
     const p = EMBED_PRESETS.find((x) => x.label === label);
     if (!p) return;
-    setV({ ...v, provider: p.provider, model: p.model, base_url: p.base_url, dim: p.dim });
+    updateProfile(v, setV, editingId, { provider: p.provider, model: p.model, base_url: p.base_url, dim: p.dim });
+  }
+
+  const profiles = v.profiles || [];
+  const active = profiles.find((p) => p.id === editingId) || profiles.find((p) => p.id === v.active_profile) || profiles[0];
+  const hasSavedKey = active?.api_key === "********";
+  function patchActive(patch: Partial<ModelProfile>) {
+    updateProfile(v, setV, active?.id, patch);
+  }
+  function addProfile(profile?: Partial<ModelProfile>) {
+    const id = `emb_${Date.now()}`;
+    setV({
+      ...v,
+      profiles: [
+        ...profiles,
+        {
+          id,
+          name: profile?.name || "新向量模型",
+          provider: profile?.provider || "openai",
+          model: profile?.model || "text-embedding-3-small",
+          base_url: profile?.base_url || "https://api.openai.com/v1",
+          api_key: "",
+          dim: profile?.dim ?? 1536,
+        },
+      ],
+    });
+    setEditingId(id);
+  }
+  function removeActive() {
+    if (profiles.length <= 1 || !active) return;
+    const next = profiles.filter((p) => p.id !== active.id);
+    setV({ ...v, profiles: next, active_profile: v.active_profile === active.id ? next[0].id : v.active_profile });
+    setEditingId(next[0].id);
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">Embedding（向量化）</CardTitle>
-        <CardDescription>
-          切换 embedding 模型后,旧的向量库数据可能仍然按旧维度存在,建议为新模型创建新知识库。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="space-y-2">
-          <Label>预设</Label>
-          <Select onValueChange={applyPreset}>
-            <SelectTrigger>
-              <SelectValue placeholder="选择一个预设快速填写" />
-            </SelectTrigger>
-            <SelectContent>
-              {EMBED_PRESETS.map((p) => (
-                <SelectItem key={p.label} value={p.label}>
-                  {p.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label>provider</Label>
-            <Select
-              value={v.provider}
-              onValueChange={(x) => setV({ ...v, provider: x as any })}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="openai">openai 兼容端</SelectItem>
-                <SelectItem value="mock">mock</SelectItem>
-              </SelectContent>
-            </Select>
+    <Card className="overflow-hidden">
+      <CardHeader className="border-b">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle className="text-base">Embedding（向量化）</CardTitle>
+            <CardDescription>用于知识库入库和检索。切换维度后建议重建对应知识库向量。</CardDescription>
           </div>
-          <Field
-            label="model"
-            value={v.model}
-            onChange={(x) => setV({ ...v, model: x })}
-          />
-          <Field
-            label="base_url"
-            value={v.base_url}
-            onChange={(x) => setV({ ...v, base_url: x })}
-            placeholder="https://api.openai.com/v1"
-            full
-          />
-          <Field
-            label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 key）" : ""}`}
-            value={v.api_key}
-            onChange={(x) => setV({ ...v, api_key: x })}
-            placeholder={hasSavedKey ? "已配置 ✓ — 留空则保持，填写则覆盖" : "sk-..."}
-            type="password"
-            full
-          />
-          <Field
-            label="dim"
-            value={String(v.dim)}
-            onChange={(x) => setV({ ...v, dim: Number(x) })}
-            type="number"
-          />
+          <Button variant="outline" onClick={() => setAddOpen(true)}>
+            <Plus className="h-4 w-4" /> 新增向量模型
+          </Button>
         </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="grid min-h-[360px] lg:grid-cols-[280px_minmax(0,1fr)]">
+          <div className="border-b bg-muted/20 p-4 lg:border-b-0 lg:border-r">
+            <div className="space-y-4">
+              <ModelRoleSelect
+                label="当前使用"
+                value={v.active_profile || ""}
+                profiles={profiles}
+                onChange={(id) => {
+                  setV({ ...v, active_profile: id });
+                  setEditingId(id);
+                }}
+              />
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>模型列表</Label>
+                  <Badge variant="secondary">{profiles.length}</Badge>
+                </div>
+                <ProfileList
+                  profiles={profiles}
+                  activeId={active?.id}
+                  mainId={v.active_profile}
+                  onSelect={setEditingId}
+                />
+                <Button
+                  variant="outline"
+                  className="w-full text-destructive hover:text-destructive"
+                  onClick={removeActive}
+                  disabled={profiles.length <= 1}
+                >
+                  <Trash2 className="h-4 w-4" /> 删除当前模型
+                </Button>
+              </div>
+            </div>
+          </div>
 
-        <ActionRow
-          probe={probe}
-          probing={probing}
-          busy={busy}
-          onTest={test}
-          onSave={save}
-        />
+          <div className="space-y-5 p-4">
+            <PresetSelect label="套用预设到当前模型" presets={EMBED_PRESETS} onApply={applyPreset} />
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="名称" value={active?.name || ""} onChange={(x) => patchActive({ name: x })} />
+              <ProviderSelect value={active?.provider} onChange={(x) => patchActive({ provider: x as any })} />
+              <Field label="model" value={active?.model || ""} onChange={(x) => patchActive({ model: x })} />
+              <Field
+                label="dim"
+                value={String(active?.dim ?? 1536)}
+                onChange={(x) => patchActive({ dim: Number(x) })}
+                type="number"
+              />
+              <Field
+                label="base_url"
+                value={active?.base_url || ""}
+                onChange={(x) => patchActive({ base_url: x })}
+                placeholder="https://api.openai.com/v1"
+                full
+              />
+              <Field
+                label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 key）" : ""}`}
+                value={active?.api_key === "********" ? "" : active?.api_key || ""}
+                onChange={(x) => patchActive({ api_key: x })}
+                placeholder={hasSavedKey ? "已配置，留空保持不变" : "sk-..."}
+                type="password"
+                full
+              />
+            </div>
+
+            <ActionRow probe={probe} probing={probing} busy={busy} onTest={test} onSave={save} />
+          </div>
+        </div>
       </CardContent>
+      <AddProfileDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        title="新增向量模型"
+        presets={EMBED_PRESETS}
+        defaultName="新向量模型"
+        onCreate={(profile) => addProfile(profile)}
+      />
     </Card>
   );
 }
@@ -419,29 +630,12 @@ function ParserCard({ value, onSaved }: { value: ParserCfg; onSaved: () => void 
       <CardHeader>
         <CardTitle className="text-base">文档解析（MinerU）</CardTitle>
         <CardDescription>
-          上传 PDF / Office / 图片 文档时使用的解析后端。
-          <br />
-          <span className="text-foreground">builtin</span>：仅文本 + pypdf，零依赖。
-          {" · "}
-          <span className="text-foreground">mineru_local</span>：调用本机的 <code>mineru</code> 命令（需 <code>pip install -U &quot;mineru[all]&quot;</code>）。
-          {" · "}
-          <span className="text-foreground">mineru_api</span>：调用 mineru.net 官方云端 API（需在
-          {" "}
-          <a
-            href="https://mineru.net/apiManage"
-            target="_blank"
-            rel="noreferrer"
-            className="underline"
-          >
-            mineru.net
-          </a>
-          {" "}
-          申请 Token）。
+          上传 PDF、Office、图片文档时使用。默认内置解析零依赖，复杂版面可以切到 MinerU。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-2">
-          <Label>backend</Label>
+          <Label>解析方式</Label>
           <Select
             value={v.backend}
             onValueChange={(x) => setV({ ...v, backend: x as ParserCfg["backend"] })}
@@ -460,13 +654,13 @@ function ParserCard({ value, onSaved }: { value: ParserCfg; onSaved: () => void 
         {v.backend === "mineru_local" && (
           <div className="grid gap-4 sm:grid-cols-2">
             <Field
-              label="local_cmd"
+              label="本地命令"
               value={v.local_cmd}
               onChange={(x) => setV({ ...v, local_cmd: x })}
               placeholder="mineru"
             />
             <Field
-              label="local_extra_args"
+              label="额外参数"
               value={v.local_extra_args}
               onChange={(x) => setV({ ...v, local_extra_args: x })}
               placeholder="如 -b pipeline （CPU 模式）"
@@ -477,22 +671,22 @@ function ParserCard({ value, onSaved }: { value: ParserCfg; onSaved: () => void 
         {v.backend === "mineru_api" && (
           <div className="grid gap-4 sm:grid-cols-2">
             <Field
-              label="api_base"
+              label="API 地址"
               value={v.api_base}
               onChange={(x) => setV({ ...v, api_base: x })}
               placeholder="https://mineru.net/api/v4"
               full
             />
             <Field
-              label={`api_key${hasSavedKey ? "（留空 = 使用已保存的 token）" : ""}`}
+              label={`API Token${hasSavedKey ? "（留空 = 使用已保存的 token）" : ""}`}
               value={v.api_key}
               onChange={(x) => setV({ ...v, api_key: x })}
-              placeholder={hasSavedKey ? "已配置 ✓ — 留空则保持，填写则覆盖" : "粘贴 Bearer Token"}
+              placeholder={hasSavedKey ? "已配置，留空保持不变" : "粘贴 Bearer Token"}
               type="password"
               full
             />
             <div className="space-y-2">
-              <Label>model_version</Label>
+              <Label>模型版本</Label>
               <Select
                 value={v.model_version}
                 onValueChange={(x) =>
@@ -543,27 +737,29 @@ function RetrievalCard({ value, onSaved }: { value: RetrievalCfg; onSaved: () =>
       <CardHeader>
         <CardTitle className="text-base">检索参数</CardTitle>
         <CardDescription>
-          mock embedding 因为只是字符 bigram 哈希,score 上限大约 0.2; 真实 embedding 推荐
-          min_score = 0.5 起步。
+          控制知识库每次召回多少片段，以及低相关度内容是否进入回答上下文。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-4 sm:grid-cols-2">
           <Field
-            label="top_k"
+            label="召回片段数"
             value={String(v.top_k)}
             onChange={(x) => setV({ ...v, top_k: Number(x) })}
             type="number"
           />
           <Field
-            label="min_score"
+            label="最低相关分"
             value={String(v.min_score)}
             onChange={(x) => setV({ ...v, min_score: Number(x) })}
             type="number"
           />
         </div>
-        <Button onClick={save} disabled={busy}>
-          <Save className="h-4 w-4" /> 保存
+        <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+          Mock 向量模型的分数通常偏低；真实 embedding 一般可以从 0.5 附近开始调。
+        </div>
+        <Button onClick={save} disabled={busy} className="w-full sm:w-auto">
+          <Save className="h-4 w-4" /> 保存检索参数
         </Button>
       </CardContent>
     </Card>
@@ -590,32 +786,32 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
       <CardHeader>
         <CardTitle className="text-base">AI 行为</CardTitle>
         <CardDescription>
-          system prompt + 置信度阈值（混合模式下低于此值会转人工建议）+ 历史窗口大小 + 单次回复 token 上限。
+          控制客服助手的回复风格、置信度门槛、历史上下文窗口和智能体步数。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-4 sm:grid-cols-3">
           <Field
-            label="confidence_threshold"
+            label="转人工阈值"
             value={String(v.confidence_threshold)}
             onChange={(x) => setV({ ...v, confidence_threshold: Number(x) })}
             type="number"
           />
           <Field
-            label="context_window"
+            label="历史消息数"
             value={String(v.context_window)}
             onChange={(x) => setV({ ...v, context_window: Number(x) })}
             type="number"
           />
           <Field
-            label="max_tokens"
+            label="回复 token 上限"
             value={String(v.max_tokens)}
             onChange={(x) => setV({ ...v, max_tokens: Number(x) })}
             type="number"
           />
         </div>
         <div className="space-y-2">
-          <Label>default_prompt</Label>
+          <Label>默认系统提示词</Label>
           <Textarea
             value={v.default_prompt}
             onChange={(e) => setV({ ...v, default_prompt: e.target.value })}
@@ -633,7 +829,7 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
             <span>启用 ReAct 智能体（可调用 kb_search / 技能 / MCP 工具）</span>
           </label>
           <div className="flex items-center gap-2">
-            <Label htmlFor="ams" className="m-0">agent_max_steps</Label>
+            <Label htmlFor="ams" className="m-0">最多推理步数</Label>
             <Input
               id="ams"
               type="number"
@@ -643,8 +839,8 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
             />
           </div>
         </div>
-        <Button onClick={save} disabled={busy}>
-          <Save className="h-4 w-4" /> 保存
+        <Button onClick={save} disabled={busy} className="w-full sm:w-auto">
+          <Save className="h-4 w-4" /> 保存 AI 行为
         </Button>
       </CardContent>
     </Card>
@@ -675,6 +871,263 @@ function InfraCard({ value }: { value: InfraCfg }) {
       </CardContent>
     </Card>
   );
+}
+
+function StatusLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[56px_minmax(0,1fr)] gap-2">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="truncate font-medium">{value}</span>
+    </div>
+  );
+}
+
+function ModelRoleSelect({
+  label,
+  value,
+  profiles,
+  allowNone,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  profiles: ModelProfile[];
+  allowNone?: boolean;
+  onChange: (id: string) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <Label>{label}</Label>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger className="bg-background">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {allowNone && <SelectItem value="__none">不启用</SelectItem>}
+          {profiles.map((p) => (
+            <SelectItem key={p.id} value={p.id}>
+              {p.name || p.id}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function ProfileList({
+  profiles,
+  activeId,
+  mainId,
+  fallbackId,
+  onSelect,
+}: {
+  profiles: ModelProfile[];
+  activeId?: string;
+  mainId?: string;
+  fallbackId?: string;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="max-h-[320px] space-y-1 overflow-auto pr-1">
+      {profiles.map((p) => {
+        const selected = p.id === activeId;
+        return (
+          <button
+            key={p.id}
+            type="button"
+            onClick={() => onSelect(p.id)}
+            className={cn(
+              "w-full rounded-md border px-3 py-2 text-left transition-colors",
+              selected ? "border-primary bg-primary/5" : "bg-background hover:bg-muted",
+            )}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="min-w-0 truncate text-sm font-medium">{p.name || p.id}</span>
+              <span className="flex shrink-0 gap-1">
+                {p.id === mainId && <Badge className="h-5 px-1.5 text-[10px]">主</Badge>}
+                {p.id === fallbackId && <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">兜底</Badge>}
+              </span>
+            </div>
+            <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+              <span className="truncate font-mono">{p.model || "未填写 model"}</span>
+              {typeof p.dim === "number" && <span className="shrink-0">dim {p.dim}</span>}
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ProviderSelect({
+  value,
+  onChange,
+}: {
+  value?: "mock" | "openai";
+  onChange: (value: "mock" | "openai") => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <Label>provider</Label>
+      <Select value={value} onValueChange={(x) => onChange(x as "mock" | "openai")}>
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="openai">OpenAI 兼容端</SelectItem>
+          <SelectItem value="mock">mock</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function PresetSelect({
+  label,
+  presets,
+  value,
+  onApply,
+}: {
+  label: string;
+  presets: { label: string }[];
+  value?: string;
+  onApply: (label: string) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <Label>{label}</Label>
+      <Select value={value} onValueChange={onApply}>
+        <SelectTrigger>
+          <SelectValue placeholder="选择一个预设快速填写" />
+        </SelectTrigger>
+        <SelectContent>
+          {presets.map((p) => (
+            <SelectItem key={p.label} value={p.label}>
+              {p.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function AddProfileDialog({
+  open,
+  onOpenChange,
+  title,
+  presets,
+  defaultName,
+  onCreate,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  presets: ({ label: string; provider: "openai" | "mock"; model: string; base_url: string; dim?: number })[];
+  defaultName: string;
+  onCreate: (profile: Partial<ModelProfile>) => void;
+}) {
+  const [name, setName] = useState(defaultName);
+  const [presetLabel, setPresetLabel] = useState(presets[0]?.label || "");
+  const preset = useMemo(
+    () => presets.find((p) => p.label === presetLabel) || presets[0],
+    [presetLabel, presets],
+  );
+
+  function create() {
+    if (!preset) return;
+    onCreate({
+      name: name.trim() || defaultName,
+      provider: preset.provider,
+      model: preset.model,
+      base_url: preset.base_url,
+      dim: preset.dim,
+    });
+    setName(defaultName);
+    setPresetLabel(presets[0]?.label || "");
+    onOpenChange(false);
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <Field label="名称" value={name} onChange={setName} />
+          <PresetSelect label="从预设开始" presets={presets} value={presetLabel} onApply={setPresetLabel} />
+          {preset && (
+            <div className="rounded-md border bg-muted/30 p-3 text-xs">
+              <StatusLine label="provider" value={preset.provider} />
+              <StatusLine label="model" value={preset.model} />
+              <StatusLine label="base" value={preset.base_url || "mock"} />
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
+          <Button onClick={create}>
+            <Plus className="h-4 w-4" /> 新增
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function normaliseLlm(value: LlmCfg): LlmCfg {
+  const profiles = (value.profiles?.length ? value.profiles : [{
+    id: value.active_profile || "default",
+    name: "默认模型",
+    provider: value.provider,
+    model: value.model,
+    api_key: value.api_key || "",
+    base_url: value.base_url,
+    temperature: value.temperature,
+    supports_vision: value.supports_vision,
+  }]).map((p) => ({ ...p, api_key: p.api_key === "********" ? "********" : "" }));
+  return {
+    ...value,
+    api_key: "",
+    profiles,
+    active_profile: value.active_profile || profiles[0].id,
+    fallback_profile: value.fallback_profile || "",
+    fallback_enabled: Boolean(value.fallback_enabled && value.fallback_profile),
+  };
+}
+
+function normaliseEmbed(value: EmbedCfg): EmbedCfg {
+  const profiles = (value.profiles?.length ? value.profiles : [{
+    id: value.active_profile || "default",
+    name: "默认向量模型",
+    provider: value.provider,
+    model: value.model,
+    api_key: value.api_key || "",
+    base_url: value.base_url,
+    dim: value.dim,
+  }]).map((p) => ({ ...p, api_key: p.api_key === "********" ? "********" : "" }));
+  return {
+    ...value,
+    api_key: "",
+    profiles,
+    active_profile: value.active_profile || profiles[0].id,
+  };
+}
+
+function updateProfile<T extends { profiles?: ModelProfile[] }>(
+  value: T,
+  setValue: (v: T) => void,
+  profileId: string | undefined,
+  patch: Partial<ModelProfile>,
+) {
+  const profiles = value.profiles || [];
+  const targetId = profileId || profiles[0]?.id;
+  setValue({
+    ...value,
+    profiles: profiles.map((p) => p.id === targetId ? { ...p, ...patch } : p),
+  });
 }
 
 function ActionRow({

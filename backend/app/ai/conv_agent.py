@@ -102,6 +102,7 @@ async def run_conv_agent(
     history,  # list[Message]
     unreplied_chain: list[str] | None = None,
     provider,
+    fallback_provider=None,
     temperature: float = 0.3,
     max_tokens: int = 8192,
     max_steps: int = 5,
@@ -181,15 +182,65 @@ async def run_conv_agent(
             trace.append({"step": step, "error": f"llm_timeout_{int(_STEP_LLM_TIMEOUT_SEC)}s"})
             break
         except Exception as e:  # noqa: BLE001
-            log.exception("agent LLM call failed")
-            trace.append({"step": step, "error": f"llm_error: {e}"})
-            break
+            if fallback_provider is None:
+                log.exception("agent LLM call failed")
+                trace.append({"step": step, "error": f"llm_error: {e}"})
+                break
+            log.warning("[agent] primary LLM failed, trying fallback: %s", e)
+            try:
+                result = await asyncio.wait_for(
+                    fallback_provider.chat(msgs, temperature=agent_temp, max_tokens=max_tokens),
+                    timeout=_STEP_LLM_TIMEOUT_SEC,
+                )
+            except Exception as fallback_e:  # noqa: BLE001
+                log.exception("agent fallback LLM call failed")
+                trace.append({"step": step, "error": f"llm_error: {e}; fallback_error: {fallback_e}"})
+                break
         log.info(
             "[agent] step %d LLM ok (%dms, %d tokens out approx)",
             step, int((time.monotonic() - t_llm) * 1000), len(result.text or "") // 4,
         )
         last_model = result.model
         decision = _parse_json(result.text)
+        if decision.get("_parse_error"):
+            if fallback_provider is not None and provider is not fallback_provider:
+                try:
+                    fallback_result = await asyncio.wait_for(
+                        fallback_provider.chat(msgs, temperature=agent_temp, max_tokens=max_tokens),
+                        timeout=_STEP_LLM_TIMEOUT_SEC,
+                    )
+                    fallback_decision = _parse_json(fallback_result.text)
+                    if not fallback_decision.get("_parse_error"):
+                        log.info("[agent] fallback model repaired bad_json at step %d", step)
+                        result = fallback_result
+                        decision = fallback_decision
+                    else:
+                        log.warning("[agent] fallback also bad_json raw=%r", fallback_result.text[:500])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[agent] fallback retry after bad_json failed: %s", e)
+            if not decision.get("_parse_error"):
+                pass
+            else:
+                raw = str(decision.get("raw") or "").strip()
+                log.warning("[agent] step %d bad_json raw=%r", step, raw[:500])
+                trace.append({"step": step, "error": "bad_json", "raw": raw[:1000]})
+                if ctx.scratch.get("kb_hit_ids") and len(raw) >= 20 and not raw.lstrip().startswith("{"):
+                    final_text = raw
+                    final_confidence = 0.7
+                    break
+                scratch_for_step.append(
+                    ChatMessage(role="assistant", content=raw[:1200] or "（空响应）")
+                )
+                scratch_for_step.append(
+                    ChatMessage(
+                        role="user",
+                        content=(
+                            "[observation]\nERROR: 你的上一条回复不是工具 JSON。"
+                            "请严格输出 JSON，并调用 final_reply 或其它可用工具。"
+                        ),
+                    )
+                )
+                continue
         tool_name = (decision.get("tool") or "").strip()
         thought = (decision.get("thought") or "").strip()
         args = decision.get("args") or {}
@@ -285,8 +336,10 @@ def _parse_json(s: str) -> dict[str, Any]:
             pass
     return {
         "thought": "LLM 输出无法解析为 JSON",
-        "tool": "final_reply",
-        "args": {"text": "抱歉，我这边出了点小问题。请稍后再试一次。", "confidence": 0.2},
+        "tool": "__parse_error__",
+        "args": {},
+        "_parse_error": True,
+        "raw": s,
     }
 
 

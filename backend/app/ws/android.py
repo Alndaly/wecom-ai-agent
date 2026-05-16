@@ -98,9 +98,10 @@ async def _handle_event(robot: Robot, data: dict) -> None:
     if event == "message.received":
         evt = AndroidMessageReceived.model_validate(payload)
         log.info(
-            "android inbound robot=%s contact=%s content=%r",
+            "android message robot=%s contact=%s sender_type=%s content=%r",
             robot.robot_id,
             evt.contact.external_id,
+            evt.sender_type,
             (evt.content or "")[:80],
         )
         async with SessionLocal() as db:

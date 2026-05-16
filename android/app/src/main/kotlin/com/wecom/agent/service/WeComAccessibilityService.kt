@@ -18,7 +18,7 @@ import kotlin.coroutines.resume
  *  1. Track current page so [WeComAutomator] / the foreground service know
  *     whether we're on HOME / CHAT / SEARCH / ...
  *  2. When the user is on a ChatActivity, watch the message list and forward
- *     newly-appeared inbound bubbles to a registered callback. This is the
+ *     newly-appeared bubbles to a registered callback. This is the
  *     "while-you-watch" channel; the always-on channel is
  *     [MessageNotificationListener].
  *
@@ -30,7 +30,7 @@ class WeComAccessibilityService : AccessibilityService() {
             private set
 
         /** Set by AgentForegroundService; called for every fresh visible message bubble. */
-        @Volatile var onChatMessage: ((sender: String, content: String) -> Unit)? = null
+        @Volatile var onChatMessage: ((sender: String, content: String, fromSelf: Boolean) -> Unit)? = null
     }
 
     private val tag = "WeComA11y"
@@ -43,8 +43,10 @@ class WeComAccessibilityService : AccessibilityService() {
     @Volatile var currentChatTitle: String? = null
         private set
 
-    /** Dedupe per-session: we never re-fire the same (sender, content) within a short window. */
-    private val recent = ArrayDeque<Triple<String, String, Long>>()
+    /** Dedupe per-session: we never re-fire the same visible bubble within a short window. */
+    private data class RecentBubble(val chat: String, val content: String, val fromSelf: Boolean, val at: Long)
+    private data class ChatBubble(val content: String, val fromSelf: Boolean, val bounds: android.graphics.Rect)
+    private val recent = ArrayDeque<RecentBubble>()
     private val recentTtlMs = 10 * 60_000L
     private var baselineChatTitle: String? = null
     private var baselineReady = false
@@ -53,6 +55,7 @@ class WeComAccessibilityService : AccessibilityService() {
      *  don't re-fire all history on startup. */
     private val homeListBaseline = HashMap<String, String>()
     private var homeBaselineReady = false
+    private var lastChatHarvestAt = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -63,21 +66,33 @@ class WeComAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> updatePage(event)
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                // Dispatch by *current root content* rather than the cached
-                // `currentPage`. WeCom switches tabs inside a single activity,
-                // so WINDOW_STATE_CHANGED doesn't fire and the cache stays stale
-                // (often UNKNOWN), which used to suppress harvest entirely.
-                val root = rootInActiveWindow ?: return
-                if (root.packageName?.toString() != "com.tencent.wework") return
-                if (isMessagesListVisible(root)) {
-                    maybeHarvestHomeList()
-                } else if (looksLikeChatPage(root)) {
-                    maybeHarvestChat()
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                updatePage(event)
+                rootInActiveWindow?.let { root ->
+                    if (root.packageName?.toString() == "com.tencent.wework" && looksLikeChatPage(root)) {
+                        maybeHarvestChat(reason = "window_state")
+                    }
                 }
             }
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                dispatchVisibleRootHarvest("content_changed")
+            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> dispatchVisibleRootHarvest("view_event")
             else -> Unit
+        }
+    }
+
+    private fun dispatchVisibleRootHarvest(reason: String) {
+        // Dispatch by *current root content* rather than the cached
+        // `currentPage`. WeCom switches tabs inside a single activity, so
+        // WINDOW_STATE_CHANGED doesn't always fire and the cache can be stale.
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() != "com.tencent.wework") return
+        if (isMessagesListVisible(root)) {
+            maybeHarvestHomeList()
+        } else if (looksLikeChatPage(root)) {
+            maybeHarvestChat(reason = reason)
         }
     }
 
@@ -299,67 +314,120 @@ class WeComAccessibilityService : AccessibilityService() {
 
     // -------------------------------------------------------- harvest chat
     /** Walk the chat list and emit any unseen inbound bubbles. */
-    private fun maybeHarvestChat() {
+    fun forceHarvestCurrentChat() {
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() != "com.tencent.wework") return
+        if (looksLikeChatPage(root)) maybeHarvestChat(reason = "force")
+    }
+
+    private fun maybeHarvestChat(reason: String) {
         val cb = onChatMessage ?: return
         val root = rootInActiveWindow ?: return
-        val title = currentChatTitle ?: return
+        val title = currentChatTitle ?: inferChatTitle() ?: "当前聊天"
+        currentChatTitle = title
 
-        // Heuristic for an inbound bubble: a TextView whose text is non-empty,
-        // sits in the left-half of the screen, and whose nearest scrollable
-        // ancestor is the message list. WeCom puts outbound on the right.
+        // Heuristic for message bubbles: collect visible TextView bubbles in
+        // the message area, then classify left/right alignment. Customer
+        // messages trigger AI downstream; self messages are persisted only.
         val screenWidth = resources.displayMetrics.widthPixels
         val now = System.currentTimeMillis()
+        if (now - lastChatHarvestAt < 350) return
+        lastChatHarvestAt = now
         gc(now)
 
-        val candidates = mutableListOf<String>()
+        val candidates = mutableListOf<ChatBubble>()
         fun walk(n: AccessibilityNodeInfo?) {
             n ?: return
             val cls = n.className?.toString() ?: ""
             if (cls.contains("TextView", true) && !n.text.isNullOrBlank()) {
-                val r = android.graphics.Rect()
-                n.getBoundsInScreen(r)
                 val content = n.text.toString().trim()
-                if (isInboundBubbleCandidate(n, r, screenWidth, content)) {
-                    candidates.add(content)
-                }
+                classifyMessageBubble(n, screenWidth, content)?.let { candidates.add(it) }
             }
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(root)
 
         if (!baselineReady || baselineChatTitle != title) {
-            for (content in candidates) {
-                recent.addLast(Triple(title, content, now))
+            val shouldEmitLatest = reason != "force" && reason != "window_state" && candidates.isNotEmpty()
+            val baselineOnly = if (shouldEmitLatest) candidates.dropLast(1) else candidates
+            for (bubble in baselineOnly) {
+                recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now))
             }
             baselineChatTitle = title
             baselineReady = true
-            Log.d(tag, "baseline chat=$title candidates=${candidates.size}")
+            if (shouldEmitLatest) {
+                val latest = candidates.last()
+                if (!alreadySeen(title, latest)) {
+                    recent.addLast(RecentBubble(title, latest.content, latest.fromSelf, now))
+                    cb(title, latest.content, latest.fromSelf)
+                    Log.d(tag, "harvest first chat=$title self=${latest.fromSelf} reason=$reason content=${latest.content.take(60)}")
+                }
+            }
+            Log.d(tag, "baseline chat=$title candidates=${candidates.size} emitLatest=$shouldEmitLatest reason=$reason")
             return
         }
 
-        for (content in candidates) {
-            if (alreadySeen(title, content)) continue
-            recent.addLast(Triple(title, content, now))
-            cb(title, content)
-            Log.d(tag, "harvest chat=$title content=${content.take(60)}")
+        var emitted = 0
+        for (bubble in candidates) {
+            if (alreadySeen(title, bubble)) continue
+            recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now))
+            cb(title, bubble.content, bubble.fromSelf)
+            emitted++
+            Log.d(tag, "harvest chat=$title self=${bubble.fromSelf} reason=$reason content=${bubble.content.take(60)}")
+        }
+        if (emitted == 0) {
+            Log.d(tag, "chat scan no new title=$title candidates=${candidates.size} reason=$reason")
         }
     }
 
-    private fun isInboundBubbleCandidate(
+    private fun classifyMessageBubble(
         node: AccessibilityNodeInfo,
-        bounds: android.graphics.Rect,
         screenWidth: Int,
         content: String,
-    ): Boolean {
-        // header zone excluded
+    ): ChatBubble? {
+        if (content.isEmpty() || content.length > 2000) return null
+        if (content == currentChatTitle) return null
+
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+        if (!isInMessageArea(bounds)) return null
+
+        val rects = mutableListOf<android.graphics.Rect>()
+        rects.add(android.graphics.Rect(bounds))
+        var p = node.parent
+        var depth = 0
+        while (p != null && depth < 5) {
+            val r = android.graphics.Rect()
+            p.getBoundsInScreen(r)
+            if (isInMessageArea(r)) rects.add(r)
+            p = p.parent
+            depth += 1
+        }
+
+        val bubbleRect = rects
+            .filter { it.width() in 24 until (screenWidth * 0.88f).toInt() }
+            .maxByOrNull { it.width() }
+            ?: bounds
+        val center = bubbleRect.centerX()
+        val fromSelf =
+            bubbleRect.left > screenWidth * 0.35f ||
+            center > screenWidth * 0.58f ||
+            bubbleRect.right > screenWidth * 0.82f
+        val looksInbound =
+            bubbleRect.right < screenWidth * 0.78f ||
+            center < screenWidth * 0.48f ||
+            bounds.left < screenWidth * 0.42f
+        if (!fromSelf && !looksInbound) {
+            Log.d(tag, "skip ambiguous bubble bounds=$bubbleRect text=${content.take(40)}")
+            return null
+        }
+        return ChatBubble(content = content, fromSelf = fromSelf, bounds = bubbleRect)
+    }
+
+    private fun isInMessageArea(bounds: android.graphics.Rect): Boolean {
+        if (bounds.isEmpty) return false
         if (bounds.top < 200) return false
-        // input bar (bottom) excluded
         if (bounds.bottom > resources.displayMetrics.heightPixels - 120) return false
-        // outbound bubble (right half) excluded
-        if (bounds.left > screenWidth / 2) return false
-        if (content.isEmpty() || content.length > 2000) return false
-        if (content == currentChatTitle) return false
-        if (!hasScrollableAncestor(node)) return false
         return true
     }
 
@@ -374,15 +442,22 @@ class WeComAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun alreadySeen(sender: String, bubble: ChatBubble): Boolean {
+        for (item in recent) {
+            if (item.chat == sender && item.content == bubble.content && item.fromSelf == bubble.fromSelf) return true
+        }
+        return false
+    }
+
     private fun alreadySeen(sender: String, content: String): Boolean {
-        for ((s, c) in recent) {
-            if (s == sender && c == content) return true
+        for (item in recent) {
+            if (item.chat == sender && item.content == content && !item.fromSelf) return true
         }
         return false
     }
 
     private fun gc(now: Long) {
-        while (recent.isNotEmpty() && now - recent.first().third > recentTtlMs) {
+        while (recent.isNotEmpty() && now - recent.first().at > recentTtlMs) {
             recent.removeFirst()
         }
     }
@@ -448,8 +523,8 @@ class WeComAccessibilityService : AccessibilityService() {
                 if (row.preview.isEmpty()) continue
                 if (isOutboundPreview(row.preview)) continue
                 if (alreadySeen(row.name, row.preview)) continue
-                recent.addLast(Triple(row.name, row.preview, now))
-                cb(row.name, row.preview)
+                recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now))
+                cb(row.name, row.preview, false)
                 emittedUnread++
             }
             homeBaselineReady = true
@@ -465,8 +540,8 @@ class WeComAccessibilityService : AccessibilityService() {
             if (!changed && !row.hasUnread) continue
             homeListBaseline[row.name] = row.preview
             if (alreadySeen(row.name, row.preview)) continue
-            recent.addLast(Triple(row.name, row.preview, now))
-            cb(row.name, row.preview)
+            recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now))
+            cb(row.name, row.preview, false)
             Log.d(
                 tag,
                 "home harvest name=${row.name} unread=${row.hasUnread} changed=$changed preview=${row.preview.take(60)}",

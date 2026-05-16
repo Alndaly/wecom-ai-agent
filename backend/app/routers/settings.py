@@ -45,6 +45,15 @@ def _mask_api_key(d: dict) -> dict:
     out = dict(d)
     if "api_key" in out:
         out["api_key"] = _MASK if out["api_key"] else ""
+    if isinstance(out.get("profiles"), list):
+        masked = []
+        for profile in out["profiles"]:
+            if not isinstance(profile, dict):
+                continue
+            p = dict(profile)
+            p["api_key"] = _MASK if p.get("api_key") else ""
+            masked.append(p)
+        out["profiles"] = masked
     return out
 
 
@@ -64,6 +73,10 @@ class LLMIn(BaseModel):
     # Tick this when the configured model accepts inline images (gpt-4o / qwen-vl
     # / glm-4v). The ReAct device agent attaches the current screenshot when on.
     supports_vision: bool = False
+    profiles: list[dict[str, Any]] = Field(default_factory=list)
+    active_profile: str = "default"
+    fallback_profile: str = ""
+    fallback_enabled: bool = False
 
 
 class EmbeddingIn(BaseModel):
@@ -72,6 +85,8 @@ class EmbeddingIn(BaseModel):
     api_key: str = ""
     base_url: str = ""
     dim: int = Field(default=1536, ge=16, le=8192)
+    profiles: list[dict[str, Any]] = Field(default_factory=list)
+    active_profile: str = "default"
 
 
 class RetrievalIn(BaseModel):
@@ -136,6 +151,26 @@ async def _upsert(
         and _is_placeholder(payload["api_key"])
     ):
         payload = {k: v for k, v in payload.items() if k != "api_key"}
+    if treat_placeholder_as_keep and isinstance(payload.get("profiles"), list):
+        saved = await settings_service.get(db, team_id, scope)
+        saved_profiles = {
+            str(p.get("id")): p
+            for p in (saved.get("profiles") or [])
+            if isinstance(p, dict) and p.get("id")
+        }
+        profiles = []
+        for profile in payload["profiles"]:
+            if not isinstance(profile, dict):
+                continue
+            p = dict(profile)
+            old = saved_profiles.get(str(p.get("id")))
+            if _is_placeholder(p.get("api_key")):
+                if old and old.get("api_key"):
+                    p["api_key"] = old["api_key"]
+                else:
+                    p.pop("api_key", None)
+            profiles.append(p)
+        payload = {**payload, "profiles": profiles}
     return await settings_service.upsert(db, team_id, scope, payload)
 
 
@@ -204,6 +239,15 @@ def _merge_for_test(saved: dict, body_payload: dict | None) -> dict:
         if k == "api_key" and _is_placeholder(v):
             continue  # keep saved api_key
         cfg[k] = v
+    if isinstance(cfg.get("profiles"), list):
+        active = str(cfg.get("active_profile") or "")
+        for profile in cfg["profiles"]:
+            if isinstance(profile, dict) and str(profile.get("id") or "") == active:
+                for pk, pv in profile.items():
+                    if pk == "api_key" and _is_placeholder(pv):
+                        continue
+                    cfg[pk] = pv
+                break
     return cfg
 
 

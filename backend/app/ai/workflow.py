@@ -37,7 +37,7 @@ from app.models import (
 )
 from app.services import settings_service
 
-from .providers import ChatMessage, get_provider
+from .providers import ChatMessage, get_fallback_provider, get_provider
 
 log = logging.getLogger(__name__)
 
@@ -219,13 +219,14 @@ async def _retrieve(db: AsyncSession, team_id: int, query: str) -> RetrievalResu
 async def _generate(state: AIState, db: AsyncSession) -> Decision:
     team_id = state.conv.team_id
     provider = await get_provider(db, team_id)
+    fallback_provider = await get_fallback_provider(db, team_id)
     llm_cfg = await settings_service.get(db, team_id, "llm")
     ai_cfg = await settings_service.get(db, team_id, "ai")
 
     # ReAct agent path: lets the model call tools (kb_search, set_profile_field,
     # MCP, user skills) before producing the final reply.
     if _agent_enabled(ai_cfg):
-        return await _generate_via_agent(state, db, provider, llm_cfg, ai_cfg)
+        return await _generate_via_agent(state, db, provider, fallback_provider, llm_cfg, ai_cfg)
 
     system_parts = [state.prompt]
     if state.memory_summary:
@@ -248,14 +249,34 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
             max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
         )
     except Exception as e:
-        log.exception("LLM error")
-        return Decision(
-            action="suggest",
-            text=None,
-            confidence=0.0,
-            trace_id=state.trace_id,
-            reason=f"llm_error: {e}",
+        if fallback_provider is None:
+            log.exception("LLM error")
+            return Decision(
+                action="suggest",
+                text=None,
+                confidence=0.0,
+                trace_id=state.trace_id,
+                reason=f"llm_error: {e}",
+            )
+        log.warning("primary LLM error, trying fallback: %s", e)
+        result = await fallback_provider.chat(
+            msgs,
+            temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
+            max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
         )
+
+    if fallback_provider is not None and _llm_result_insufficient(result.text, result.confidence):
+        log.info("primary LLM looks insufficient, trying fallback model=%s", getattr(fallback_provider, "model", "?"))
+        try:
+            fallback_result = await fallback_provider.chat(
+                msgs,
+                temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
+                max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
+            )
+            if not _llm_result_insufficient(fallback_result.text, fallback_result.confidence):
+                result = fallback_result
+        except Exception:
+            log.exception("fallback LLM failed; keeping primary result")
 
     # boost confidence a notch if KB clearly contributed
     conf = result.confidence
@@ -284,8 +305,23 @@ def _agent_enabled(ai_cfg: dict) -> bool:
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _llm_result_insufficient(text: str, confidence: float) -> bool:
+    body = (text or "").strip()
+    if not body:
+        return True
+    if confidence < 0.45:
+        return True
+    weak_markers = (
+        "不知道", "不清楚", "无法回答", "不能回答", "无法确定", "没有相关信息",
+        "知识库中没有", "稍后再试", "出了点小问题", "抱歉，我这边",
+    )
+    if len(body) < 20 and any(m in body for m in weak_markers):
+        return True
+    return any(m in body for m in weak_markers[:8]) and len(body) < 120
+
+
 async def _generate_via_agent(
-    state: AIState, db: AsyncSession, provider, llm_cfg: dict, ai_cfg: dict
+    state: AIState, db: AsyncSession, provider, fallback_provider, llm_cfg: dict, ai_cfg: dict
 ) -> Decision:
     from .conv_agent import run_conv_agent
 
@@ -314,6 +350,7 @@ async def _generate_via_agent(
         history=state.history,
         unreplied_chain=chain_texts,
         provider=provider,
+        fallback_provider=fallback_provider,
         temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
         max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
         max_steps=int(ai_cfg.get("agent_max_steps") or settings.agent_max_steps),

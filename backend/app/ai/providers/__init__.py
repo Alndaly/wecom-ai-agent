@@ -9,6 +9,8 @@ provider — no backend restart required.
 """
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import settings_service
@@ -17,10 +19,19 @@ from .base import ChatMessage, LLMProvider, LLMResult
 from .mock import MockProvider
 from .openai_compatible import OpenAICompatibleProvider
 
-__all__ = ["ChatMessage", "LLMProvider", "LLMResult", "get_provider", "build_provider"]
+__all__ = [
+    "ChatMessage",
+    "LLMProvider",
+    "LLMResult",
+    "get_provider",
+    "get_fallback_provider",
+    "build_provider",
+]
 
-# (team_id, version) → provider
-_cache: dict[tuple[int, int], LLMProvider] = {}
+log = logging.getLogger(__name__)
+
+# (team_id, version, profile_id) → provider
+_cache: dict[tuple[int, int, str], LLMProvider] = {}
 
 
 def build_provider(cfg: dict) -> LLMProvider:
@@ -44,13 +55,30 @@ def build_provider(cfg: dict) -> LLMProvider:
 
 async def get_provider(db: AsyncSession, team_id: int) -> LLMProvider:
     cfg = await settings_service.get(db, team_id, "llm")
+    return await get_profile_provider(db, team_id, str(cfg.get("active_profile") or ""))
+
+
+async def get_fallback_provider(db: AsyncSession, team_id: int) -> LLMProvider | None:
+    cfg = await settings_service.get(db, team_id, "llm")
+    if not cfg.get("fallback_enabled"):
+        return None
+    fallback_id = str(cfg.get("fallback_profile") or "")
+    active_id = str(cfg.get("active_profile") or "")
+    if not fallback_id or fallback_id == active_id:
+        return None
+    return await get_profile_provider(db, team_id, fallback_id)
+
+
+async def get_profile_provider(db: AsyncSession, team_id: int, profile_id: str) -> LLMProvider:
+    cfg = await settings_service.get_profile(db, team_id, "llm", profile_id)
     ver = await settings_service.version(db, team_id, "llm")
-    key = (team_id, ver)
+    key = (team_id, ver, str(cfg.get("active_profile") or profile_id or "default"))
     cached = _cache.get(key)
     if cached is not None:
         return cached
     inst = build_provider(cfg)
     _cache[key] = inst
+    log.info("llm provider built team=%s profile=%s provider=%s model=%s", team_id, key[2], inst.name, getattr(inst, "model", "?"))
     return inst
 
 

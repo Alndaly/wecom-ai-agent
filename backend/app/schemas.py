@@ -152,4 +152,5 @@ class AndroidMessageReceived(BaseModel):
     external_msg_id: str | None = None
     type: Literal["text"] = "text"
     content: str
+    sender_type: Literal["customer", "human"] = "customer"
     sent_at: datetime | None = None
