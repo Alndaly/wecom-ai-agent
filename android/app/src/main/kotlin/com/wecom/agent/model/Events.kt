@@ -47,6 +47,7 @@ data class UiDumpPayload(
     val nodes: List<UiNode> = emptyList(),
     val screen_width: Int? = null,
     val screen_height: Int? = null,
+    val input_panel_visible: Boolean? = null,
 )
 
 @Serializable

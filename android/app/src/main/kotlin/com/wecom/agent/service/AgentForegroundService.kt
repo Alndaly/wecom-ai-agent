@@ -261,6 +261,7 @@ class AgentForegroundService : Service() {
                 tree = result.tree,
                 screen_width = metrics.widthPixels,
                 screen_height = metrics.heightPixels,
+                input_panel_visible = svc.isInputPanelVisible(),
                 nodes = result.nodes.map { n ->
                     com.wecom.agent.model.UiNode(
                         id = n.id,
@@ -304,7 +305,13 @@ class AgentForegroundService : Service() {
                     "screen_stop" -> stopScreenStream()
                     "screenshot_once",
                     "tap_text",
+                    "tap_node",
                     "tap_xy",
+                    "double_tap_node",
+                    "double_tap_xy",
+                    "long_press_node",
+                    "long_press_xy",
+                    "drag_xy",
                     "swipe",
                     "input_text",
                     "back",
@@ -447,7 +454,7 @@ class AgentForegroundService : Service() {
                     if (svc == null) {
                         Pair(false, "无障碍未启用")
                     } else {
-                        val frame = svc.captureScreenJpegBase64(quality = 55)
+                        val frame = svc.captureScreenJpegBase64(quality = 55, allowCached = false)
                         data = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
                         Pair(frame.error == null, frame.error ?: "已截图")
                     }
@@ -457,11 +464,56 @@ class AgentForegroundService : Service() {
                     if (text.isNullOrBlank()) Pair(false, "缺少 text 参数")
                     else automator.reactTapText(text)
                 }
+                "tap_node" -> {
+                    val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    if (nodeId == null) Pair(false, "缺少 node_id")
+                    else automator.reactTapNode(nodeId, x, y)
+                }
                 "tap_xy" -> {
                     val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                     val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                     if (x == null || y == null) Pair(false, "缺少 x/y")
                     else automator.reactTapXY(x, y)
+                }
+                "double_tap_node" -> {
+                    val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    if (nodeId == null) Pair(false, "缺少 node_id")
+                    else automator.reactDoubleTapNode(nodeId, x, y)
+                }
+                "double_tap_xy" -> {
+                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    if (x == null || y == null) Pair(false, "缺少 x/y")
+                    else automator.reactDoubleTapXY(x, y)
+                }
+                "long_press_node" -> {
+                    val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
+                    if (nodeId == null) Pair(false, "缺少 node_id")
+                    else automator.reactLongPressNode(nodeId, x, y, dur)
+                }
+                "long_press_xy" -> {
+                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
+                    if (x == null || y == null) Pair(false, "缺少 x/y")
+                    else automator.reactLongPressXY(x, y, dur)
+                }
+                "drag_xy" -> {
+                    val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y1 = obj["y1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val x2 = obj["x2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val y2 = obj["y2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 450L
+                    if (x1 == null || y1 == null || x2 == null || y2 == null)
+                        Pair(false, "缺少 x1/y1/x2/y2")
+                    else automator.reactDragXY(x1, y1, x2, y2, dur)
                 }
                 "swipe" -> {
                     val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
@@ -475,10 +527,11 @@ class AgentForegroundService : Service() {
                 }
                 "input_text" -> {
                     val text = obj["text"]?.jsonPrimitive?.contentOrNull
+                    val mode = obj["mode"]?.jsonPrimitive?.contentOrNull ?: "replace"
                     if (text == null) {
                         Pair(false, "缺少 text")
                     } else {
-                        val r = automator.reactInputText(text)
+                        val r = automator.reactInputText(text, mode)
                         if (r.first) rememberAutomatedOutput(text)
                         r
                     }
@@ -536,7 +589,7 @@ class AgentForegroundService : Service() {
             client?.sendEvent("device.screen_frame", payload)
             return false
         }
-        val frame = svc.captureScreenJpegBase64(quality = 55)
+        val frame = svc.captureScreenJpegBase64(quality = 55, allowCached = true)
         val payload = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
         val ok = client?.sendEvent("device.screen_frame", payload) == true
         if (!ok) broadcastLog("屏幕帧上传失败（未连接后端）")

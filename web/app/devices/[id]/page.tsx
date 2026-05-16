@@ -79,6 +79,12 @@ export default function DeviceDetailPage() {
   const [pendingDumpRequest, setPendingDumpRequest] = useState<string | null>(null);
   const [uiDump, setUiDump] = useState<UiDump | null>(null);
   const [logs, setLogs] = useState<RobotTaskLog[]>([]);
+  const [queue, setQueue] = useState<{
+    robot_id: string;
+    running: { kind: string; task_id: number; priority: number; waited_ms: number } | null;
+    depth: number;
+    pending: { kind: string; task_id: number; priority: number; waited_ms: number }[];
+  } | null>(null);
   const [clearingLogs, setClearingLogs] = useState(false);
   const [clearLogsOpen, setClearLogsOpen] = useState(false);
   const [agentGoal, setAgentGoal] = useState("");
@@ -107,16 +113,29 @@ export default function DeviceDetailPage() {
   useEffect(() => {
     if (!Number.isFinite(id)) return;
     const loadLogs = () => {
-      // Backend returns DESC by created_at; flip to ASC so the panel reads
-      // top→bottom in execution order (observe → think → act → result).
+      // Backend returns DESC by created_at — newest first, like a chat
+      // / notification feed. We keep that order in the UI.
       api<RobotTaskLog[]>(`/robots/${id}/logs?limit=200`)
-        .then((rows) => setLogs([...rows].reverse()))
+        .then(setLogs)
         .catch(() => {});
     };
     loadLogs();
-    // WS pushes new entries in real time (see task.log handler); this poll is
-    // just a 30s safety net for missed events.
+    // WS pushes new entries in real time (see task.log handler); this poll
+    // is just a 30s safety net for missed events.
     const timer = setInterval(loadLogs, 30_000);
+    return () => clearInterval(timer);
+  }, [id]);
+
+  useEffect(() => {
+    if (!Number.isFinite(id)) return;
+    const loadQueue = () =>
+      api<NonNullable<typeof queue>>(`/robots/${id}/queue`)
+        .then(setQueue)
+        .catch(() => {});
+    loadQueue();
+    // 3s feels right — visible feedback when an operator clicks "执行" and
+    // their task moves through the queue, without hammering the API.
+    const timer = setInterval(loadQueue, 3_000);
     return () => clearInterval(timer);
   }, [id]);
 
@@ -183,7 +202,8 @@ export default function DeviceDetailPage() {
       };
       setLogs((prev) => {
         if (row.id && prev.some((p) => p.id === row.id)) return prev;
-        return [...prev, row];
+        // Newest on top — prepend.
+        return [row, ...prev];
       });
     }
     if (event === "robot.logs_cleared" && robot?.robot_id === payload.robot_id) {
@@ -369,6 +389,19 @@ export default function DeviceDetailPage() {
               <StateRow label="实时屏幕" value={streaming ? "已开启" : "未开启"} active={streaming} />
               <StateRow label="屏幕帧" value={frame ? formatFull(frame.created_at) : "等待中"} />
               <StateRow label="最近命令" value={lastCommandMessage ?? "暂无"} />
+              <StateRow
+                label="队列"
+                value={
+                  queue == null
+                    ? "—"
+                    : queue.running
+                      ? `运行中 ${queue.running.kind} #${queue.running.task_id} · 等待中 ${queue.depth}`
+                      : queue.depth > 0
+                        ? `等待中 ${queue.depth}`
+                        : "空闲"
+                }
+                active={!!queue?.running || (queue?.depth ?? 0) > 0}
+              />
             </CardContent>
           </Card>
         </aside>
@@ -687,7 +720,9 @@ function TaskLogPanel({
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    if (el.scrollTop < 80) el.scrollTop = 0;
+    // Newest is on top. Pin to top only when the user is already near the
+    // top — don't yank them back if they're scrolled down reading history.
+    if (el.scrollTop < 120) el.scrollTop = 0;
   }, [logs.length]);
 
   return (
@@ -748,7 +783,7 @@ function LogRow({ log }: { log: RobotTaskLog }) {
           <div className="text-[10px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
             目标
           </div>
-          <div className="mt-0.5 line-clamp-3 text-foreground">{parsed.goal}</div>
+          <div className="mt-0.5 text-foreground">{parsed.goal}</div>
         </div>
       );
       break;
@@ -824,7 +859,7 @@ function LogRow({ log }: { log: RobotTaskLog }) {
             </span>
           </div>
           {parsed.summary && (
-            <div className="mt-0.5 line-clamp-3 text-foreground">{parsed.summary}</div>
+            <div className="mt-0.5 text-foreground">{parsed.summary}</div>
           )}
         </div>
       );

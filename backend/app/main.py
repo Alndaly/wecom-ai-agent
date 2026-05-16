@@ -47,8 +47,9 @@ async def lifespan(_: FastAPI):
     await _ensure_seed()
     await _bootstrap_agent_tools()
     await _hydrate_vector_store()
+    await _bootstrap_task_queue()
     # background retention sweeper — cancel on shutdown
-    from app.services import retention
+    from app.services import retention, task_queue as _tq
     retention_task = asyncio.create_task(retention.run_loop(), name="retention-loop")
     try:
         yield
@@ -58,6 +59,10 @@ async def lifespan(_: FastAPI):
             await retention_task
         except (asyncio.CancelledError, Exception):
             pass
+        try:
+            await _tq.shutdown()
+        except Exception:  # noqa: BLE001
+            logging.exception("task queue shutdown failed")
         # Close MCP sessions on shutdown so subprocesses don't linger.
         try:
             from app.ai.tools import mcp_adapter
@@ -116,6 +121,23 @@ async def _hydrate_vector_store() -> None:
         )
     except Exception:
         logging.exception("vector hydrate failed (continuing without it)")
+
+
+async def _bootstrap_task_queue() -> None:
+    """Register every runner with the per-robot priority queue, then re-queue
+    any tasks that were `dispatched` when the process last died."""
+    try:
+        from app.services import task_queue
+        from app.services.send_orchestrator import run_send_task
+        from app.routers.robots import run_agent_goal_task
+
+        task_queue.register_runner("send_text", run_send_task)
+        task_queue.register_runner("agent_goal", run_agent_goal_task)
+        n = await task_queue.recover_pending_tasks()
+        if n:
+            logging.info("task queue: recovered %d in-flight task(s) from previous run", n)
+    except Exception:  # noqa: BLE001
+        logging.exception("task queue bootstrap failed")
 
 
 async def _bootstrap_agent_tools() -> None:

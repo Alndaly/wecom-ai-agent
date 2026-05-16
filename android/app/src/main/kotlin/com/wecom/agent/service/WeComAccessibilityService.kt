@@ -7,8 +7,12 @@ import android.util.Base64
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import com.wecom.agent.model.ScreenFramePayload
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import kotlin.coroutines.resume
 
@@ -57,6 +61,12 @@ class WeComAccessibilityService : AccessibilityService() {
     private val homeListBaseline = HashMap<String, String>()
     private var homeBaselineReady = false
     private var lastChatHarvestAt = 0L
+    private data class CachedScreenshot(val atMs: Long, val quality: Int, val frame: ScreenFramePayload)
+    private val screenshotMutex = Mutex()
+    private var lastScreenshotAtMs = 0L
+    private var cachedScreenshot: CachedScreenshot? = null
+    private val screenshotMinIntervalMs = 1_000L
+    private val screenshotCacheTtlMs = 900L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -163,6 +173,10 @@ class WeComAccessibilityService : AccessibilityService() {
         out.append(dumpTreeWithNodes().tree)
     }
 
+    fun isInputPanelVisible(): Boolean {
+        return windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+    }
+
     private fun walkNumbered(
         n: AccessibilityNodeInfo?,
         depth: Int,
@@ -207,10 +221,44 @@ class WeComAccessibilityService : AccessibilityService() {
         for (i in 0 until n.childCount) walkNumbered(n.getChild(i), depth + 1, sb, nodes)
     }
 
-    suspend fun captureScreenJpegBase64(quality: Int = 55): ScreenFramePayload {
+    suspend fun captureScreenJpegBase64(quality: Int = 55, allowCached: Boolean = true): ScreenFramePayload {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             return ScreenFramePayload(error = "实时屏幕需要 Android 11 / API 30 及以上")
         }
+        val normalizedQuality = quality.coerceIn(20, 90)
+        return screenshotMutex.withLock {
+            val now = System.currentTimeMillis()
+            if (allowCached) {
+                cachedScreenshot
+                    ?.takeIf { it.quality == normalizedQuality && it.frame.error == null && now - it.atMs <= screenshotCacheTtlMs }
+                    ?.let { return@withLock it.frame }
+            }
+
+            val waitMs = screenshotMinIntervalMs - (now - lastScreenshotAtMs)
+            if (waitMs > 0) {
+                if (allowCached) {
+                    cachedScreenshot
+                        ?.takeIf { it.quality == normalizedQuality && it.frame.error == null }
+                        ?.let { return@withLock it.frame }
+                }
+                delay(waitMs)
+            }
+
+            val frame = captureScreenOnceJpegBase64(normalizedQuality)
+            val finishedAt = System.currentTimeMillis()
+            lastScreenshotAtMs = finishedAt
+            if (frame.error == null) {
+                cachedScreenshot = CachedScreenshot(finishedAt, normalizedQuality, frame)
+            } else if (allowCached) {
+                cachedScreenshot
+                    ?.takeIf { it.quality == normalizedQuality && it.frame.error == null && finishedAt - it.atMs <= 5_000L }
+                    ?.let { return@withLock it.frame }
+            }
+            frame
+        }
+    }
+
+    private suspend fun captureScreenOnceJpegBase64(quality: Int): ScreenFramePayload {
         return suspendCancellableCoroutine { cont ->
             takeScreenshot(
                 android.view.Display.DEFAULT_DISPLAY,
@@ -229,7 +277,7 @@ class WeComAccessibilityService : AccessibilityService() {
                         val software = bitmap.copy(Bitmap.Config.ARGB_8888, false)
                         bitmap.recycle()
                         val out = ByteArrayOutputStream()
-                        software.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(20, 90), out)
+                        software.compress(Bitmap.CompressFormat.JPEG, quality, out)
                         val width = software.width
                         val height = software.height
                         software.recycle()
@@ -244,10 +292,22 @@ class WeComAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onFailure(errorCode: Int) {
-                        cont.resume(ScreenFramePayload(error = "截图失败：$errorCode"))
+                        cont.resume(ScreenFramePayload(error = screenshotErrorMessage(errorCode)))
                     }
                 },
             )
+        }
+    }
+
+    private fun screenshotErrorMessage(errorCode: Int): String {
+        return when (errorCode) {
+            1 -> "截图失败：系统内部错误(1)"
+            2 -> "截图失败：无无障碍截图权限(2)"
+            3 -> "截图失败：请求过于频繁，请稍后重试(3)"
+            4 -> "截图失败：无效显示器(4)"
+            5 -> "截图失败：无效窗口(5)"
+            6 -> "截图失败：安全窗口禁止截图(6)"
+            else -> "截图失败：未知错误($errorCode)"
         }
     }
 

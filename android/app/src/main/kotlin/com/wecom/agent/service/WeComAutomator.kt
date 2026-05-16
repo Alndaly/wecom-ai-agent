@@ -72,10 +72,95 @@ class WeComAutomator(
         return ok to if (ok) "已点击「$text」" else "节点不可点击"
     }
 
+    suspend fun reactTapNode(nodeId: Int, fallbackX: Int?, fallbackY: Int?): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
+        val node = root.findByDumpId(nodeId)
+        if (node != null) {
+            val target = node.clickTarget()
+            if (target != null && target.tap()) {
+                val label = target.label().ifBlank { target.className?.toString()?.substringAfterLast('.') ?: "node" }
+                return true to "已通过节点 ACTION_CLICK 点击 [$nodeId] $label"
+            }
+        }
+        if (fallbackX != null && fallbackY != null) {
+            val ok = gestureTap(svc, fallbackX.toFloat(), fallbackY.toFloat())
+            val reason = if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_CLICK 失败"
+            return ok to if (ok) "$reason，已坐标兜底 ($fallbackX, $fallbackY)" else "$reason，坐标兜底也失败"
+        }
+        return false to if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_CLICK 失败且缺少坐标兜底"
+    }
+
     suspend fun reactTapXY(x: Int, y: Int): Pair<Boolean, String> {
         val svc = a11y() ?: return false to "无障碍未启用"
         val ok = gestureTap(svc, x.toFloat(), y.toFloat())
         return ok to if (ok) "已在 ($x, $y) 点击" else "手势失败"
+    }
+
+    suspend fun reactDoubleTapNode(nodeId: Int, fallbackX: Int?, fallbackY: Int?): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
+        val node = root.findByDumpId(nodeId)
+        if (node != null) {
+            val target = node.clickTarget()
+            if (target != null && target.tap()) {
+                delay(120)
+                val ok = target.tap()
+                val label = target.label().ifBlank { target.className?.toString()?.substringAfterLast('.') ?: "node" }
+                if (ok) return true to "已通过节点 ACTION_CLICK 双击 [$nodeId] $label"
+            }
+        }
+        if (fallbackX != null && fallbackY != null) {
+            val ok = gestureDoubleTap(svc, fallbackX.toFloat(), fallbackY.toFloat())
+            val reason = if (node == null) "未找到节点 [$nodeId]" else "节点双击 ACTION_CLICK 失败"
+            return ok to if (ok) "$reason，已坐标双击兜底 ($fallbackX, $fallbackY)" else "$reason，坐标双击也失败"
+        }
+        return false to if (node == null) "未找到节点 [$nodeId]" else "节点双击失败且缺少坐标兜底"
+    }
+
+    suspend fun reactDoubleTapXY(x: Int, y: Int): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val ok = gestureDoubleTap(svc, x.toFloat(), y.toFloat())
+        return ok to if (ok) "已在 ($x, $y) 双击" else "双击手势失败"
+    }
+
+    suspend fun reactLongPressNode(
+        nodeId: Int,
+        fallbackX: Int?,
+        fallbackY: Int?,
+        durationMs: Long = 650,
+    ): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
+        val node = root.findByDumpId(nodeId)
+        if (node != null) {
+            val target = node.longClickTarget()
+            if (target != null && target.longPress()) {
+                val label = target.label().ifBlank { target.className?.toString()?.substringAfterLast('.') ?: "node" }
+                return true to "已通过节点 ACTION_LONG_CLICK 长按 [$nodeId] $label"
+            }
+        }
+        if (fallbackX != null && fallbackY != null) {
+            val dur = durationMs.coerceIn(350L, 3_000L)
+            val ok = gestureLongPress(svc, fallbackX.toFloat(), fallbackY.toFloat(), dur)
+            val reason = if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_LONG_CLICK 失败"
+            return ok to if (ok) "$reason，已长按坐标兜底 ($fallbackX, $fallbackY) ${dur}ms" else "$reason，坐标长按也失败"
+        }
+        return false to if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_LONG_CLICK 失败且缺少坐标兜底"
+    }
+
+    suspend fun reactLongPressXY(x: Int, y: Int, durationMs: Long = 650): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val dur = durationMs.coerceIn(350L, 3_000L)
+        val ok = gestureLongPress(svc, x.toFloat(), y.toFloat(), dur)
+        return ok to if (ok) "已在 ($x, $y) 长按 ${dur}ms" else "长按手势失败"
+    }
+
+    suspend fun reactDragXY(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Long = 450): Pair<Boolean, String> {
+        val svc = a11y() ?: return false to "无障碍未启用"
+        val dur = durationMs.coerceIn(120L, 5_000L)
+        val ok = gestureSwipe(svc, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur)
+        return ok to if (ok) "已拖拽 ($x1,$y1)→($x2,$y2) ${dur}ms" else "拖拽手势失败"
     }
 
     suspend fun reactSwipe(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Long = 300): Pair<Boolean, String> {
@@ -84,14 +169,26 @@ class WeComAutomator(
         return ok to if (ok) "已滑动 ($x1,$y1)→($x2,$y2)" else "手势失败"
     }
 
-    suspend fun reactInputText(text: String): Pair<Boolean, String> {
+    suspend fun reactInputText(text: String, mode: String = "replace"): Pair<Boolean, String> {
         val svc = a11y() ?: return false to "无障碍未启用"
         val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
         // Prefer the currently focused editable; fall back to any editable.
         val edit = root.findFirst { it.isEditable && it.isFocused }
             ?: root.findFirst { it.isEditable }
             ?: return false to "未找到可编辑输入框"
-        return edit.replaceText(text).let { it to if (it) "已输入文本" else "ACTION_SET_TEXT 失败" }
+        val normalizedMode = mode.lowercase()
+        val nextText = when (normalizedMode) {
+            "append" -> edit.text?.toString().orEmpty() + text
+            "clear" -> ""
+            else -> text
+        }
+        val ok = edit.replaceText(nextText)
+        val label = when (normalizedMode) {
+            "append" -> "已追加文本"
+            "clear" -> "已清空文本"
+            else -> "已输入文本"
+        }
+        return ok to if (ok) label else "ACTION_SET_TEXT 失败"
     }
 
     suspend fun reactBack(): Pair<Boolean, String> {
@@ -109,6 +206,26 @@ class WeComAutomator(
     private fun gestureTap(svc: AccessibilityService, x: Float, y: Float): Boolean {
         val path = android.graphics.Path().apply { moveTo(x, y) }
         val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, 80)
+        val gesture = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()
+        return svc.dispatchGesture(gesture, null, null)
+    }
+
+    private suspend fun gestureDoubleTap(svc: AccessibilityService, x: Float, y: Float): Boolean {
+        val first = gestureTap(svc, x, y)
+        if (!first) return false
+        delay(120)
+        return gestureTap(svc, x, y)
+    }
+
+    private fun gestureLongPress(
+        svc: AccessibilityService,
+        x: Float,
+        y: Float,
+        durationMs: Long,
+    ): Boolean {
+        val path = android.graphics.Path().apply { moveTo(x, y) }
+        val dur = durationMs.coerceIn(350L, 3_000L)
+        val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, dur)
         val gesture = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()
         return svc.dispatchGesture(gesture, null, null)
     }
@@ -174,14 +291,50 @@ private fun AccessibilityNodeInfo.findFirst(pred: (AccessibilityNodeInfo) -> Boo
     return null
 }
 
+private fun AccessibilityNodeInfo.findByDumpId(targetId: Int): AccessibilityNodeInfo? {
+    var seen = 0
+    fun walk(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        n ?: return null
+        seen += 1
+        if (seen == targetId) return n
+        for (i in 0 until n.childCount) {
+            walk(n.getChild(i))?.let { return it }
+        }
+        return null
+    }
+    return walk(this)
+}
+
 private fun matchesText(n: AccessibilityNodeInfo, s: String): Boolean {
     val a = n.text?.toString().orEmpty()
     val b = n.contentDescription?.toString().orEmpty()
     return a.contains(s) || b.contains(s)
 }
 
+private fun AccessibilityNodeInfo.clickTarget(): AccessibilityNodeInfo? {
+    var n: AccessibilityNodeInfo? = this
+    while (n != null && !n.isClickable) n = n.parent
+    return n
+}
+
+private fun AccessibilityNodeInfo.longClickTarget(): AccessibilityNodeInfo? {
+    var n: AccessibilityNodeInfo? = this
+    while (n != null && !n.isLongClickable) n = n.parent
+    return n
+}
+
+private fun AccessibilityNodeInfo.label(): String {
+    return text?.toString()?.takeIf { it.isNotBlank() }
+        ?: contentDescription?.toString()?.takeIf { it.isNotBlank() }
+        ?: ""
+}
+
 private fun AccessibilityNodeInfo.tap(): Boolean {
     return performAction(AccessibilityNodeInfo.ACTION_CLICK)
+}
+
+private fun AccessibilityNodeInfo.longPress(): Boolean {
+    return performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
 }
 
 /** Named distinctly to avoid colliding with the deprecated AccessibilityNodeInfo.setText

@@ -481,6 +481,22 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
                 type="password"
                 full
               />
+              <label className="flex items-start gap-2 sm:col-span-2 rounded-md border bg-muted/30 p-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={!!active?.supports_vision}
+                  onChange={(e) => patchActive({ supports_vision: e.target.checked })}
+                />
+                <div>
+                  <div className="font-medium">该模型支持多模态（截图输入）</div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    开启后，设备 ReAct agent 每一步会把当前屏幕截图作为 <code>image_url</code> 一起发给 LLM，
+                    对图标按钮等无文本节点的判断更准。需要模型确实支持：gpt-4o / qwen-vl-plus / qwen-vl-max / glm-4v 等。
+                    本地 gemma / 纯文本 qwen 等请保持关闭。
+                  </p>
+                </div>
+              </label>
             </div>
             <ActionRow probe={probe} probing={probing} busy={busy} onTest={test} onSave={save} />
           </div>

@@ -248,6 +248,7 @@ def _save_ui_dump(robot: Robot, payload: dict) -> dict:
         "nodes": nodes,
         "screen_width": payload.get("screen_width"),
         "screen_height": payload.get("screen_height"),
+        "input_panel_visible": payload.get("input_panel_visible"),
         "path": str(fp),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }

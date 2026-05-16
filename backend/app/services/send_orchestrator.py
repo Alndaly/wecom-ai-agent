@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 _REACT_PREFIX = "[react] "
 
 
+# Per-device serialisation is the job of services.task_queue (one consumer
+# per robot, priority-ordered). Producers don't need to hold any lock here.
+
+
 async def create_and_dispatch_send_text(
     db: AsyncSession,
     *,
@@ -73,7 +77,13 @@ async def create_and_dispatch_send_text(
     await db.refresh(msg)
     await db.refresh(task)
 
-    asyncio.create_task(_run_send_via_react(robot_id=robot.id, task_id=task.id))
+    # Hand off to the per-robot priority queue. Auto-replies sit at
+    # PRIORITY_AUTO_REPLY — operator-typed agent goals jump ahead of them.
+    from app.services import task_queue
+
+    await task_queue.enqueue(
+        robot.robot_id, "send_text", task.id, priority=task_queue.PRIORITY_AUTO_REPLY
+    )
     await _broadcast_message_new(robot.team_id, conv.id, msg)
     return msg, task
 
@@ -94,16 +104,22 @@ async def append_task_log(
             exists = await db.get(RobotTask, safe_task_id)
             if exists is None:
                 safe_task_id = None
-    db.add(RobotTaskLog(robot_id=robot.id, task_id=safe_task_id, level=level, message=message))
+    row = RobotTaskLog(
+        robot_id=robot.id, task_id=safe_task_id, level=level, message=message
+    )
+    db.add(row)
     await db.commit()
+    await db.refresh(row)
     await hub.broadcast_web(
         robot.team_id,
         "task.log",
         {
+            "id": row.id,
             "robot_id": robot.robot_id,
             "task_id": task_id,
             "level": level,
             "message": message,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
         },
     )
 
@@ -130,7 +146,10 @@ async def _broadcast_message_update(team_id: int, msg: Message) -> None:
     )
 
 
-async def _run_send_via_react(*, robot_id: int, task_id: int) -> None:
+async def run_send_task(task_id: int) -> None:
+    """Queue runner — invoked by services.task_queue once the device slot
+    becomes available. Serialisation is the queue's job; this function just
+    drives one task end-to-end."""
     from app.ai.react_agent import run_react
 
     async with SessionLocal() as db:
@@ -138,7 +157,7 @@ async def _run_send_via_react(*, robot_id: int, task_id: int) -> None:
             task = await db.get(RobotTask, task_id)
             if task is None:
                 return
-            robot = await db.get(Robot, robot_id)
+            robot = await db.get(Robot, task.robot_id)
             if robot is None:
                 return
 
@@ -164,7 +183,11 @@ async def _run_send_via_react(*, robot_id: int, task_id: int) -> None:
                 log.debug("open_wecom pre-flight failed; continuing")
 
             ai_cfg = await settings_service.get(db, robot.team_id, "ai")
-            force_llm = bool(ai_cfg.get("react_force_llm") if ai_cfg.get("react_force_llm") is not None else settings.react_force_llm)
+            force_llm = bool(
+                ai_cfg.get("react_force_llm")
+                if ai_cfg.get("react_force_llm") is not None
+                else settings.react_force_llm
+            )
             result = await run_react(
                 db,
                 robot,

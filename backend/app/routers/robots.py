@@ -168,6 +168,22 @@ async def list_robot_logs(
     return list(rows)
 
 
+@router.get("/{rid}/queue")
+async def get_robot_queue(
+    rid: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Snapshot of the per-robot task queue — what's currently running and
+    what's waiting, with priorities and wait times. Pure read."""
+    from app.services import task_queue
+
+    robot = await db.get(Robot, rid)
+    if not robot or robot.team_id != user.team_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    return task_queue.snapshot(robot.robot_id)
+
+
 @router.delete("/{rid}/logs", status_code=status.HTTP_204_NO_CONTENT)
 async def clear_robot_logs(
     rid: int,
@@ -230,21 +246,27 @@ async def run_agent_goal(
     await db.commit()
     await db.refresh(task)
 
-    asyncio.create_task(_run_agent_goal(robot_id=robot.id, task_id=task.id))
+    # Enqueue on the per-robot priority queue. Operator-typed goals jump
+    # ahead of any pending AI auto-replies.
+    from app.services import task_queue
+
+    await task_queue.enqueue(
+        robot.robot_id, "agent_goal", task.id, priority=task_queue.PRIORITY_OPERATOR
+    )
     return AgentRunOut(task_id=task.id, accepted=True)
 
 
-async def _run_agent_goal(*, robot_id: int, task_id: int) -> None:
-    """Background coroutine: invoke the ReAct agent for a semantic goal, then
-    finalise the synthetic task row. Errors are swallowed (logged) so a bad
-    invocation can't take down the worker."""
+async def run_agent_goal_task(task_id: int) -> None:
+    """Queue runner — invoked once the device slot opens up."""
     from app.ai.react_agent import run_react
     from app.services.send_orchestrator import append_task_log
 
     async with SessionLocal() as db:
         task = await db.get(RobotTask, task_id)
-        robot = await db.get(Robot, robot_id)
-        if task is None or robot is None:
+        if task is None:
+            return
+        robot = await db.get(Robot, task.robot_id)
+        if robot is None:
             return
         goal = (task.payload_json or {}).get("goal") or ""
         max_steps = int((task.payload_json or {}).get("max_steps") or 8)
@@ -259,7 +281,6 @@ async def _run_agent_goal(*, robot_id: int, task_id: int) -> None:
                     message=message,
                 )
 
-        log.info("agent_goal start task=%s goal=%r max_steps=%d", task.id, goal, max_steps)
         ai_cfg = await settings_service.get(db, robot.team_id, "ai")
         force_llm = bool(
             ai_cfg.get("react_force_llm")
@@ -267,6 +288,7 @@ async def _run_agent_goal(*, robot_id: int, task_id: int) -> None:
             else settings.react_force_llm
         )
         try:
+            log.info("agent_goal start task=%s goal=%r max_steps=%d", task.id, goal, max_steps)
             result = await run_react(
                 db, robot, goal,
                 max_steps=max_steps,
@@ -276,7 +298,6 @@ async def _run_agent_goal(*, robot_id: int, task_id: int) -> None:
             )
         except Exception as e:  # noqa: BLE001
             log.exception("agent_goal crashed task=%s", task.id)
-            result = None
             task_row = await db.get(RobotTask, task_id)
             if task_row is not None:
                 task_row.status = "failed"

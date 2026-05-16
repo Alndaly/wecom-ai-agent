@@ -86,8 +86,62 @@ class DeviceClient:
     async def tap_text(self, text: str, *, timeout: float) -> DeviceCommandResult:
         return await self.command("tap_text", {"text": text}, timeout=timeout)
 
+    async def tap_node(self, node_id: int, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
+        return await self.command("tap_node", {"node_id": node_id, "x": x, "y": y}, timeout=timeout)
+
     async def tap_xy(self, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
         return await self.command("tap_xy", {"x": x, "y": y}, timeout=timeout)
+
+    async def double_tap_node(self, node_id: int, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
+        return await self.command("double_tap_node", {"node_id": node_id, "x": x, "y": y}, timeout=timeout)
+
+    async def double_tap_xy(self, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
+        return await self.command("double_tap_xy", {"x": x, "y": y}, timeout=timeout)
+
+    async def long_press_node(
+        self,
+        node_id: int,
+        x: int,
+        y: int,
+        *,
+        duration_ms: int = 650,
+        timeout: float,
+    ) -> DeviceCommandResult:
+        return await self.command(
+            "long_press_node",
+            {"node_id": node_id, "x": x, "y": y, "duration_ms": duration_ms},
+            timeout=timeout,
+        )
+
+    async def long_press_xy(
+        self,
+        x: int,
+        y: int,
+        *,
+        duration_ms: int = 650,
+        timeout: float,
+    ) -> DeviceCommandResult:
+        return await self.command(
+            "long_press_xy",
+            {"x": x, "y": y, "duration_ms": duration_ms},
+            timeout=timeout,
+        )
+
+    async def drag_xy(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        *,
+        duration_ms: int = 450,
+        timeout: float,
+    ) -> DeviceCommandResult:
+        return await self.command(
+            "drag_xy",
+            {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration_ms},
+            timeout=timeout,
+        )
 
     async def swipe(
         self,
@@ -105,8 +159,8 @@ class DeviceClient:
             timeout=timeout,
         )
 
-    async def input_text(self, text: str, *, timeout: float) -> DeviceCommandResult:
-        return await self.command("input_text", {"text": text}, timeout=timeout)
+    async def input_text(self, text: str, *, mode: str = "replace", timeout: float) -> DeviceCommandResult:
+        return await self.command("input_text", {"text": text, "mode": mode}, timeout=timeout)
 
     async def back(self, *, timeout: float) -> DeviceCommandResult:
         return await self.command("back", timeout=timeout)

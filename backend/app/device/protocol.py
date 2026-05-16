@@ -38,6 +38,7 @@ class UiDump(BaseModel):
     nodes: list[UiNode] = Field(default_factory=list)
     screen_width: int | None = None
     screen_height: int | None = None
+    input_panel_visible: bool | None = None
     path: str | None = None
     created_at: str | None = None
 
@@ -56,7 +57,13 @@ DeviceCommandName = Literal[
     "dump_ui",
     "screenshot_once",
     "tap_text",
+    "tap_node",
     "tap_xy",
+    "double_tap_node",
+    "double_tap_xy",
+    "long_press_node",
+    "long_press_xy",
+    "drag_xy",
     "swipe",
     "input_text",
     "back",
