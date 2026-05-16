@@ -71,6 +71,16 @@ class RobotCommandOut(BaseModel):
     dispatched: bool
 
 
+class AgentRunIn(BaseModel):
+    goal: str
+    max_steps: int = 8
+
+
+class AgentRunOut(BaseModel):
+    task_id: int
+    accepted: bool
+
+
 class RobotTaskLogOut(ORM):
     id: int
     robot_id: int

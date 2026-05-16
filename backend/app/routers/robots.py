@@ -2,17 +2,22 @@ import hashlib
 import hmac
 import secrets
 
+import asyncio
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.db import get_db
+from app.core.db import SessionLocal, get_db
 from app.core.security import new_robot_token
 from app.core.ws_manager import hub
 from app.deps import current_user
-from app.models import Robot, RobotTaskLog, User
+from app.models import Robot, RobotTask, RobotTaskLog, User
 from app.schemas import (
+    AgentRunIn,
+    AgentRunOut,
     RobotCommandOut,
     RobotCreateIn,
     RobotCreateOut,
@@ -20,6 +25,8 @@ from app.schemas import (
     RobotTaskLogOut,
     RobotUiDumpRequestOut,
 )
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/robots", tags=["robots"])
 
@@ -158,3 +165,134 @@ async def list_robot_logs(
         )
     ).scalars().all()
     return list(rows)
+
+
+@router.delete("/{rid}/logs", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_robot_logs(
+    rid: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Wipe every task-log row for this robot. Tasks themselves are kept —
+    only the verbose per-step log trail is dropped."""
+    robot = await db.get(Robot, rid)
+    if not robot or robot.team_id != user.team_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    await db.execute(sa_delete(RobotTaskLog).where(RobotTaskLog.robot_id == robot.id))
+    await db.commit()
+    await hub.broadcast_web(
+        user.team_id,
+        "robot.logs_cleared",
+        {"robot_id": robot.robot_id},
+    )
+
+
+@router.post("/{rid}/agent/run", response_model=AgentRunOut, status_code=status.HTTP_202_ACCEPTED)
+async def run_agent_goal(
+    rid: int,
+    body: AgentRunIn,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> AgentRunOut:
+    """Fire an ad-hoc semantic instruction at the device. The ReAct agent
+    plans + drives the device until `done(...)` or `max_steps` is reached.
+
+    A synthetic RobotTask row is created so the trajectory is visible in the
+    same task-log panel the rest of the system uses. The request returns
+    immediately; logs stream in via the existing `task.log` WS event.
+    """
+    goal = (body.goal or "").strip()
+    if not goal:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "goal 不能为空")
+    if len(goal) > 800:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "goal 太长（最多 800 字）")
+    max_steps = max(1, min(int(body.max_steps or 8), 20))
+
+    robot = await db.get(Robot, rid)
+    if not robot or robot.team_id != user.team_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    if not hub.is_android_online(robot.robot_id):
+        raise HTTPException(status.HTTP_409_CONFLICT, "robot offline")
+
+    task = RobotTask(
+        robot_id=robot.id,
+        type="agent_goal",
+        payload_json={"goal": goal, "max_steps": max_steps, "issued_by": user.id},
+        status="dispatched",
+    )
+    db.add(task)
+    await db.flush()
+    db.add(RobotTaskLog(
+        robot_id=robot.id, task_id=task.id, level="info",
+        message=f"agent_goal received: {goal[:200]}",
+    ))
+    await db.commit()
+    await db.refresh(task)
+
+    asyncio.create_task(_run_agent_goal(robot_id=robot.id, task_id=task.id))
+    return AgentRunOut(task_id=task.id, accepted=True)
+
+
+async def _run_agent_goal(*, robot_id: int, task_id: int) -> None:
+    """Background coroutine: invoke the ReAct agent for a semantic goal, then
+    finalise the synthetic task row. Errors are swallowed (logged) so a bad
+    invocation can't take down the worker."""
+    from app.ai.react_agent import run_react
+    from app.services.send_orchestrator import append_task_log
+
+    async with SessionLocal() as db:
+        task = await db.get(RobotTask, task_id)
+        robot = await db.get(Robot, robot_id)
+        if task is None or robot is None:
+            return
+        goal = (task.payload_json or {}).get("goal") or ""
+        max_steps = int((task.payload_json or {}).get("max_steps") or 8)
+
+        async def _sink(level: str, message: str) -> None:
+            async with SessionLocal() as inner:
+                await append_task_log(
+                    inner,
+                    robot=robot,
+                    task_id=task.id,
+                    level=level if level in ("info", "warn", "error") else "info",
+                    message=message,
+                )
+
+        log.info("agent_goal start task=%s goal=%r max_steps=%d", task.id, goal, max_steps)
+        try:
+            result = await run_react(
+                db, robot, goal,
+                max_steps=max_steps,
+                step_timeout=settings.react_step_timeout_sec,
+                log_sink=_sink,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("agent_goal crashed task=%s", task.id)
+            result = None
+            task_row = await db.get(RobotTask, task_id)
+            if task_row is not None:
+                task_row.status = "failed"
+                task_row.last_error = f"agent crash: {e}"
+                db.add(RobotTaskLog(
+                    robot_id=robot.id, task_id=task.id, level="error",
+                    message=f"agent crash: {e}",
+                ))
+                await db.commit()
+            return
+
+        task_row = await db.get(RobotTask, task_id)
+        if task_row is None:
+            return
+        task_row.status = "completed" if result.ok else "failed"
+        if not result.ok:
+            task_row.last_error = result.summary
+        db.add(RobotTaskLog(
+            robot_id=robot.id, task_id=task.id,
+            level="info" if result.ok else "warn",
+            message=f"[react] result ok={result.ok} steps={len(result.steps)} summary={result.summary}",
+        ))
+        await db.commit()
+        await hub.broadcast_web(
+            robot.team_id, "task.updated",
+            {"task_id": task.id, "status": task_row.status, "error": task_row.last_error},
+        )

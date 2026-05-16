@@ -11,10 +11,14 @@ import {
   Loader2,
   MonitorUp,
   Radio,
+  Send,
   Square,
   Smartphone,
+  Trash2,
+  Wand2,
   XCircle,
 } from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
 import { api, type Robot, type RobotTaskLog } from "@/lib/api";
 import { formatFull } from "@/lib/datetime";
 import { useWebWs } from "@/lib/ws";
@@ -30,6 +34,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 type ScreenFrame = {
   robot_id: string;
@@ -65,6 +79,11 @@ export default function DeviceDetailPage() {
   const [pendingDumpRequest, setPendingDumpRequest] = useState<string | null>(null);
   const [uiDump, setUiDump] = useState<UiDump | null>(null);
   const [logs, setLogs] = useState<RobotTaskLog[]>([]);
+  const [clearingLogs, setClearingLogs] = useState(false);
+  const [clearLogsOpen, setClearLogsOpen] = useState(false);
+  const [agentGoal, setAgentGoal] = useState("");
+  const [agentMaxSteps, setAgentMaxSteps] = useState(8);
+  const [agentSubmitting, setAgentSubmitting] = useState(false);
 
   useEffect(() => {
     if (!Number.isFinite(id)) return;
@@ -192,6 +211,48 @@ export default function DeviceDetailPage() {
     } catch (e: any) {
       setDumping(false);
       toast.error("请求失败", { description: e?.message ?? String(e) });
+    }
+  }
+
+  async function confirmClearLogs() {
+    if (!Number.isFinite(id)) return;
+    setClearingLogs(true);
+    try {
+      await api(`/robots/${id}/logs`, { method: "DELETE" });
+      setLogs([]);
+      toast.success("已清空任务日志");
+      setClearLogsOpen(false);
+    } catch (e: any) {
+      toast.error("清空失败", { description: e?.message ?? String(e) });
+    } finally {
+      setClearingLogs(false);
+    }
+  }
+
+  async function runAgentGoal() {
+    if (!Number.isFinite(id)) return;
+    const goal = agentGoal.trim();
+    if (!goal) {
+      toast.error("请先输入指令");
+      return;
+    }
+    setAgentSubmitting(true);
+    try {
+      const res = await api<{ task_id: number; accepted: boolean }>(
+        `/robots/${id}/agent/run`,
+        {
+          method: "POST",
+          body: JSON.stringify({ goal, max_steps: agentMaxSteps }),
+        }
+      );
+      toast.success(`已下发指令 #${res.task_id}`, {
+        description: "ReAct agent 正在逐步执行，进度见下方日志",
+      });
+      setAgentGoal("");
+    } catch (e: any) {
+      toast.error("下发失败", { description: e?.message ?? String(e) });
+    } finally {
+      setAgentSubmitting(false);
     }
   }
 
@@ -326,7 +387,22 @@ export default function DeviceDetailPage() {
           </Card>
         </main>
 
-        <TaskLogPanel logs={logs} />
+        <aside className="flex min-h-0 flex-col gap-4 overflow-hidden">
+          <AgentCommandCard
+            value={agentGoal}
+            onChange={setAgentGoal}
+            maxSteps={agentMaxSteps}
+            onMaxStepsChange={setAgentMaxSteps}
+            onSubmit={runAgentGoal}
+            submitting={agentSubmitting}
+            online={robot.status === "online"}
+          />
+          <TaskLogPanel
+            logs={logs}
+            onClear={() => setClearLogsOpen(true)}
+            clearing={clearingLogs}
+          />
+        </aside>
       </div>
 
       <Dialog open={!!uiDump} onOpenChange={(o) => !o && setUiDump(null)}>
@@ -363,6 +439,33 @@ export default function DeviceDetailPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog
+        open={clearLogsOpen}
+        onOpenChange={(o) => !o && !clearingLogs && setClearLogsOpen(false)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>清空该设备的所有任务日志？</AlertDialogTitle>
+            <AlertDialogDescription>
+              任务本身保留，只删除步进记录（每个任务下的逐步日志）。此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={clearingLogs}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={clearingLogs}
+              onClick={(e) => {
+                e.preventDefault();
+                confirmClearLogs();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {clearingLogs ? "清空中…" : "确认清空"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -469,7 +572,88 @@ function stripQuotes(s: string): string {
   return s;
 }
 
-function TaskLogPanel({ logs }: { logs: RobotTaskLog[] }) {
+function AgentCommandCard({
+  value,
+  onChange,
+  maxSteps,
+  onMaxStepsChange,
+  onSubmit,
+  submitting,
+  online,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  maxSteps: number;
+  onMaxStepsChange: (n: number) => void;
+  onSubmit: () => void;
+  submitting: boolean;
+  online: boolean;
+}) {
+  return (
+    <Card className="rounded-lg shadow-sm">
+      <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-4">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Wand2 className="h-4 w-4 text-muted-foreground" />
+          语义化指令
+        </CardTitle>
+        <span className="text-[10px] text-muted-foreground">ReAct agent</span>
+      </CardHeader>
+      <CardContent className="space-y-2 p-3">
+        <Textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="用自然语言描述想让设备做什么，例如：&#10;&#10;- 打开「七月」的聊天并发送：你好&#10;- 给所有未读联系人发问候&#10;- 切到工作台 tab"
+          rows={4}
+          disabled={submitting}
+          className="resize-none text-xs"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              onSubmit();
+            }
+          }}
+        />
+        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+          <label className="flex items-center gap-1.5">
+            <span>最大步数</span>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={maxSteps}
+              onChange={(e) => onMaxStepsChange(Math.max(1, Math.min(20, Number(e.target.value) || 8)))}
+              className="h-6 w-14 rounded border bg-background px-1.5 font-mono text-xs"
+              disabled={submitting}
+            />
+          </label>
+          <Button
+            size="sm"
+            onClick={onSubmit}
+            disabled={submitting || !online || !value.trim()}
+            className="h-7"
+          >
+            {submitting ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Send className="h-3.5 w-3.5" />
+            )}
+            <span className="ml-1">{online ? "执行" : "设备离线"}</span>
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function TaskLogPanel({
+  logs,
+  onClear,
+  clearing,
+}: {
+  logs: RobotTaskLog[];
+  onClear?: () => void;
+  clearing?: boolean;
+}) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
@@ -480,8 +664,27 @@ function TaskLogPanel({ logs }: { logs: RobotTaskLog[] }) {
   return (
     <Card className="flex min-h-0 flex-col rounded-lg shadow-sm">
       <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-4">
-        <CardTitle className="text-sm">任务日志</CardTitle>
-        <Badge variant="secondary" className="h-6 font-mono">{logs.length}</Badge>
+        <div className="flex items-center gap-2">
+          <CardTitle className="text-sm">任务日志</CardTitle>
+          <Badge variant="secondary" className="h-6 font-mono">{logs.length}</Badge>
+        </div>
+        {onClear && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onClear}
+            disabled={clearing || logs.length === 0}
+            className="h-7 px-2 text-muted-foreground hover:text-destructive"
+            title="清空该设备的所有日志"
+          >
+            {clearing ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Trash2 className="h-3.5 w-3.5" />
+            )}
+            <span className="ml-1 text-xs">清空</span>
+          </Button>
+        )}
       </CardHeader>
       <CardContent ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-0">
         {logs.length === 0 ? (
