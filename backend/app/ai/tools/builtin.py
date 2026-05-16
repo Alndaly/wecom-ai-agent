@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -135,10 +136,13 @@ async def _final_reply(ctx: ToolContext, args: dict[str, Any]) -> str:
     replies_raw = args.get("replies")
     replies: list[str] = []
     if isinstance(replies_raw, list):
-        replies = [str(x).strip() for x in replies_raw if str(x).strip()]
+        replies = [_clean_reply(str(x)) for x in replies_raw]
+        replies = [r for r in replies if r]
     elif isinstance(replies_raw, str) and replies_raw.strip():
-        replies = [replies_raw.strip()]
-    text = (args.get("text") or "").strip()
+        cleaned = _clean_reply(replies_raw)
+        if cleaned:
+            replies = [cleaned]
+    text = _clean_reply(args.get("text") or "")
     if text and not replies:
         replies = [text]
     if not replies:
@@ -149,6 +153,27 @@ async def _final_reply(ctx: ToolContext, args: dict[str, Any]) -> str:
     ctx.scratch["final_text"] = replies[0]  # back-compat for callers
     ctx.scratch["final_confidence"] = max(0.0, min(1.0, confidence))
     return f"OK: 已记录 {len(replies)} 条最终回复"
+
+
+# Common stylistic placeholders that local models (gemma / qwen-instruct) tend
+# to emit at the end of an otherwise-complete sentence. They look bad in chat
+# bubbles ("您好…" / "请稍等..." with no real continuation). We strip:
+#   - trailing `…` (single or runs)
+#   - trailing `...` or `..` runs (three or more dots)
+#   - the literal trailing word "等等" / "等" before such markers
+# We KEEP normal terminal punctuation like "。" / "！" / "？" / "." so well-
+# formed sentences are unaffected.
+_TRAILING_ELLIPSIS_RX = re.compile(
+    r"(?:\s|(?:等等)|(?:\.{2,})|…)+\Z"
+)
+
+
+def _clean_reply(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    s = _TRAILING_ELLIPSIS_RX.sub("", s)
+    return s.strip()
 
 
 final_reply = Tool(
