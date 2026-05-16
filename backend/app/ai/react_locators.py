@@ -292,9 +292,22 @@ def _score_node(
             score += 45
         else:
             return 0
-    if spec.get("view_id") and node.view_id == spec.get("view_id"):
+    # Require a structural anchor (same class OR same view_id) when the
+    # learned locator had one. Without this, a wrapping container that
+    # inherits `contentDescription` from a child (e.g. a LinearLayout around
+    # the actual "发送" TextView) can match by label + boolean + bounds alone
+    # and steal the cache slot. Tapping the container then opens whatever
+    # OnClickListener the container has — usually NOT the send button.
+    learned_cls = spec.get("cls")
+    learned_view_id = spec.get("view_id")
+    if learned_cls or learned_view_id:
+        cls_ok = bool(learned_cls) and node.cls == learned_cls
+        view_id_ok = bool(learned_view_id) and node.view_id == learned_view_id
+        if not (cls_ok or view_id_ok):
+            return 0
+    if learned_view_id and node.view_id == learned_view_id:
         score += 30
-    if spec.get("cls") and node.cls == spec.get("cls"):
+    if learned_cls and node.cls == learned_cls:
         score += 18
     for key, weight in (("editable", 25), ("clickable", 12), ("focusable", 8), ("scrollable", 8)):
         val = spec.get(key)

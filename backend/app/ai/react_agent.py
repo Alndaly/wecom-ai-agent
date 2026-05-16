@@ -554,13 +554,22 @@ def _fast_decide(
             # so the model can pick a different node.
             locator_store.remember_failure(role="send_button")
             return None, "none"
-        # verdict == "unknown" (no editable input found) — fall back to
-        # the original optimistic behaviour rather than loop forever.
-        return {
-            "thought": "已点击发送按钮，未找到可校验的输入框，按成功处理。",
-            "action": "done",
-            "args": {"success": True, "summary": f"已向 {target} 发送消息。"},
-        }, "rule"
+        # verdict == "unknown" — no editable input visible. Two possibilities:
+        #   (a) The send went through and WeCom briefly hid the input area
+        #       (still on CHAT page, just without the soft-keyboard footer).
+        #   (b) We tapped a wrong node (e.g. a wrapping LinearLayout that the
+        #       cached locator scored as send_button) and got dropped onto
+        #       a popup / sidebar / completely different page.
+        # Heuristic: trust (a) only if we're still on a WeCom chat page;
+        # otherwise decay the locator and bail to the LLM so it can recover.
+        if _is_wecom_tree(obs.tree) and _root_page(obs.tree) == "CHAT":
+            return {
+                "thought": "已点击发送按钮，未找到输入框但仍在聊天页，按成功处理。",
+                "action": "done",
+                "args": {"success": True, "summary": f"已向 {target} 发送消息。"},
+            }, "rule"
+        locator_store.remember_failure(role="send_button")
+        return None, "none"
 
     if _last_success(history, "input_text"):
         search_input_done = _last_success(history, "input_text", locator_role="search_input")

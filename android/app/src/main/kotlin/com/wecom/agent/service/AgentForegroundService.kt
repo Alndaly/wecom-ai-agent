@@ -377,6 +377,15 @@ class AgentForegroundService : Service() {
             shouldYield = { pendingCommandCount.get() > 0 },
         )
 
+        // Page gate semantics:
+        //   chatScan harvests the *current* chat — only makes sense on CHAT.
+        //   tier1/2/3 walk the messages list; each one internally calls
+        //     `ensureMessagesTab(svc)` to navigate from CHAT/other pages back
+        //     to HOME before scanning, so we let them fire from any WeCom
+        //     page. Without this, parking the device on a chat indefinitely
+        //     starves inbound discovery for *other* conversations.
+        val inWeCom: (WeComAccessibilityService.Page) -> Boolean =
+            { it != WeComAccessibilityService.Page.UNKNOWN }
         val kinds = listOf(
             // P3 — high-cadence passive (no UI mutation)
             ScanKind(
@@ -393,7 +402,7 @@ class AgentForegroundService : Service() {
                 name = "tier1",
                 priority = 3,
                 cadenceMs = 5_000L,
-                pageGate = { it == WeComAccessibilityService.Page.HOME },
+                pageGate = inWeCom,
                 run = { scanner.scanVisible() },
             ),
             // P4 — low-cadence active (swipe; preemptable mid-scroll via shouldYield)
@@ -401,14 +410,14 @@ class AgentForegroundService : Service() {
                 name = "tier2",
                 priority = 4,
                 cadenceMs = 5 * 60_000L,
-                pageGate = { it == WeComAccessibilityService.Page.HOME },
+                pageGate = inWeCom,
                 run = { scanner.scanPagesDown(pages = 3) },
             ),
             ScanKind(
                 name = "tier3",
                 priority = 4,
                 cadenceMs = 30 * 60_000L,
-                pageGate = { it == WeComAccessibilityService.Page.HOME },
+                pageGate = inWeCom,
                 run = { scanner.scanToBottom(maxSwipes = 30) },
             ),
         )
