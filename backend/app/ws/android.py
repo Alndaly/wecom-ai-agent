@@ -97,17 +97,27 @@ async def _handle_event(robot: Robot, data: dict) -> None:
 
     if event == "message.received":
         evt = AndroidMessageReceived.model_validate(payload)
-        log.info(
-            "android message robot=%s contact=%s sender_type=%s content=%r",
-            robot.robot_id,
-            evt.contact.external_id,
-            evt.sender_type,
-            (evt.content or "")[:80],
-        )
         async with SessionLocal() as db:
             r = await db.get(Robot, robot.id)
             if r:
-                await ingest_inbound_message(db, r, evt)
+                msg = await ingest_inbound_message(db, r, evt)
+                if msg is None:
+                    log.debug(
+                        "android message skipped robot=%s contact=%s sender_type=%s content=%r",
+                        robot.robot_id,
+                        evt.contact.external_id,
+                        evt.sender_type,
+                        (evt.content or "")[:80],
+                    )
+                else:
+                    log.info(
+                        "android message accepted robot=%s contact=%s sender_type=%s direction=%s content=%r",
+                        robot.robot_id,
+                        evt.contact.external_id,
+                        evt.sender_type,
+                        msg.direction,
+                        (msg.content or "")[:80],
+                    )
         return
 
     if event == "task.log":

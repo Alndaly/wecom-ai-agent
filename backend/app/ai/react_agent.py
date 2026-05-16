@@ -385,28 +385,12 @@ def _fast_decide(
             "args": {},
         }, "rule"
 
-    if _last_success(history, "tap_node", contains_message="发送"):
+    if _last_success(history, "tap_node", locator_role="send_button"):
         return {
             "thought": "上一轮已经点击发送按钮，目标完成。",
             "action": "done",
             "args": {"success": True, "summary": f"已向 {target} 发送消息。"},
         }, "rule"
-
-    if _last_success(history, "tap_node", locator_role="chat_target"):
-        cached_message_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target)
-        if cached_message_input is not None:
-            return {
-                "thought": "目标会话已打开，命中缓存的消息输入框 locator。",
-                "action": "input_text",
-                "args": {"node_id": cached_message_input.id, "text": text, "_locator_role": "message_input"},
-            }, "cache"
-        message_input = _find_message_input(obs)
-        if message_input is not None:
-            return {
-                "thought": "目标会话已打开，找到消息输入框，输入目标文本。",
-                "action": "input_text",
-                "args": {"node_id": message_input.id, "text": text, "_locator_role": "message_input"},
-            }, "rule"
 
     if _last_success(history, "input_text"):
         search_input_done = _last_success(history, "input_text", locator_role="search_input")
@@ -442,6 +426,22 @@ def _fast_decide(
                 "args": {"node_id": send_node.id, "_locator_role": "send_button"},
             }, "rule"
         return None, "none"
+
+    if _last_success(history, "tap_node", locator_role="chat_target"):
+        cached_message_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target)
+        if cached_message_input is not None:
+            return {
+                "thought": "目标会话已打开，命中缓存的消息输入框 locator。",
+                "action": "input_text",
+                "args": {"node_id": cached_message_input.id, "text": text, "_locator_role": "message_input"},
+            }, "cache"
+        message_input = _find_message_input(obs)
+        if message_input is not None:
+            return {
+                "thought": "目标会话已打开，找到消息输入框，输入目标文本。",
+                "action": "input_text",
+                "args": {"node_id": message_input.id, "text": text, "_locator_role": "message_input"},
+            }, "rule"
 
     if _last_success(history, "tap_node", locator_role="search_entry"):
         cached_search_input = None if "search_input" in failed_cache_roles else locator_store.match("search_input", obs.nodes, target=target)
@@ -703,15 +703,10 @@ async def _execute(
         if node is None:
             return False, f"node_id={args.get('node_id')} 不在 UI tree 中"
         cx, cy = node.center
-        # Prefer accessibility ACTION_CLICK via tap_text if the node has a
-        # distinctive text — more robust to small layout shifts. Otherwise
-        # fall back to coordinate tap.
-        if node.text and len(node.text) >= 2:
-            ack = await device.tap_text(node.text, timeout=step_timeout)
-            if ack.ok:
-                return True, f"tap_text({node.text!r}) -> {ack.message or 'ok'}"
         ack = await device.tap_xy(cx, cy, timeout=step_timeout)
-        return ack.ok, f"tap_xy({cx},{cy}) -> {ack.message or ''}"
+        label = _node_label(node)
+        label_part = f" label={label!r}" if label else ""
+        return ack.ok, f"tap_node({node.id}{label_part}) xy=({cx},{cy}) -> {ack.message or ''}"
 
     if action == "input_text":
         node_id = args.get("node_id")

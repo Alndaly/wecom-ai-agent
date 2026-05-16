@@ -124,6 +124,7 @@ export default function SettingsPage() {
   const [infra, setInfra] = useState<InfraCfg | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [section, setSection] = useState<SettingsSection>("models");
+  const [modelPane, setModelPane] = useState<"llm" | "embedding">("llm");
 
   // Two distinct flows:
   //   - first mount → show a loading state until we know the values
@@ -160,23 +161,23 @@ export default function SettingsPage() {
   ];
 
   return (
-    <div className="mx-auto max-w-7xl space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
+    <div className="flex h-[calc(100vh-3rem)] min-h-[760px] flex-col gap-4 overflow-hidden">
+      <div className="flex shrink-0 items-start justify-between gap-4 border-b pb-4">
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">系统设置</h1>
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            配置会在保存后对新的对话、入库和自动任务生效。常用入口放在左侧，右侧只展示当前要处理的内容。
+            管理模型、入库解析、检索策略和自动回复行为。切换左侧模块后，只编辑当前模块。
           </p>
         </div>
-        <div className="grid min-w-[280px] gap-1 rounded-md border bg-muted/30 p-3 text-xs">
-          <StatusLine label="主模型" value={activeLlm?.name || llm.model} />
-          <StatusLine label="兜底" value={llm.fallback_enabled && fallbackLlm ? fallbackLlm.name : "未启用"} />
-          <StatusLine label="向量" value={activeEmbed?.name || embed.model} />
+        <div className="hidden grid-cols-3 gap-2 xl:grid">
+          <SummaryChip label="主模型" value={activeLlm?.name || llm.model} />
+          <SummaryChip label="兜底" value={llm.fallback_enabled && fallbackLlm ? fallbackLlm.name : "未启用"} muted={!llm.fallback_enabled} />
+          <SummaryChip label="向量" value={activeEmbed?.name || embed.model} />
         </div>
       </div>
 
-      <div className="grid gap-5 lg:grid-cols-[240px_minmax(0,1fr)]">
-        <aside className="self-start rounded-md border bg-background p-2">
+      <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
+        <aside className="min-h-0 overflow-auto rounded-lg border bg-background p-2 shadow-sm">
           {nav.map((item) => {
             const Icon = item.icon;
             const active = section === item.id;
@@ -186,14 +187,14 @@ export default function SettingsPage() {
                 type="button"
                 onClick={() => setSection(item.id)}
                 className={cn(
-                  "flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors",
-                  active ? "bg-primary text-primary-foreground" : "hover:bg-muted",
+                  "flex w-full items-center gap-3 rounded-md px-3 py-3 text-left transition-colors",
+                  active ? "bg-slate-950 text-white dark:bg-slate-100 dark:text-slate-950" : "hover:bg-muted",
                 )}
               >
                 <Icon className="h-4 w-4 shrink-0" />
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-medium">{item.label}</span>
-                  <span className={cn("block truncate text-xs", active ? "text-primary-foreground/75" : "text-muted-foreground")}>
+                  <span className={cn("mt-0.5 block truncate text-xs", active ? "text-white/70 dark:text-slate-950/65" : "text-muted-foreground")}>
                     {item.detail}
                   </span>
                 </span>
@@ -202,12 +203,15 @@ export default function SettingsPage() {
           })}
         </aside>
 
-        <div className="min-w-0 space-y-5">
+        <div className="min-h-0 min-w-0 overflow-auto pr-1">
           {section === "models" && (
-            <>
-              <LLMCard value={llm} onSaved={reload} />
-              <EmbeddingCard value={embed} onSaved={reload} />
-            </>
+            <ModelHub
+              pane={modelPane}
+              onPaneChange={setModelPane}
+              llm={llm}
+              embed={embed}
+              onSaved={reload}
+            />
           )}
           {section === "parser" && <ParserCard value={parser} onSaved={reload} />}
           {section === "retrieval" && <RetrievalCard value={retrieval} onSaved={reload} />}
@@ -215,6 +219,84 @@ export default function SettingsPage() {
           {section === "infra" && <InfraCard value={infra} />}
         </div>
       </div>
+    </div>
+  );
+}
+
+function SummaryChip({ label, value, muted }: { label: string; value: string; muted?: boolean }) {
+  return (
+    <div
+      className={cn(
+        "min-w-[150px] rounded-lg border px-3 py-2 shadow-sm",
+        muted ? "bg-muted/30 text-muted-foreground" : "bg-background",
+      )}
+    >
+      <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
+      <p className="mt-0.5 max-w-[180px] truncate text-sm font-semibold">{value}</p>
+    </div>
+  );
+}
+
+function ModelHub({
+  pane,
+  onPaneChange,
+  llm,
+  embed,
+  onSaved,
+}: {
+  pane: "llm" | "embedding";
+  onPaneChange: (pane: "llm" | "embedding") => void;
+  llm: LlmCfg;
+  embed: EmbedCfg;
+  onSaved: () => void;
+}) {
+  const activeLlm = (llm.profiles || []).find((p) => p.id === llm.active_profile);
+  const fallbackLlm = (llm.profiles || []).find((p) => p.id === llm.fallback_profile);
+  const activeEmbed = (embed.profiles || []).find((p) => p.id === embed.active_profile);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-background p-3 shadow-sm">
+        <div className="flex rounded-md bg-muted p-1">
+          <button
+            type="button"
+            onClick={() => onPaneChange("llm")}
+            className={cn(
+              "flex items-center gap-2 rounded px-3 py-2 text-sm font-medium transition-colors",
+              pane === "llm" ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Bot className="h-4 w-4" />
+            LLM
+          </button>
+          <button
+            type="button"
+            onClick={() => onPaneChange("embedding")}
+            className={cn(
+              "flex items-center gap-2 rounded px-3 py-2 text-sm font-medium transition-colors",
+              pane === "embedding" ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Database className="h-4 w-4" />
+            Embedding
+          </button>
+        </div>
+        <div className="grid w-full gap-2 text-xs text-muted-foreground sm:w-auto sm:grid-cols-3">
+          <StatusPill label="主模型" value={activeLlm?.name || llm.model} />
+          <StatusPill label="二层兜底" value={llm.fallback_enabled && fallbackLlm ? fallbackLlm.name : "未启用"} muted={!llm.fallback_enabled} />
+          <StatusPill label="向量模型" value={activeEmbed?.name || embed.model} />
+        </div>
+      </div>
+      {pane === "llm" ? <LLMCard value={llm} onSaved={onSaved} /> : <EmbeddingCard value={embed} onSaved={onSaved} />}
+    </div>
+  );
+}
+
+function StatusPill({ label, value, muted }: { label: string; value: string; muted?: boolean }) {
+  return (
+    <div className={cn("rounded-md border px-3 py-2", muted ? "bg-muted/30" : "bg-background")}>
+      <span className="block text-[11px]">{label}</span>
+      <span className="block max-w-[160px] truncate font-medium text-foreground">{value}</span>
     </div>
   );
 }
@@ -309,8 +391,8 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
   }
 
   return (
-    <Card className="overflow-hidden">
-      <CardHeader className="border-b">
+    <Card className="overflow-hidden rounded-lg shadow-sm">
+      <CardHeader className="border-b p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <CardTitle className="text-base">LLM（生成）</CardTitle>
@@ -322,8 +404,8 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
         </div>
       </CardHeader>
       <CardContent className="p-0">
-        <div className="grid min-h-[420px] lg:grid-cols-[280px_minmax(0,1fr)]">
-          <div className="border-b bg-muted/20 p-4 lg:border-b-0 lg:border-r">
+        <div className="grid min-h-[520px] xl:grid-cols-[320px_minmax(0,1fr)]">
+          <div className="border-b bg-slate-50/70 p-4 dark:bg-slate-950/20 xl:border-b-0 xl:border-r">
             <div className="space-y-4">
               <ModelRoleSelect
                 label="主模型"
@@ -371,7 +453,7 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
             </div>
           </div>
 
-          <div className="space-y-5 p-4">
+          <div className="space-y-5 p-5">
             <PresetSelect label="套用预设到当前模型" presets={LLM_PRESETS} onApply={applyPreset} />
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="名称" value={active?.name || ""} onChange={(x) => patchActive({ name: x })} />
@@ -495,8 +577,8 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
   }
 
   return (
-    <Card className="overflow-hidden">
-      <CardHeader className="border-b">
+    <Card className="overflow-hidden rounded-lg shadow-sm">
+      <CardHeader className="border-b p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <CardTitle className="text-base">Embedding（向量化）</CardTitle>
@@ -508,8 +590,8 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
         </div>
       </CardHeader>
       <CardContent className="p-0">
-        <div className="grid min-h-[360px] lg:grid-cols-[280px_minmax(0,1fr)]">
-          <div className="border-b bg-muted/20 p-4 lg:border-b-0 lg:border-r">
+        <div className="grid min-h-[500px] xl:grid-cols-[320px_minmax(0,1fr)]">
+          <div className="border-b bg-slate-50/70 p-4 dark:bg-slate-950/20 xl:border-b-0 xl:border-r">
             <div className="space-y-4">
               <ModelRoleSelect
                 label="当前使用"
@@ -543,7 +625,7 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
             </div>
           </div>
 
-          <div className="space-y-5 p-4">
+          <div className="space-y-5 p-5">
             <PresetSelect label="套用预设到当前模型" presets={EMBED_PRESETS} onApply={applyPreset} />
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="名称" value={active?.name || ""} onChange={(x) => patchActive({ name: x })} />
@@ -626,14 +708,14 @@ function ParserCard({ value, onSaved }: { value: ParserCfg; onSaved: () => void 
   }
 
   return (
-    <Card>
-      <CardHeader>
+    <Card className="rounded-lg shadow-sm">
+      <CardHeader className="border-b p-4">
         <CardTitle className="text-base">文档解析（MinerU）</CardTitle>
         <CardDescription>
           上传 PDF、Office、图片文档时使用。默认内置解析零依赖，复杂版面可以切到 MinerU。
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-4 p-5">
         <div className="space-y-2">
           <Label>解析方式</Label>
           <Select
@@ -733,14 +815,14 @@ function RetrievalCard({ value, onSaved }: { value: RetrievalCfg; onSaved: () =>
     }
   }
   return (
-    <Card>
-      <CardHeader>
+    <Card className="rounded-lg shadow-sm">
+      <CardHeader className="border-b p-4">
         <CardTitle className="text-base">检索参数</CardTitle>
         <CardDescription>
           控制知识库每次召回多少片段，以及低相关度内容是否进入回答上下文。
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-4 p-5">
         <div className="grid gap-4 sm:grid-cols-2">
           <Field
             label="召回片段数"
@@ -782,14 +864,14 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
     }
   }
   return (
-    <Card>
-      <CardHeader>
+    <Card className="rounded-lg shadow-sm">
+      <CardHeader className="border-b p-4">
         <CardTitle className="text-base">AI 行为</CardTitle>
         <CardDescription>
           控制客服助手的回复风格、置信度门槛、历史上下文窗口和智能体步数。
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-4 p-5">
         <div className="grid gap-4 sm:grid-cols-3">
           <Field
             label="转人工阈值"
@@ -819,7 +901,7 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
             placeholder="留空则使用后端默认提示词"
           />
         </div>
-        <div className="flex flex-wrap items-center gap-4 rounded-md border bg-muted/30 p-3 text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-md border bg-muted/30 p-3 text-sm">
           <label className="flex items-center gap-2">
             <input
               type="checkbox"
@@ -849,14 +931,14 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
 
 function InfraCard({ value }: { value: InfraCfg }) {
   return (
-    <Card>
-      <CardHeader>
+    <Card className="rounded-lg shadow-sm">
+      <CardHeader className="border-b p-4">
         <CardTitle className="text-base">基础设施（只读）</CardTitle>
         <CardDescription>
           通过环境变量 / docker-compose 配置,改这些需要重启后端。
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-2 text-sm">
+      <CardContent className="space-y-2 p-5 text-sm">
         <KV k="vector_store" v={value.vector_store} />
         {value.vector_store === "milvus" && (
           <>
@@ -1144,8 +1226,8 @@ function ActionRow({
   onSave: () => void;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3">
-      <div className="flex-1">
+    <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0 flex-1">
         {probe && (
           <div
             className={`flex items-start gap-2 rounded-md border p-2 text-xs ${
@@ -1181,7 +1263,7 @@ function ActionRow({
           </div>
         )}
       </div>
-      <div className="flex gap-2">
+      <div className="flex shrink-0 gap-2">
         <Button variant="outline" onClick={onTest} disabled={probing}>
           <Wand2 className="h-4 w-4" /> 测试
         </Button>

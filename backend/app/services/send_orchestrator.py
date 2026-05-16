@@ -218,5 +218,4 @@ def _goal_for_task(task: RobotTask) -> str | None:
     text = (payload.get("text") or "").strip()
     if not text:
         return None
-    snippet = text if len(text) <= 80 else text[:80] + "…"
-    return f"打开与「{contact}」的聊天，并发送下面这段文本：{snippet}"
+    return f"打开与「{contact}」的聊天，并发送下面这段文本：{text}"

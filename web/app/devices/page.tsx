@@ -313,7 +313,7 @@ export default function DevicesPage() {
 								<span>reason: {uiDump.reason}</span>
 								<span>saved: {uiDump.path}</span>
 							</div>
-							<pre className='max-h-[60vh] overflow-auto rounded-md border bg-muted p-3 font-mono text-xs leading-relaxed'>
+							<pre className='max-h-[60vh] overflow-auto rounded-md border bg-muted p-3 font-mono text-xs leading-relaxed break-all'>
 								{uiDump.tree}
 							</pre>
 						</div>

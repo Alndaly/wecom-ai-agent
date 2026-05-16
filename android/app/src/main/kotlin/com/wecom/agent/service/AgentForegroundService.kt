@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.wecom.agent.R
@@ -61,6 +62,16 @@ class AgentForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
+    private data class PendingInbound(
+        val payload: MessageReceivedPayload,
+        val src: String,
+        val senderType: String,
+    )
+    private val pendingInbound = ArrayDeque<PendingInbound>()
+    private val pendingInboundCap = 200
+    private data class RecentAutomatedOutput(val content: String, val at: Long)
+    private val recentAutomatedOutputs = ArrayDeque<RecentAutomatedOutput>()
+    private val automatedOutputTtlMs = 10 * 60_000L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -96,9 +107,10 @@ class AgentForegroundService : Service() {
         updateNotification("connecting $rid")
         broadcastState("connecting")
         broadcastLog("服务启动，正在连接 $base")
+        requestNotificationListenerRebind()
 
         // wire inbound channels → ws.message.received
-        MessageNotificationListener.onMessage = { sender, content, postTime ->
+        MessageNotificationListener.registerCallback { sender, content, postTime ->
             forwardInboundMessage(sender, content, postTime, viaNotification = true)
         }
         WeComAccessibilityService.onChatMessage = { sender, content, fromSelf ->
@@ -120,6 +132,9 @@ class AgentForegroundService : Service() {
                 broadcastState(state)
                 broadcastLog(if (connected) "WebSocket 已连接" else "WebSocket 已断开，等待重连")
                 Log.i(tag, "ws state=$state")
+                if (connected) {
+                    flushPendingInbound()
+                }
             },
         ).also { it.start() }
 
@@ -152,7 +167,7 @@ class AgentForegroundService : Service() {
         scanTier3Job?.cancel(); scanTier3Job = null
         chatScanJob?.cancel(); chatScanJob = null
         client?.stop()
-        MessageNotificationListener.onMessage = null
+        MessageNotificationListener.unregisterCallback()
         WeComAccessibilityService.onChatMessage = null
         releaseWakeLock()
         connected = false
@@ -190,6 +205,17 @@ class AgentForegroundService : Service() {
             Log.w(tag, "wake lock release failed", e)
         }
         wakeLock = null
+    }
+
+    private fun requestNotificationListenerRebind() {
+        try {
+            val cn = ComponentName(this, MessageNotificationListener::class.java)
+            NotificationListenerService.requestRebind(cn)
+            broadcastLog("已请求系统重连通知监听服务")
+        } catch (e: Exception) {
+            Log.w(tag, "notification listener rebind request failed", e)
+            broadcastLog("通知监听重连请求失败: ${e.message}")
+        }
     }
 
     private fun currentPage(): String =
@@ -313,13 +339,14 @@ class AgentForegroundService : Service() {
 
         scanTier1Job = scope.launch {
             // tier 1 — visible only, frequent. Cheap: no scrolling.
-            delay(15_000L)  // small offset so we don't fire during boot
+            delay(1_000L)  // prime the baseline before a fresh unread preview arrives
             while (isActive) {
                 if (a11yInboundEnabled) {
                     val r = scanner.scanVisible()
-                    Log.d(tag, "scan tier1 ok=${r.ok} ${r.message}")
+                    Log.i(tag, "scan tier1 ok=${r.ok} ${r.message}")
+                    if (!r.ok) broadcastLog("scan tier1: ${r.message}")
                 }
-                delay(30_000L)
+                delay(5_000L)
             }
         }
         scanTier2Job = scope.launch {
@@ -448,8 +475,13 @@ class AgentForegroundService : Service() {
                 }
                 "input_text" -> {
                     val text = obj["text"]?.jsonPrimitive?.contentOrNull
-                    if (text == null) Pair(false, "缺少 text")
-                    else automator.reactInputText(text)
+                    if (text == null) {
+                        Pair(false, "缺少 text")
+                    } else {
+                        val r = automator.reactInputText(text)
+                        if (r.first) rememberAutomatedOutput(text)
+                        r
+                    }
                 }
                 "back" -> automator.reactBack()
                 "home" -> automator.reactHome()
@@ -526,7 +558,46 @@ class AgentForegroundService : Service() {
         postTimeMs: Long,
         fromSelf: Boolean,
     ) {
+        if (fromSelf && isRecentAutomatedOutput(content)) {
+            Log.i(tag, "skip automated self echo sender=$sender content=${content.take(60)}")
+            broadcastLog("跳过自动发送回显[$sender] ${content.take(40)}")
+            return
+        }
         forwardMessage(sender, content, postTimeMs, senderType = if (fromSelf) "human" else "customer", src = if (fromSelf) "a11y-self" else "a11y")
+    }
+
+    @Synchronized
+    private fun rememberAutomatedOutput(content: String) {
+        val normalized = normalizeMessageContent(content)
+        if (normalized.isBlank()) return
+        val now = System.currentTimeMillis()
+        gcAutomatedOutputs(now)
+        recentAutomatedOutputs.addLast(RecentAutomatedOutput(normalized, now))
+        while (recentAutomatedOutputs.size > 100) recentAutomatedOutputs.removeFirst()
+        Log.d(tag, "remember automated output len=${normalized.length}")
+    }
+
+    @Synchronized
+    private fun isRecentAutomatedOutput(content: String): Boolean {
+        val normalized = normalizeMessageContent(content)
+        if (normalized.isBlank()) return false
+        val now = System.currentTimeMillis()
+        gcAutomatedOutputs(now)
+        return recentAutomatedOutputs.any { item ->
+            normalized == item.content ||
+                normalized.startsWith(item.content.take(80)) ||
+                item.content.startsWith(normalized.take(80))
+        }
+    }
+
+    private fun gcAutomatedOutputs(now: Long) {
+        while (recentAutomatedOutputs.isNotEmpty() && now - recentAutomatedOutputs.first().at > automatedOutputTtlMs) {
+            recentAutomatedOutputs.removeFirst()
+        }
+    }
+
+    private fun normalizeMessageContent(content: String): String {
+        return content.trim().replace(Regex("""\s+"""), " ")
     }
 
     private fun forwardMessage(
@@ -544,13 +615,45 @@ class AgentForegroundService : Service() {
             sender_type = senderType,
             sent_at = Instant.ofEpochMilli(postTimeMs).toString(),
         )
-        val element = json.encodeToJsonElement(MessageReceivedPayload.serializer(), payload)
-        val sent = client?.sendEvent("message.received", element) == true
+        val sent = sendInboundPayload(payload)
+        if (!sent) {
+            enqueuePendingInbound(PendingInbound(payload, src, senderType))
+        }
         broadcastLog(
             if (sent) "上报消息[$src/$senderType] $sender :: ${content.take(40)}"
-            else "上报失败(未连接)[$src/$senderType] $sender :: ${content.take(40)}"
+            else "上报暂存(未连接)[$src/$senderType] $sender :: ${content.take(40)}"
         )
-        Log.i(tag, "message[$src/$senderType] sent=$sent sender=$sender content=${content.take(60)}")
+        Log.i(tag, "message[$src/$senderType] sent=$sent queued=${!sent} sender=$sender content=${content.take(60)}")
+    }
+
+    private fun sendInboundPayload(payload: MessageReceivedPayload): Boolean {
+        val element = json.encodeToJsonElement(MessageReceivedPayload.serializer(), payload)
+        return client?.sendEvent("message.received", element) == true
+    }
+
+    @Synchronized
+    private fun enqueuePendingInbound(item: PendingInbound) {
+        pendingInbound.addLast(item)
+        while (pendingInbound.size > pendingInboundCap) {
+            val dropped = pendingInbound.removeFirst()
+            Log.w(tag, "drop pending inbound src=${dropped.src} senderType=${dropped.senderType} content=${dropped.payload.content.take(60)}")
+        }
+    }
+
+    @Synchronized
+    private fun flushPendingInbound() {
+        if (pendingInbound.isEmpty()) return
+        var sent = 0
+        while (pendingInbound.isNotEmpty()) {
+            val item = pendingInbound.first()
+            if (!sendInboundPayload(item.payload)) break
+            pendingInbound.removeFirst()
+            sent++
+        }
+        if (sent > 0) {
+            broadcastLog("已补发暂存入站消息 $sent 条，剩余 ${pendingInbound.size} 条")
+        }
+        Log.i(tag, "flush pending inbound sent=$sent remaining=${pendingInbound.size}")
     }
 
     private fun ensureChannel() {

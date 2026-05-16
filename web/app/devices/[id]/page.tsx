@@ -4,12 +4,15 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
   ArrowLeft,
+  Activity,
   CheckCircle2,
   Copy,
   FileSearch,
   Loader2,
   MonitorUp,
+  Radio,
   Square,
+  Smartphone,
   XCircle,
 } from "lucide-react";
 import { api, type Robot, type RobotTaskLog } from "@/lib/api";
@@ -201,37 +204,38 @@ export default function DeviceDetailPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="space-y-1">
-          <Button asChild variant="ghost" size="sm" className="-ml-2">
+    <div className="flex h-[calc(100vh-3rem)] min-h-[760px] flex-col gap-4 overflow-hidden">
+      <div className="flex shrink-0 items-center justify-between gap-4 border-b pb-4">
+        <div className="min-w-0">
+          <Button asChild variant="ghost" size="sm" className="-ml-3 mb-1 h-8 px-2 text-muted-foreground">
             <Link href="/devices">
               <ArrowLeft className="h-4 w-4" />
               返回设备
             </Link>
           </Button>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-semibold tracking-tight">{robot.name}</h1>
-            <Badge variant={robot.status === "online" ? "success" : "secondary"}>{robot.status}</Badge>
+          <div className="flex min-w-0 items-center gap-3">
+            <h1 className="truncate text-2xl font-semibold tracking-tight">{robot.name}</h1>
+            <StatusBadge status={robot.status} />
           </div>
-          <p className="font-mono text-xs text-muted-foreground">{robot.robot_id}</p>
+          <p className="mt-1 font-mono text-xs text-muted-foreground">{robot.robot_id}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <Button
             variant="outline"
             disabled={dumping || robot.status !== "online"}
             onClick={requestUiDump}
+            className="h-9"
           >
             {dumping ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSearch className="h-4 w-4" />}
             获取 UI 树
           </Button>
           {streaming ? (
-            <Button variant="outline" disabled={streamBusy} onClick={stopStream}>
+            <Button variant="outline" disabled={streamBusy} onClick={stopStream} className="h-9">
               {streamBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
               关闭实时屏幕
             </Button>
           ) : (
-            <Button disabled={streamBusy || robot.status !== "online"} onClick={startStream}>
+            <Button disabled={streamBusy || robot.status !== "online"} onClick={startStream} className="h-9">
               {streamBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MonitorUp className="h-4 w-4" />}
               开启实时屏幕
             </Button>
@@ -239,60 +243,94 @@ export default function DeviceDetailPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)_360px]">
-        <Card className="self-start">
-          <CardHeader>
-            <CardTitle className="text-base">设备信息</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm">
-            <InfoRow label="设备类型" value={robot.device_type ?? "未知"} />
-            <InfoRow label="设备名称" value={robot.device_name ?? "未知"} />
-            <InfoRow label="厂商 / 型号" value={[robot.manufacturer, robot.model].filter(Boolean).join(" ") || "未知"} />
-            <InfoRow label="Android" value={robot.android_version ? `${robot.android_version} / API ${robot.sdk_int ?? "-"}` : "未知"} />
-            <InfoRow label="Agent 版本" value={robot.app_version ?? "未知"} />
-            <InfoRow label="分辨率" value={screenLabel} />
-            <InfoRow label="当前页面" value={robot.current_page ?? "UNKNOWN"} />
-            <InfoRow label="最近上线" value={robot.last_seen_at ? formatFull(robot.last_seen_at) : "-"} />
-          </CardContent>
-        </Card>
-
-        <Card className="min-w-0">
-          <CardHeader>
-            <CardTitle className="flex items-center justify-between gap-3 text-base">
-              <span>实时屏幕</span>
-              {streaming && <Badge variant="secondary">接收中</Badge>}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex min-h-[520px] items-center justify-center overflow-hidden rounded-md border bg-muted">
-              {frame?.image ? (
-                <img
-                  src={`data:${frame.mime};base64,${frame.image}`}
-                  alt="设备实时屏幕"
-                  className="max-h-[72vh] max-w-full object-contain"
-                />
-              ) : (
-                <div className="max-w-sm text-center text-sm text-muted-foreground">
-                  {frameError ?? (streaming ? "等待第一帧..." : "开启实时屏幕后会显示设备当前屏幕")}
-                </div>
-              )}
-            </div>
-            {frame && (
-              <div className="mt-2 text-xs text-muted-foreground">
-                {frame.width} x {frame.height} · {formatFull(frame.created_at)}
+      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[300px_minmax(520px,1fr)_400px]">
+        <aside className="min-h-0 space-y-4 overflow-auto pr-1">
+          <Card className="rounded-lg shadow-sm">
+            <CardHeader className="border-b p-4">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Smartphone className="h-4 w-4 text-muted-foreground" />
+                设备信息
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4">
+              <div className="grid grid-cols-2 gap-3">
+                <Metric label="页面" value={robot.current_page ?? "UNKNOWN"} />
+                <Metric label="分辨率" value={screenLabel} />
               </div>
-            )}
-            {lastCommandMessage && (
-              <div className="mt-2 text-xs text-muted-foreground">{lastCommandMessage}</div>
-            )}
-          </CardContent>
-        </Card>
+              <div className="mt-4 space-y-3 border-t pt-4 text-sm">
+                <InfoRow label="设备类型" value={robot.device_type ?? "未知"} />
+                <InfoRow label="设备名称" value={robot.device_name ?? "未知"} />
+                <InfoRow label="厂商型号" value={[robot.manufacturer, robot.model].filter(Boolean).join(" ") || "未知"} />
+                <InfoRow label="Android" value={robot.android_version ? `${robot.android_version} / API ${robot.sdk_int ?? "-"}` : "未知"} />
+                <InfoRow label="Agent" value={robot.app_version ?? "未知"} />
+                <InfoRow label="最近上线" value={robot.last_seen_at ? formatFull(robot.last_seen_at) : "-"} />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-lg shadow-sm">
+            <CardHeader className="border-b p-4">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Activity className="h-4 w-4 text-muted-foreground" />
+                控制状态
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 p-4 text-sm">
+              <StateRow label="实时屏幕" value={streaming ? "已开启" : "未开启"} active={streaming} />
+              <StateRow label="屏幕帧" value={frame ? formatFull(frame.created_at) : "等待中"} />
+              <StateRow label="最近命令" value={lastCommandMessage ?? "暂无"} />
+            </CardContent>
+          </Card>
+        </aside>
+
+        <main className="min-h-0">
+          <Card className="flex h-full min-w-0 flex-col rounded-lg shadow-sm">
+            <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-4">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <MonitorUp className="h-4 w-4 text-muted-foreground" />
+                实时屏幕
+              </CardTitle>
+              <div className="flex items-center gap-2">
+                {frame && (
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {frame.width} x {frame.height}
+                  </span>
+                )}
+                {streaming && (
+                  <Badge variant="secondary" className="gap-1.5">
+                    <Radio className="h-3 w-3" />
+                    接收中
+                  </Badge>
+                )}
+              </div>
+            </CardHeader>
+            <CardContent className="flex min-h-0 flex-1 flex-col p-4">
+              <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border bg-slate-100 p-4 dark:bg-slate-900">
+                {frame?.image ? (
+                  <img
+                    src={`data:${frame.mime};base64,${frame.image}`}
+                    alt="设备实时屏幕"
+                    className="h-full max-h-full max-w-full rounded-md object-contain shadow-sm"
+                  />
+                ) : (
+                  <div className="max-w-sm text-center text-sm text-muted-foreground">
+                    {frameError ?? (streaming ? "等待第一帧..." : "开启实时屏幕后会显示设备当前屏幕")}
+                  </div>
+                )}
+              </div>
+              <div className="mt-3 flex min-h-5 items-center justify-between gap-3 text-xs text-muted-foreground">
+                <span>{frame ? formatFull(frame.created_at) : "无屏幕帧"}</span>
+                {lastCommandMessage && <span className="truncate">{lastCommandMessage}</span>}
+              </div>
+            </CardContent>
+          </Card>
+        </main>
 
         <TaskLogPanel logs={logs} />
       </div>
 
       <Dialog open={!!uiDump} onOpenChange={(o) => !o && setUiDump(null)}>
-        <DialogContent className="max-w-5xl">
+        <DialogContent className="flex max-h-[88vh] w-[min(1120px,calc(100vw-48px))] max-w-none flex-col overflow-hidden">
           <DialogHeader>
             <DialogTitle>当前 UI 树</DialogTitle>
             <DialogDescription>
@@ -300,17 +338,17 @@ export default function DeviceDetailPage() {
             </DialogDescription>
           </DialogHeader>
           {uiDump && (
-            <div className="space-y-3">
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>request_id: {uiDump.request_id ?? "manual"}</span>
-                <span>saved: {uiDump.path}</span>
+            <div className="flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden">
+              <div className="grid min-w-0 gap-1 text-xs text-muted-foreground sm:grid-cols-[220px_1fr]">
+                <span className="truncate">request_id: {uiDump.request_id ?? "manual"}</span>
+                <span className="min-w-0 truncate">saved: {uiDump.path}</span>
               </div>
-              <pre className="max-h-[60vh] overflow-auto rounded-md border bg-muted p-3 font-mono text-xs leading-relaxed">
+              <pre className="min-h-0 flex-1 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs leading-relaxed whitespace-pre">
                 {uiDump.tree}
               </pre>
             </div>
           )}
-          <DialogFooter>
+          <DialogFooter className="shrink-0">
             <Button
               variant="outline"
               onClick={() => {
@@ -331,9 +369,45 @@ export default function DeviceDetailPage() {
 
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="grid grid-cols-[88px_1fr] gap-3">
+    <div className="grid grid-cols-[76px_1fr] gap-3">
       <div className="text-muted-foreground">{label}</div>
-      <div className="min-w-0 break-words">{value}</div>
+      <div className="min-w-0 break-words font-medium">{value}</div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const online = status === "online";
+  return (
+    <span
+      className={`inline-flex h-6 items-center gap-1.5 rounded-md px-2 text-xs font-medium ${
+        online
+          ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 dark:bg-emerald-950/30 dark:text-emerald-300 dark:ring-emerald-900"
+          : "bg-slate-100 text-slate-600 ring-1 ring-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:ring-slate-800"
+      }`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${online ? "bg-emerald-500" : "bg-slate-400"}`} />
+      {status}
+    </span>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border bg-muted/30 px-3 py-2">
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate font-mono text-sm font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function StateRow({ label, value, active = false }: { label: string; value: string; active?: boolean }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className={`min-w-0 break-words text-right font-medium ${active ? "text-emerald-700 dark:text-emerald-300" : ""}`}>
+        {value}
+      </span>
     </div>
   );
 }
@@ -397,25 +471,23 @@ function stripQuotes(s: string): string {
 
 function TaskLogPanel({ logs }: { logs: RobotTaskLog[] }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  // Auto-scroll to bottom when new entries arrive — only if user is already near bottom.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
+    if (el.scrollTop < 80) el.scrollTop = 0;
   }, [logs.length]);
 
   return (
-    <Card className="flex max-h-[78vh] min-h-[520px] flex-col self-start">
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
-        <CardTitle className="text-base">任务日志</CardTitle>
-        <Badge variant="secondary" className="font-mono">{logs.length}</Badge>
+    <Card className="flex min-h-0 flex-col rounded-lg shadow-sm">
+      <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-4">
+        <CardTitle className="text-sm">任务日志</CardTitle>
+        <Badge variant="secondary" className="h-6 font-mono">{logs.length}</Badge>
       </CardHeader>
-      <CardContent ref={scrollRef} className="min-h-0 flex-1 overflow-auto px-0 pt-0">
+      <CardContent ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-0">
         {logs.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground">暂无日志</div>
         ) : (
-          <ul className="space-y-px">
+          <ul className="divide-y">
             {logs.map((log) => (
               <LogRow key={log.id} log={log} />
             ))}
@@ -538,10 +610,10 @@ function LogRow({ log }: { log: RobotTaskLog }) {
   }
 
   return (
-    <li className="border-b px-3 py-2 text-xs last:border-b-0">
-      <div className="mb-1 flex items-center justify-between gap-2 text-[10.5px] font-mono text-muted-foreground">
+    <li className="px-4 py-3 text-xs transition-colors hover:bg-muted/40">
+      <div className="mb-1.5 flex items-center justify-between gap-2 text-[10.5px] font-mono text-muted-foreground">
         <span>{time}</span>
-        {taskTag && <span>task {taskTag}</span>}
+        {taskTag && <span>{taskTag}</span>}
       </div>
       {body}
     </li>
