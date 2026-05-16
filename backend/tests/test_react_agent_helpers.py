@@ -78,23 +78,52 @@ def test_guard_blocks_back_after_context_changed_without_goal_match() -> None:
     assert result.ok is False
 
 
-def test_guard_converts_repeated_back_after_input_panel_dismissed_to_done() -> None:
-    steps = [
+def test_guard_stops_repeated_back_only_when_page_actually_changed() -> None:
+    # Android BACK has two stages: dismiss keyboard first, then leave page.
+    # "panel collapsed AND page changed" is real navigation → declare done.
+    steps_real_nav = [
         AgentStep(
             1,
             "",
             "back",
             {},
             True,
-            "已返回 (before_pkg=before.app before_page=form before_input_panel=true) [验证] 输入面板已消失",
+            "已返回 (before_pkg=before.app before_page=form before_input_panel=true) "
+            "[验证] 输入面板已消失；上下文从 page=form 变为 home",
             1,
         )
     ]
-
-    result = _guard_decision({"action": "back", "args": {}}, _observation(package="before.app", page="form"), steps)
-
+    result = _guard_decision(
+        {"action": "back", "args": {}},
+        _observation(package="before.app", page="home"),
+        steps_real_nav,
+    )
     assert isinstance(result, AgentResult)
     assert result.ok is True
+
+
+def test_guard_allows_second_back_when_panel_only_collapsed() -> None:
+    # Previous back only dismissed the keyboard (panel: true → false) but the
+    # page didn't change — we're still on the same screen. The next back must
+    # be allowed through so it can actually leave the page.
+    steps_panel_only = [
+        AgentStep(
+            1,
+            "",
+            "back",
+            {},
+            True,
+            "已返回 (before_pkg=before.app before_page=form before_input_panel=true) "
+            "[验证] 输入面板已消失",
+            1,
+        )
+    ]
+    result = _guard_decision(
+        {"action": "back", "args": {}},
+        _observation(package="before.app", page="form"),
+        steps_panel_only,
+    )
+    assert result is None  # guard does not short-circuit; back action proceeds
 
 
 def test_post_tap_verdict_detects_send_from_executed_message_without_locator_role() -> None:

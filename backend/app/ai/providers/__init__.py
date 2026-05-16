@@ -9,10 +9,12 @@ provider — no backend restart required.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.services import settings_service
 
 from .base import ChatMessage, LLMProvider, LLMResult
@@ -32,6 +34,48 @@ log = logging.getLogger(__name__)
 
 # (team_id, version, profile_id) → provider
 _cache: dict[tuple[int, int, str], LLMProvider] = {}
+
+# Per-team semaphore caps simultaneous LLM chat calls so a burst of concurrent
+# conversations doesn't blow through provider rate limits or budget. The
+# downstream device queue stays serial, so the semaphore only governs how many
+# `handle_inbound` LLM phases overlap.
+_chat_semaphores: dict[int, asyncio.Semaphore] = {}
+
+
+def _get_chat_semaphore(team_id: int) -> asyncio.Semaphore:
+    sem = _chat_semaphores.get(team_id)
+    if sem is None:
+        sem = asyncio.Semaphore(max(1, int(settings.llm_max_concurrent)))
+        _chat_semaphores[team_id] = sem
+    return sem
+
+
+class _SemaphoredProvider(LLMProvider):
+    """Decorator that serializes `chat()` through a team-wide semaphore.
+
+    All other attributes (name, model, embedding helpers, …) delegate to the
+    wrapped provider, so callers can't tell the difference.
+    """
+
+    def __init__(self, inner: LLMProvider, team_id: int) -> None:
+        self._inner = inner
+        self._team_id = team_id
+        self.name = inner.name
+
+    def __getattr__(self, item):  # delegate everything we didn't override
+        return getattr(self._inner, item)
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+    ) -> LLMResult:
+        async with _get_chat_semaphore(self._team_id):
+            return await self._inner.chat(
+                messages, temperature=temperature, max_tokens=max_tokens
+            )
 
 
 def build_provider(cfg: dict) -> LLMProvider:
@@ -76,7 +120,8 @@ async def get_profile_provider(db: AsyncSession, team_id: int, profile_id: str) 
     cached = _cache.get(key)
     if cached is not None:
         return cached
-    inst = build_provider(cfg)
+    raw = build_provider(cfg)
+    inst: LLMProvider = _SemaphoredProvider(raw, team_id)
     _cache[key] = inst
     log.info("llm provider built team=%s profile=%s provider=%s model=%s", team_id, key[2], inst.name, getattr(inst, "model", "?"))
     return inst
@@ -85,6 +130,8 @@ async def get_profile_provider(db: AsyncSession, team_id: int, profile_id: str) 
 def reset_cache(team_id: int | None = None) -> None:
     if team_id is None:
         _cache.clear()
+        _chat_semaphores.clear()
     else:
         for k in [k for k in _cache if k[0] == team_id]:
             _cache.pop(k, None)
+        _chat_semaphores.pop(team_id, None)

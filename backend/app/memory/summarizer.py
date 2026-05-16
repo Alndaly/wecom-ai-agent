@@ -10,6 +10,7 @@ changing the call sites.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import desc, select
@@ -17,10 +18,58 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers import ChatMessage, get_provider
 from app.core.config import settings
+from app.core.db import SessionLocal
 from app.kb.embeddings import get_embedding_provider
 from app.models import Contact, Conversation, Message, UserMemory, UserProfile, utcnow
 
 log = logging.getLogger(__name__)
+
+# Per-contact lock so two concurrent refresh tasks for the same contact
+# serialize — UserProfile.summary / UserMemory writes must not race (different
+# contacts on the same robot are independent, so this is per-contact, not
+# per-robot).
+_contact_locks: dict[int, asyncio.Lock] = {}
+
+
+def _lock_for(contact_id: int) -> asyncio.Lock:
+    lk = _contact_locks.get(contact_id)
+    if lk is None:
+        lk = asyncio.Lock()
+        _contact_locks[contact_id] = lk
+    return lk
+
+
+def schedule_refresh(contact_id: int, conv_id: int) -> None:
+    """Fire-and-forget memory refresh.
+
+    Callers don't await — the task runs in the background with its own DB
+    session so it can outlive the calling request. If a refresh for the same
+    contact is already running we skip (it'll see the new messages in its own
+    window), avoiding queue buildup.
+    """
+    if not settings.memory_refresh_enabled:
+        return
+    asyncio.create_task(
+        _run_refresh(contact_id, conv_id), name=f"memory-refresh-{contact_id}"
+    )
+
+
+async def _run_refresh(contact_id: int, conv_id: int) -> None:
+    lock = _lock_for(contact_id)
+    if lock.locked():
+        log.debug("memory.refresh skip already-running contact=%s", contact_id)
+        return
+    async with lock:
+        try:
+            async with SessionLocal() as db:
+                contact = await db.get(Contact, contact_id)
+                conv = await db.get(Conversation, conv_id)
+                if contact is not None and conv is not None:
+                    await maybe_refresh(db, contact=contact, conv=conv)
+        except Exception:
+            log.exception(
+                "memory.refresh failed contact=%s conv=%s", contact_id, conv_id
+            )
 
 _SUMMARY_PROMPT = (
     "你是私域客服的记忆助理。请阅读以下「客户 ↔ 客服」对话历史,提炼一段 ≤ 120 字"

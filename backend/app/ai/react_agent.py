@@ -519,6 +519,22 @@ def _fast_decide(
             "args": {},
         }, "rule"
 
+    # Wrong-chat guard. If a message input is visible (we're inside *some*
+    # chat) but the title bar doesn't show `target`, we landed in another
+    # contact's chat — typically because the operator or a prior task left
+    # the device parked there. Sending here would deliver to the wrong
+    # customer; back out to the messages list first.
+    if (
+        _find_message_input(obs) is not None
+        and not _last_success(history, "tap_node", locator_role="chat_target")
+        and not _in_target_chat(obs, target)
+    ):
+        return {
+            "thought": f"输入框可见，但顶栏不是「{target}」，先返回会话列表。",
+            "action": "back",
+            "args": {},
+        }, "rule"
+
     if _last_success(history, "tap_node", locator_role="send_button"):
         # Verify: a successful tap returns ok=True even when the tap missed
         # (gesture dispatched OK, but the target moved / was hidden). The
@@ -672,6 +688,32 @@ def _fast_decide(
 def _is_wecom_tree(tree: str) -> bool:
     header = tree.splitlines()[0] if tree else ""
     return "pkg=com.tencent.wework" in header
+
+
+def _in_target_chat(obs: _Observation, target: str) -> bool:
+    """True iff the current chat page's title bar shows `target`.
+
+    WeCom renders the conversation title as a TextView pinned to the top of
+    the screen (action bar / toolbar region, roughly the top 15% of screen
+    height). The same name may appear in message bubbles below, but those
+    aren't in the title region — so requiring `bounds.top` to be in the top
+    15% reliably distinguishes title from bubble content.
+    """
+    if not target:
+        return False
+    screen_h = obs.screen_size[1] if obs.screen_size else 0
+    if screen_h <= 0:
+        return False
+    cutoff = int(screen_h * 0.15)
+    for n in obs.nodes.values():
+        if len(n.bounds) != 4:
+            continue
+        if n.bounds[1] >= cutoff:
+            continue  # node starts below the title region
+        label = (n.text or n.desc or "").strip()
+        if label == target:
+            return True
+    return False
 
 
 def _find_launcher_icon(obs: _Observation, names: tuple[str, ...]) -> UiNode | None:
@@ -867,9 +909,17 @@ def _guard_decision(decision: dict[str, Any], obs: _Observation, steps: list[Age
     if last_back is None:
         return None
     msg = last_back.message or ""
-    if "输入面板已消失" in msg:
+    page_changed = "上下文从" in msg
+    panel_collapsed = "输入面板已消失" in msg
+    # Android's BACK has two-stage semantics: first dismiss the soft keyboard,
+    # then leave the activity. So "panel collapsed but page unchanged" means
+    # the previous back only closed the keyboard — let the next back actually
+    # navigate. We only declare back-as-success when the page truly changed.
+    if panel_collapsed and page_changed:
         return AgentResult(ok=True, summary="返回键已收起输入面板，停止继续返回。", steps=steps)
-    if "执行前后均未检测到输入面板" in msg or "上下文从" in msg:
+    if panel_collapsed and not page_changed:
+        return None  # allow another back to actually leave the page
+    if "执行前后均未检测到输入面板" in msg or page_changed:
         return AgentResult(ok=False, summary="连续返回没有明确收益，已阻止继续返回。", steps=steps)
     recent_back_count = sum(1 for s in steps[-3:] if s.action == "back" and s.ok)
     if recent_back_count >= 2:

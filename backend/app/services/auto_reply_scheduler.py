@@ -1,16 +1,28 @@
 """Fair auto-reply scheduler.
 
 Inbound customer messages are persisted as `feedback_status=pending`. This
-scheduler walks pending conversations per robot, one conversation at a time,
-so a noisy customer cannot monopolise the device. Each conversation turn may
-enqueue at most two outbound reply tasks; then the scheduler rotates back to
-the messages list and gives other pending customers a chance.
+scheduler walks pending conversations per robot and generates AI replies.
+
+Concurrency model
+-----------------
+- Across robots: fully parallel — one dispatcher coroutine per robot.
+- Within a robot, across conversations: up to
+  `settings.auto_reply_concurrency_per_robot` LLM phases run in parallel.
+- Within a single conversation: strictly serial. Reply order must match
+  question order, and the per-contact UserProfile/UserMemory writes must
+  not race. The dispatcher achieves this by tracking `active_conv_ids` —
+  a conversation is never picked twice while a worker is still on it.
+- Device dispatch (`create_and_dispatch_send_text`) feeds the per-robot
+  RobotTaskQueue, which remains serial — exactly one physical device.
+
+The LLM phase and the device phase form a pipeline: while conv X waits on
+the device queue, conv Y can already be in LLM generation.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import func, select
 
@@ -31,6 +43,8 @@ MAX_REPLY_TASKS_PER_CONVERSATION_TURN = 2
 @dataclass
 class _RobotState:
     task: asyncio.Task[None] | None = None
+    workers: set[asyncio.Task[None]] = field(default_factory=set)
+    active_conv_ids: set[int] = field(default_factory=set)
     last_conv_id: int | None = None
     same_conv_turns: int = 0
     wake_count: int = 0
@@ -86,48 +100,103 @@ async def shutdown() -> None:
                 await state.task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Drain any in-flight workers too.
+        for w in list(state.workers):
+            if not w.done():
+                w.cancel()
+        if state.workers:
+            await asyncio.gather(*list(state.workers), return_exceptions=True)
     _STATES.clear()
 
 
 async def _run_robot(robot_pk: int) -> None:
+    """Per-robot dispatcher: launches up to N parallel workers, one per
+    distinct pending conversation. The semaphore bounds LLM concurrency on
+    this robot."""
     state = _STATES.setdefault(robot_pk, _RobotState())
+    sem = asyncio.Semaphore(max(1, int(settings.auto_reply_concurrency_per_robot)))
     seen_wake = state.wake_count
-    while True:
-        processed = False
+    try:
+        while True:
+            async with SessionLocal() as db:
+                conv = await _next_pending_conversation(
+                    db, robot_pk, state, exclude_ids=state.active_conv_ids
+                )
+            if conv is not None:
+                # Bound concurrency. acquire() may suspend if N workers are
+                # already running — that's the desired backpressure.
+                await sem.acquire()
+                state.active_conv_ids.add(conv.id)
+                worker = asyncio.create_task(
+                    _run_worker(robot_pk, conv.id, state, sem),
+                    name=f"auto-reply-{robot_pk}-conv-{conv.id}",
+                )
+                state.workers.add(worker)
+                worker.add_done_callback(state.workers.discard)
+                # Immediately try to dispatch the next conv — we don't sleep
+                # between launches.
+                continue
+
+            # Nothing dispatchable right now. Either everything pending is
+            # already being worked on, or there's nothing pending. Wait for
+            # a wake signal or for a worker to finish (which may free a slot
+            # or surface a newly-eligible conv).
+            if state.wake_count != seen_wake:
+                seen_wake = state.wake_count
+                continue
+            if state.wake_event is None:
+                state.wake_event = asyncio.Event()
+            state.wake_event.clear()
+            if state.wake_count != seen_wake:
+                seen_wake = state.wake_count
+                continue
+            try:
+                await asyncio.wait_for(state.wake_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                # Idle exit only when nothing is in flight either.
+                if not state.workers:
+                    break
+            seen_wake = state.wake_count
+    finally:
+        # Don't leave orphan workers behind; let them finish their current
+        # `_process_conversation` so DB state is consistent.
+        if state.workers:
+            await asyncio.gather(*list(state.workers), return_exceptions=True)
+
+
+async def _run_worker(
+    robot_pk: int, conv_id: int, state: _RobotState, sem: asyncio.Semaphore
+) -> None:
+    """Process one conversation's LLM phase with its own DB session."""
+    try:
         async with SessionLocal() as db:
-            conv = await _next_pending_conversation(db, robot_pk, state)
-            if conv is None:
-                pass
-            else:
-                processed = True
+            conv = await db.get(Conversation, conv_id)
+            if conv is not None:
                 await _process_conversation(db, conv)
-                if conv.id == state.last_conv_id:
-                    state.same_conv_turns += 1
-                else:
-                    state.last_conv_id = conv.id
-                    state.same_conv_turns = 1
-        if processed:
-            await asyncio.sleep(0.2)
-            continue
-
-        if state.wake_count != seen_wake:
-            seen_wake = state.wake_count
-            continue
-
-        if state.wake_event is None:
-            state.wake_event = asyncio.Event()
-        state.wake_event.clear()
-        if state.wake_count != seen_wake:
-            seen_wake = state.wake_count
-            continue
-        try:
-            await asyncio.wait_for(state.wake_event.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
-            break
-        seen_wake = state.wake_count
+    except Exception:
+        log.exception("auto-reply worker crashed robot=%s conv=%s", robot_pk, conv_id)
+    finally:
+        state.active_conv_ids.discard(conv_id)
+        if conv_id == state.last_conv_id:
+            state.same_conv_turns += 1
+        else:
+            state.last_conv_id = conv_id
+            state.same_conv_turns = 1
+        sem.release()
+        # Nudge the dispatcher: a conv has freed up, and there may be
+        # follow-up messages or other convs newly eligible.
+        state.wake_count += 1
+        if state.wake_event is not None:
+            state.wake_event.set()
 
 
-async def _next_pending_conversation(db, robot_pk: int, state: _RobotState) -> Conversation | None:
+async def _next_pending_conversation(
+    db,
+    robot_pk: int,
+    state: _RobotState,
+    *,
+    exclude_ids: set[int] | None = None,
+) -> Conversation | None:
     active_reply_exists = (
         select(RobotTask.id)
         .where(
@@ -159,7 +228,10 @@ async def _next_pending_conversation(db, robot_pk: int, state: _RobotState) -> C
     if not candidate_ids:
         return None
 
-    ordered_ids = [int(row.id) for row in candidate_ids]
+    excluded = exclude_ids or set()
+    ordered_ids = [int(row.id) for row in candidate_ids if int(row.id) not in excluded]
+    if not ordered_ids:
+        return None
     if state.last_conv_id is not None and state.same_conv_turns >= 2 and len(ordered_ids) > 1:
         for conv_id in ordered_ids:
             if conv_id != state.last_conv_id:
@@ -225,10 +297,7 @@ async def _process_conversation(db, conv: Conversation) -> None:
     else:
         await _mark_feedback(db, batch_ids, "skipped", decision.trace_id, [])
     if settings.memory_refresh_enabled:
-        try:
-            await summarizer.maybe_refresh(db, contact=contact, conv=conv)
-        except Exception:
-            log.exception("memory refresh failed")
+        summarizer.schedule_refresh(contact.id, conv.id)
     else:
         log.info("[message-callback] memory refresh disabled conv=%s", conv.id)
 

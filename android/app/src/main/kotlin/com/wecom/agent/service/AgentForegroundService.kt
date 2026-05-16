@@ -19,15 +19,19 @@ import com.wecom.agent.model.MessageReceivedPayload
 import com.wecom.agent.model.ScreenFramePayload
 import com.wecom.agent.net.BackendClient
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.time.Instant
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Foreground service that owns the WebSocket lifecycle and device primitives.
@@ -56,13 +60,21 @@ class AgentForegroundService : Service() {
     private var client: BackendClient? = null
     private var heartbeatJob: Job? = null
     private var screenStreamJob: Job? = null
-    // periodic message-list scanner — three tiers at different cadences
-    private var scanTier1Job: Job? = null
-    private var scanTier2Job: Job? = null
-    private var scanTier3Job: Job? = null
-    private var chatScanJob: Job? = null
+    // single coordinator that picks the next scan job by (priority, due-time)
+    // and is page-aware (only chatScan when in a chat, only tier1/2/3 on
+    // messages tab). Replaces four independent timer-driven coroutines.
+    private var scanCoordinatorJob: Job? = null
     private val uiAutomationMutex = Mutex()
     @Volatile private var reactCommandActive = false
+
+    // All backend-originated device commands funnel through a single serial
+    // queue, so input/tap/send tasks can't be cut into by traversal scans, and
+    // commands run in arrival order. pendingCommandCount = queued + running;
+    // scanners back off whenever it's non-zero.
+    private data class CommandTask(val command: String, val obj: JsonObject)
+    private val commandQueue = Channel<CommandTask>(Channel.UNLIMITED)
+    private val pendingCommandCount = AtomicInteger(0)
+    private var commandWorkerJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
@@ -97,7 +109,7 @@ class AgentForegroundService : Service() {
             }
             ACTION_DUMP_UI -> {
                 broadcastLog("请求采集 UI 树")
-                scope.launch { dumpAndUpload("manual") }
+                enqueueCommand("dump_ui", JsonObject(mapOf("reason" to JsonPrimitive("manual"))))
                 return START_NOT_STICKY
             }
             ACTION_SET_A11Y_INGEST -> {
@@ -111,6 +123,7 @@ class AgentForegroundService : Service() {
         ensureChannel()
         startForeground(NOTIFICATION_ID, buildNotification("starting"))
         acquireWakeLockIfNeeded()
+        startCommandWorker()
 
         val base = intent?.getStringExtra(EXTRA_BASE_URL) ?: return START_NOT_STICKY
         val rid = intent.getStringExtra(EXTRA_ROBOT_ID) ?: return START_NOT_STICKY
@@ -181,10 +194,7 @@ class AgentForegroundService : Service() {
     override fun onDestroy() {
         heartbeatJob?.cancel()
         screenStreamJob?.cancel()
-        scanTier1Job?.cancel(); scanTier1Job = null
-        scanTier2Job?.cancel(); scanTier2Job = null
-        scanTier3Job?.cancel(); scanTier3Job = null
-        chatScanJob?.cancel(); chatScanJob = null
+        scanCoordinatorJob?.cancel(); scanCoordinatorJob = null
         client?.stop()
         MessageNotificationListener.unregisterCallback()
         WeComAccessibilityService.onChatMessage = null
@@ -309,19 +319,9 @@ class AgentForegroundService : Service() {
                 val obj = payload?.jsonObject ?: return
                 val command = obj["command"]?.jsonPrimitive?.contentOrNull
                 when (command) {
-                    "dump_ui" -> {
-                        val requestId = obj["request_id"]?.jsonPrimitive?.contentOrNull
-                        val reason = obj["reason"]?.jsonPrimitive?.contentOrNull ?: "remote"
-                        scope.launch { dumpAndUpload(reason, requestId) }
-                    }
-                    "screen_start" -> {
-                        val intervalMs = obj["interval_ms"]?.jsonPrimitive?.contentOrNull
-                            ?.toLongOrNull()
-                            ?.coerceIn(500L, 5_000L)
-                            ?: 1_000L
-                        startScreenStream(intervalMs)
-                    }
-                    "screen_stop" -> stopScreenStream()
+                    "dump_ui",
+                    "screen_start",
+                    "screen_stop",
                     "screenshot_once",
                     "tap_text",
                     "tap_node",
@@ -335,9 +335,7 @@ class AgentForegroundService : Service() {
                     "input_text",
                     "back",
                     "home",
-                    "open_wecom" -> {
-                        scope.launch { handleReactCommand(command, obj) }
-                    }
+                    "open_wecom" -> enqueueCommand(command, obj)
                     else -> {
                         sendCommandAck(command ?: "unknown", false, "未知设备命令")
                         broadcastLog("未知设备命令：$command")
@@ -355,72 +353,176 @@ class AgentForegroundService : Service() {
     //    - a11y ingest is off (user disabled the checkbox)
     //    - WeCom isn't in the foreground (don't hijack other apps)
     //    - a backend ReAct command is currently controlling the UI
-    private fun startMessageListScanners() {
-        if (scanTier1Job != null) {
-            Log.d(tag, "message list scanners already running")
-            return  // already running (sticky service)
-        }
-        Log.i(tag, "starting message list scanners a11yInbound=$a11yInboundEnabled")
-        broadcastLog("消息列表巡检已启动（a11y=$a11yInboundEnabled）")
-        val scanner = MessageListScanner { msg -> broadcastLog("scan: $msg") }
+    private data class ScanKind(
+        val name: String,
+        /** Lower = higher priority. P3=3 (high-cadence passive), P4=4 (low-cadence active). */
+        val priority: Int,
+        val cadenceMs: Long,
+        val pageGate: (WeComAccessibilityService.Page) -> Boolean,
+        val run: suspend () -> ScanReport,
+    )
 
-        scanTier1Job = scope.launch {
-            // tier 1 — visible only, frequent. Cheap: no scrolling.
-            delay(1_000L)  // prime the baseline before a fresh unread preview arrives
-            while (isActive) {
-                if (a11yInboundEnabled) {
-                    val r = runScanner("tier1") { scanner.scanVisible() }
-                    Log.i(tag, "scan tier1 ok=${r.ok} ${r.message}")
-                    if (!r.ok) broadcastLog("scan tier1: ${r.message}")
-                }
-                delay(5_000L)
-            }
+    private fun startMessageListScanners() {
+        if (scanCoordinatorJob?.isActive == true) {
+            Log.d(tag, "scan coordinator already running")
+            return
         }
-        scanTier2Job = scope.launch {
-            // tier 2 — 3-page scroll, medium frequency.
-            delay(60_000L)
-            while (isActive) {
-                if (a11yInboundEnabled) {
-                    val r = runScanner("tier2") { scanner.scanPagesDown(pages = 3) }
-                    Log.d(tag, "scan tier2 ok=${r.ok} ${r.message}")
-                    if (r.ok) broadcastLog("scan tier2: ${r.message}")
-                }
-                delay(5 * 60_000L)
-            }
-        }
-        scanTier3Job = scope.launch {
-            // tier 3 — full scroll, rare. Picks up old conversations buried at
-            // the bottom that haven't been re-promoted to the top.
-            delay(10 * 60_000L)
-            while (isActive) {
-                if (a11yInboundEnabled) {
-                    val r = runScanner("tier3") { scanner.scanToBottom(maxSwipes = 30) }
-                    Log.d(tag, "scan tier3 ok=${r.ok} ${r.message}")
-                    if (r.ok) broadcastLog("scan tier3: ${r.message}")
-                }
-                delay(30 * 60_000L)
-            }
-        }
-        chatScanJob = scope.launch {
-            delay(3_000L)
-            while (isActive) {
-                if (a11yInboundEnabled) {
+        Log.i(tag, "starting scan coordinator a11yInbound=$a11yInboundEnabled")
+        broadcastLog("消息列表巡检已启动（a11y=$a11yInboundEnabled）")
+        val scanner = MessageListScanner(
+            log = { msg -> broadcastLog("scan: $msg") },
+            // Cooperative cancellation: between swipes, if any device command
+            // is pending/running, abort scrolling and let the high-priority
+            // task have the device.
+            shouldYield = { pendingCommandCount.get() > 0 },
+        )
+
+        val kinds = listOf(
+            // P3 — high-cadence passive (no UI mutation)
+            ScanKind(
+                name = "chatScan",
+                priority = 3,
+                cadenceMs = 2_000L,
+                pageGate = { it == WeComAccessibilityService.Page.CHAT },
+                run = {
                     WeComAccessibilityService.instance?.forceHarvestCurrentChat()
+                    ScanReport.ok("已巡检当前聊天")
+                },
+            ),
+            ScanKind(
+                name = "tier1",
+                priority = 3,
+                cadenceMs = 5_000L,
+                pageGate = { it == WeComAccessibilityService.Page.HOME },
+                run = { scanner.scanVisible() },
+            ),
+            // P4 — low-cadence active (swipe; preemptable mid-scroll via shouldYield)
+            ScanKind(
+                name = "tier2",
+                priority = 4,
+                cadenceMs = 5 * 60_000L,
+                pageGate = { it == WeComAccessibilityService.Page.HOME },
+                run = { scanner.scanPagesDown(pages = 3) },
+            ),
+            ScanKind(
+                name = "tier3",
+                priority = 4,
+                cadenceMs = 30 * 60_000L,
+                pageGate = { it == WeComAccessibilityService.Page.HOME },
+                run = { scanner.scanToBottom(maxSwipes = 30) },
+            ),
+        )
+
+        val now0 = System.currentTimeMillis()
+        // Staggered first-run offsets so we don't fire everything at boot
+        val dueAt: MutableMap<String, Long> = mutableMapOf(
+            "chatScan" to (now0 + 3_000L),
+            "tier1" to (now0 + 1_000L),
+            "tier2" to (now0 + 60_000L),
+            "tier3" to (now0 + 10 * 60_000L),
+        )
+
+        scanCoordinatorJob = scope.launch {
+            while (isActive) {
+                if (!a11yInboundEnabled) {
+                    delay(2_000L)
+                    continue
                 }
-                delay(2_000L)
+                // P1 (queued/active commands) preempts all scans
+                if (pendingCommandCount.get() > 0) {
+                    delay(500L)
+                    continue
+                }
+                val now = System.currentTimeMillis()
+                val page = WeComAccessibilityService.instance?.currentPage
+                    ?: WeComAccessibilityService.Page.UNKNOWN
+                val eligible = kinds.filter {
+                    (dueAt[it.name] ?: 0L) <= now && it.pageGate(page)
+                }
+                if (eligible.isEmpty()) {
+                    // Sleep until either the next deadline, or 1s — whichever
+                    // is shorter. The 1s ceiling lets us notice page changes
+                    // (user/agent navigating between HOME and CHAT) promptly.
+                    val nextDue = kinds.minOf { (dueAt[it.name] ?: now) - now }
+                        .coerceAtLeast(0L)
+                    delay(nextDue.coerceAtMost(1_000L))
+                    continue
+                }
+                // Sort by (priority asc, due-time asc). P3 always beats P4;
+                // within the same tier the older-due one runs first.
+                val pick = eligible.sortedWith(
+                    compareBy({ it.priority }, { dueAt[it.name] ?: 0L })
+                ).first()
+                val r = runScanner(pick.name) { pick.run() }
+                Log.i(tag, "scan ${pick.name} ok=${r.ok} ${r.message}")
+                if (r.ok) broadcastLog("scan ${pick.name}: ${r.message}")
+                // Reschedule regardless of outcome — a skipped scan still
+                // counts so we don't busy-loop retrying the same kind.
+                dueAt[pick.name] = System.currentTimeMillis() + pick.cadenceMs
             }
         }
     }
 
     private suspend fun runScanner(label: String, block: suspend () -> ScanReport): ScanReport {
-        if (reactCommandActive) return ScanReport.skipped("设备正在执行任务，跳过 $label")
+        if (pendingCommandCount.get() > 0) return ScanReport.skipped("设备有待处理任务，跳过 $label")
         if (!uiAutomationMutex.tryLock()) return ScanReport.skipped("设备正在执行任务，跳过 $label")
         return try {
-            withTimeout(2_500L) { block() }
+            // Recheck after locking — a command may have been enqueued in the
+            // narrow window between the first check and the lock. Yield to it.
+            if (pendingCommandCount.get() > 0) {
+                ScanReport.skipped("设备任务在排队，跳过 $label")
+            } else {
+                withTimeout(2_500L) { block() }
+            }
         } catch (e: TimeoutCancellationException) {
             ScanReport.skipped("$label 超时，跳过")
         } finally {
             uiAutomationMutex.unlock()
+        }
+    }
+
+    private fun startCommandWorker() {
+        if (commandWorkerJob?.isActive == true) return
+        commandWorkerJob = scope.launch {
+            for (task in commandQueue) {
+                try {
+                    dispatchQueuedCommand(task)
+                } catch (e: Exception) {
+                    Log.w(tag, "queued command ${task.command} failed", e)
+                    broadcastLog("命令执行异常 ${task.command}: ${e.message}")
+                } finally {
+                    pendingCommandCount.decrementAndGet()
+                }
+            }
+        }
+    }
+
+    private suspend fun dispatchQueuedCommand(task: CommandTask) {
+        when (task.command) {
+            "dump_ui" -> {
+                val requestId = task.obj["request_id"]?.jsonPrimitive?.contentOrNull
+                val reason = task.obj["reason"]?.jsonPrimitive?.contentOrNull ?: "remote"
+                dumpAndUpload(reason, requestId)
+            }
+            "screen_start" -> {
+                val intervalMs = task.obj["interval_ms"]?.jsonPrimitive?.contentOrNull
+                    ?.toLongOrNull()
+                    ?.coerceIn(500L, 5_000L)
+                    ?: 1_000L
+                startScreenStream(intervalMs)
+            }
+            "screen_stop" -> stopScreenStream()
+            else -> handleReactCommand(task.command, task.obj)
+        }
+    }
+
+    private fun enqueueCommand(command: String, obj: JsonObject) {
+        pendingCommandCount.incrementAndGet()
+        val result = commandQueue.trySend(CommandTask(command, obj))
+        if (result.isFailure) {
+            pendingCommandCount.decrementAndGet()
+            Log.w(tag, "command queue rejected $command")
+            broadcastLog("命令队列已满，丢弃 $command")
         }
     }
 

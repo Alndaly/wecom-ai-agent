@@ -95,6 +95,16 @@ class Settings(BaseSettings):
     # ---- Long-term memory ----
     memory_summary_every: int = 10  # generate / refresh summary every N inbound msgs
     memory_refresh_enabled: bool = False
+    # ---- Concurrency ----
+    # How many conversations on the same robot may have their AI reply
+    # generated in parallel. Same-conversation work always serializes (reply
+    # ordering + per-contact profile/memory writes). The downstream device
+    # remains a serial chokepoint via the RobotTaskQueue, so raising this only
+    # pipelines LLM time against device send time.
+    auto_reply_concurrency_per_robot: int = 3
+    # Global cap on simultaneous LLM chat calls. Protects provider rate limits
+    # / cost budget regardless of how many robots × conversations are active.
+    llm_max_concurrent: int = 12
     # ---- Message retention ----
     # Daily sweep deletes messages older than this. Set to 0 to disable.
     message_retention_days: int = 30

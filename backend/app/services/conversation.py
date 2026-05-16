@@ -409,13 +409,11 @@ async def ingest_inbound_message(
             conv.mode,
         )
 
-    # MVP3: refresh long-term memory in the background of the request.
-    # Disabled by default while validating raw message-callback coverage.
+    # MVP3: refresh long-term memory off the request's critical path. The
+    # summarizer owns its own DB session and serializes per-contact internally
+    # — see app/memory/summarizer.py:schedule_refresh.
     if settings.memory_refresh_enabled:
-        try:
-            await summarizer.maybe_refresh(db, contact=contact, conv=conv)
-        except Exception:
-            log.exception("memory refresh failed")
+        summarizer.schedule_refresh(contact.id, conv.id)
     else:
         log.info(
             "[message-callback] memory refresh disabled conv=%s msg=%s",

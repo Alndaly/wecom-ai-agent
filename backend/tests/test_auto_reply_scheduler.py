@@ -13,7 +13,7 @@ async def test_wake_robot_rechecks_pending_work_while_idle(monkeypatch):
     calls = 0
     processed: list[int] = []
 
-    async def fake_next_pending_conversation(db, robot_pk, state):
+    async def fake_next_pending_conversation(db, robot_pk, state, *, exclude_ids=None):
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -29,6 +29,12 @@ async def test_wake_robot_rechecks_pending_work_while_idle(monkeypatch):
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
+
+        async def get(self, model, pk):
+            # The dispatcher hands the worker a conv_id; the worker re-fetches
+            # in its own session. For this test the model class doesn't matter
+            # — we just round-trip the id.
+            return type("Conv", (), {"id": pk})()
 
     monkeypatch.setattr(auto_reply_scheduler, "SessionLocal", lambda: FakeSession())
     monkeypatch.setattr(

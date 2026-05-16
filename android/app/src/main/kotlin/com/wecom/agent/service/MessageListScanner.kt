@@ -26,6 +26,7 @@ import kotlin.coroutines.resume
  */
 class MessageListScanner(
     private val log: (String) -> Unit,
+    private val shouldYield: () -> Boolean = { false },
 ) {
     private val tag = "MsgListScanner"
 
@@ -64,7 +65,13 @@ class MessageListScanner(
         var swipes = 0
         var stagnantStreak = 0
         var lastFingerprint = listFingerprint(svc)
+        var preempted = false
         while (swipes < maxSwipes) {
+            if (shouldYield()) {
+                preempted = true
+                log("检测到高优任务，提前让出（已下滑 $swipes 次）")
+                break
+            }
             val ok = swipe(svc, cx, yHigh, cx, yLow, durationMs = 280)
             if (!ok) {
                 log("swipe up 失败，提前结束")
@@ -87,12 +94,16 @@ class MessageListScanner(
         }
 
         // Restore — scroll back up the same number of times. Direction swaps:
-        // low → high on screen pulls the list back to top.
+        // low → high on screen pulls the list back to top. We DO restore even
+        // when preempted, otherwise the operator's view stays scrolled.
         repeat(swipes) {
             swipe(svc, cx, yLow, cx, yHigh, durationMs = 240)
             delay(240)
         }
-        return ScanReport.ok("已下滑 $swipes 次并恢复")
+        return ScanReport.ok(
+            if (preempted) "已下滑 $swipes 次并因高优任务提前恢复"
+            else "已下滑 $swipes 次并恢复"
+        )
     }
 
     private suspend fun ensureMessagesTab(svc: WeComAccessibilityService): ScanReport {
