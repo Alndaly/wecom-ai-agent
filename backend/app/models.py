@@ -100,7 +100,7 @@ class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
         Index("ix_msg_conv_created", "conversation_id", "created_at"),
-        UniqueConstraint("external_msg_id", name="uq_msg_external"),
+        UniqueConstraint("conversation_id", "external_msg_id", name="uq_msg_conv_external"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

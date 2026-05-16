@@ -206,33 +206,6 @@ async def ingest_inbound_message(
     see the full chat, but they never kick off an auto-reply.
     """
     now = utcnow()
-    # dedupe by external_msg_id when provided
-    if evt.external_msg_id:
-        existing = (
-            await db.execute(
-                select(Message).where(Message.external_msg_id == evt.external_msg_id)
-            )
-        ).scalar_one_or_none()
-        if existing:
-            age = now - existing.created_at
-            if age <= timedelta(minutes=5):
-                log.info(
-                    "[message-callback] duplicate external_msg_id skipped conv=%s msg=%s external_msg_id=%s content=%r",
-                    existing.conversation_id,
-                    existing.id,
-                    evt.external_msg_id,
-                    evt.content or "",
-                )
-                return None
-            log.warning(
-                "[message-callback] stale external_msg_id collision accepted existing_msg=%s age=%s external_msg_id=%s content=%r",
-                existing.id,
-                age,
-                evt.external_msg_id,
-                evt.content or "",
-            )
-            evt.external_msg_id = None
-
     cleaned = _clean_content(evt.content)
     contact_key = (evt.contact.external_id or evt.contact.nickname or "").strip()
     if not cleaned:
@@ -283,6 +256,37 @@ async def ingest_inbound_message(
         )
         db.add(conv)
         await db.flush()
+
+    # dedupe by external_msg_id (scoped to this conversation — the same hash on a
+    # different robot/device is a legitimately distinct message).
+    if evt.external_msg_id:
+        existing = (
+            await db.execute(
+                select(Message).where(
+                    Message.conversation_id == conv.id,
+                    Message.external_msg_id == evt.external_msg_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            age = now - existing.created_at
+            if age <= timedelta(minutes=5):
+                log.info(
+                    "[message-callback] duplicate external_msg_id skipped conv=%s msg=%s external_msg_id=%s content=%r",
+                    existing.conversation_id,
+                    existing.id,
+                    evt.external_msg_id,
+                    evt.content or "",
+                )
+                return None
+            log.warning(
+                "[message-callback] stale external_msg_id collision accepted existing_msg=%s age=%s external_msg_id=%s content=%r",
+                existing.id,
+                age,
+                evt.external_msg_id,
+                evt.content or "",
+            )
+            evt.external_msg_id = None
 
     # IMPORTANT: server time only.
     # We used to honour evt.sent_at (client clock) and that meant a phone

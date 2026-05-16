@@ -537,7 +537,7 @@ def _fast_decide(
     if _last_success(history, "input_text"):
         search_input_done = _last_success(history, "input_text", locator_role="search_input")
         if search_input_done:
-            cached_target_after_search = None if "chat_target" in failed_cache_roles else locator_store.match("chat_target", obs.nodes, target=target)
+            cached_target_after_search = None if "chat_target" in failed_cache_roles else locator_store.match("chat_target", obs.nodes, target=target, screen_size=obs.screen_size)
             if cached_target_after_search is not None:
                 return {
                     "thought": "搜索已输入，命中缓存的搜索结果会话 locator。",
@@ -553,7 +553,7 @@ def _fast_decide(
                 }, "rule"
             return None, "none"
 
-        cached_send = None if "send_button" in failed_cache_roles else locator_store.match("send_button", obs.nodes, target=target)
+        cached_send = None if "send_button" in failed_cache_roles else locator_store.match("send_button", obs.nodes, target=target, screen_size=obs.screen_size)
         if cached_send is not None:
             return {
                 "thought": "消息已输入，命中缓存的发送按钮 locator。",
@@ -570,7 +570,7 @@ def _fast_decide(
         return None, "none"
 
     if _last_success(history, "tap_node", locator_role="chat_target"):
-        cached_message_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target)
+        cached_message_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target, screen_size=obs.screen_size)
         if cached_message_input is not None:
             return {
                 "thought": "目标会话已打开，命中缓存的消息输入框 locator。",
@@ -586,7 +586,7 @@ def _fast_decide(
             }, "rule"
 
     if _last_success(history, "tap_node", locator_role="search_entry"):
-        cached_search_input = None if "search_input" in failed_cache_roles else locator_store.match("search_input", obs.nodes, target=target)
+        cached_search_input = None if "search_input" in failed_cache_roles else locator_store.match("search_input", obs.nodes, target=target, screen_size=obs.screen_size)
         if cached_search_input is not None:
             return {
                 "thought": "搜索入口已打开，命中缓存的搜索输入框 locator。",
@@ -602,7 +602,7 @@ def _fast_decide(
             }, "rule"
         return None, "none"
 
-    cached_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target)
+    cached_input = None if "message_input" in failed_cache_roles else locator_store.match("message_input", obs.nodes, target=target, screen_size=obs.screen_size)
     if cached_input is not None:
         return {
             "thought": "命中缓存的消息输入框 locator，直接输入目标文本。",
@@ -617,7 +617,7 @@ def _fast_decide(
             "args": {"node_id": editable.id, "text": text, "_locator_role": "message_input"},
         }, "rule"
 
-    cached_target = None if "chat_target" in failed_cache_roles else locator_store.match("chat_target", obs.nodes, target=target)
+    cached_target = None if "chat_target" in failed_cache_roles else locator_store.match("chat_target", obs.nodes, target=target, screen_size=obs.screen_size)
     if cached_target is not None:
         return {
             "thought": "命中缓存的会话列表 locator，直接打开目标会话。",
@@ -632,7 +632,7 @@ def _fast_decide(
             "args": {"node_id": target_node.id, "_locator_role": "chat_target"},
         }, "rule"
 
-    cached_search_entry = None if "search_entry" in failed_cache_roles else locator_store.match("search_entry", obs.nodes, target=target)
+    cached_search_entry = None if "search_entry" in failed_cache_roles else locator_store.match("search_entry", obs.nodes, target=target, screen_size=obs.screen_size)
     if cached_search_entry is not None:
         return {
             "thought": "首屏未找到目标联系人，命中缓存的搜索入口 locator。",
@@ -709,11 +709,16 @@ def _post_tap_verdict(prev_step: AgentStep, obs: _Observation, goal: str) -> str
     cur = (input_node.text or "").strip()
     if not cur:
         return "输入框已清空，发送已生效"
-    # If we can parse the goal, we can check explicitly.
     parsed = parse_send_goal(goal)
     if parsed and parsed.text.strip() in cur:
         return f"输入框仍含待发送文本「{cur}」—— 此次点击未触发发送，请换一个节点尝试或确认按钮是否可用"
-    return "输入框内容已不再匹配待发送文本，发送可能已生效"
+    if parsed and parsed.text.strip() not in cur:
+        # We parsed the goal and the input no longer holds that exact text —
+        # the previous tap likely sent, and what's left is a different draft.
+        return "输入框内容已不再匹配待发送文本，发送可能已生效"
+    # Goal was unparsable, but the input is still non-empty — that alone is
+    # evidence the send didn't fire. Don't optimistically assume success.
+    return f"输入框仍有文本「{cur}」—— 此次点击未触发发送，请换一个节点尝试或确认按钮是否可用"
 
 
 def _post_back_verdict(prev_step: AgentStep, obs: _Observation) -> str | None:

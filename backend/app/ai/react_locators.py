@@ -46,14 +46,21 @@ class LocatorStore:
         self.path = _CACHE_DIR / f"{robot.robot_id}.json"
         self.data = self._load()
 
-    def match(self, role: str, nodes: dict[int, UiNode], *, target: str | None = None) -> UiNode | None:
+    def match(
+        self,
+        role: str,
+        nodes: dict[int, UiNode],
+        *,
+        target: str | None = None,
+        screen_size: tuple[int, int] | None = None,
+    ) -> UiNode | None:
         entries = [
             e for e in self.data.get("locators", [])
             if e.get("role") == role and e.get("enabled", True)
         ]
         entries.sort(key=lambda e: (int(e.get("success_count") or 0), e.get("updated_at") or ""), reverse=True)
         for entry in entries[:5]:
-            node = _match_entry(entry, nodes, target=target)
+            node = _match_entry(entry, nodes, target=target, screen_size=screen_size)
             if node is not None:
                 log.info(
                     "react locator matched robot=%s role=%s node=%s source=%s",
@@ -74,8 +81,15 @@ class LocatorStore:
         obs_meta: dict[str, Any],
         source: str,
         target: str | None = None,
+        screen_size: tuple[int, int] | None = None,
     ) -> None:
-        locator = _locator_from_node(role=role, action=action, node=node, source=source, target=target)
+        if screen_size is None:
+            meta_size = obs_meta.get("screen_size") if isinstance(obs_meta, dict) else None
+            if isinstance(meta_size, (list, tuple)) and len(meta_size) == 2:
+                screen_size = (int(meta_size[0] or 0), int(meta_size[1] or 0))
+        locator = _locator_from_node(
+            role=role, action=action, node=node, source=source, target=target, screen_size=screen_size
+        )
         locator["last_observation"] = obs_meta
         locators = [e for e in self.data.get("locators", []) if e.get("role") != role]
         old = next((e for e in self.data.get("locators", []) if e.get("role") == role), None)
@@ -163,16 +177,30 @@ class LocatorStore:
         return meta_path
 
     def _load(self) -> dict[str, Any]:
+        empty = {"version": 2, "robot_id": self.robot.robot_id, "locators": [], "created_at": _now()}
         if not self.path.exists():
-            return {"version": 1, "robot_id": self.robot.robot_id, "locators": [], "created_at": _now()}
+            return empty
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("locators", [])
-                return data
+            if not isinstance(data, dict):
+                return empty
+            # v1 stored bounds_ratio as absolute pixels — drop those entries so
+            # they don't get reused on a different-resolution device. The cache
+            # rebuilds itself on the next successful action.
+            if int(data.get("version") or 1) < 2:
+                dropped = len(data.get("locators") or [])
+                if dropped:
+                    log.info(
+                        "react locator cache upgrade robot=%s dropped %d legacy entries",
+                        self.robot.robot_id, dropped,
+                    )
+                data["locators"] = []
+                data["version"] = 2
+            data.setdefault("locators", [])
+            return data
         except Exception as e:  # noqa: BLE001
             log.warning("react locator cache load failed path=%s error=%s", self.path, e)
-        return {"version": 1, "robot_id": self.robot.robot_id, "locators": [], "created_at": _now()}
+        return empty
 
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -204,9 +232,10 @@ def role_for_decision(action: str, args: dict[str, Any], node: UiNode | None, go
 
 
 def _locator_from_node(
-    *, role: str, action: str, node: UiNode, source: str, target: str | None
+    *, role: str, action: str, node: UiNode, source: str, target: str | None,
+    screen_size: tuple[int, int] | None,
 ) -> dict[str, Any]:
-    l, t, r, b = node.bounds if len(node.bounds) == 4 else [0, 0, 0, 0]
+    bounds = node.bounds if len(node.bounds) == 4 else [0, 0, 0, 0]
     label = _label(node)
     return {
         "role": role,
@@ -228,17 +257,20 @@ def _locator_from_node(
             "clickable": node.clickable,
             "focusable": node.focusable,
             "scrollable": node.scrollable,
-            "bounds_ratio": [round(x, 4) for x in (l, t, r, b)],
+            "bounds_ratio": _to_ratio(bounds, screen_size),
             "target_sample": target,
         },
     }
 
 
-def _match_entry(entry: dict[str, Any], nodes: dict[int, UiNode], *, target: str | None) -> UiNode | None:
+def _match_entry(
+    entry: dict[str, Any], nodes: dict[int, UiNode], *, target: str | None,
+    screen_size: tuple[int, int] | None,
+) -> UiNode | None:
     spec = entry.get("match") or {}
     scored: list[tuple[int, UiNode]] = []
     for node in nodes.values():
-        score = _score_node(spec, node, target=target)
+        score = _score_node(spec, node, target=target, screen_size=screen_size)
         if score >= 70:
             scored.append((score, node))
     if not scored:
@@ -247,7 +279,10 @@ def _match_entry(entry: dict[str, Any], nodes: dict[int, UiNode], *, target: str
     return scored[0][1]
 
 
-def _score_node(spec: dict[str, Any], node: UiNode, *, target: str | None) -> int:
+def _score_node(
+    spec: dict[str, Any], node: UiNode, *, target: str | None,
+    screen_size: tuple[int, int] | None,
+) -> int:
     score = 0
     label = _label(node)
     text_mode = spec.get("text_mode")
@@ -265,17 +300,47 @@ def _score_node(spec: dict[str, Any], node: UiNode, *, target: str | None) -> in
         val = spec.get(key)
         if val is not None and bool(val) == bool(getattr(node, key)):
             score += weight
-    if _bounds_close(spec.get("bounds_ratio"), node.bounds):
+    if _bounds_close(spec.get("bounds_ratio"), node.bounds, screen_size):
         score += 16
     return score
 
 
-def _bounds_close(expected: Any, actual: list[int]) -> bool:
+def _to_ratio(bounds: list[int], screen_size: tuple[int, int] | None) -> list[float] | None:
+    """Normalize absolute pixel bounds to ratio [0,1] of the screen size.
+
+    Without a screen size we cannot normalize safely — return None so the bounds
+    contribution is skipped at match time rather than poisoning future matches
+    on a different-resolution device.
+    """
+    if not screen_size:
+        return None
+    w, h = screen_size
+    if w <= 0 or h <= 0 or len(bounds) != 4:
+        return None
+    l, t, r, b = bounds
+    return [round(l / w, 4), round(t / h, 4), round(r / w, 4), round(b / h, 4)]
+
+
+def _bounds_close(
+    expected: Any, actual: list[int], screen_size: tuple[int, int] | None,
+) -> bool:
     if not isinstance(expected, list) or len(expected) != 4 or len(actual) != 4:
         return False
-    # Bounds are stored as absolute px from the observed device. This is enough
-    # for one robot; class/text/view-id carry the rest when UI shifts slightly.
-    return sum(abs(float(a) - float(b)) for a, b in zip(expected, actual)) <= 120
+    if not screen_size:
+        return False
+    w, h = screen_size
+    if w <= 0 or h <= 0:
+        return False
+    # Legacy entries stored absolute pixels under the same field name. Any value
+    # > 1.5 means it's pixels, not ratio — skip rather than misinterpret.
+    if any(float(v) > 1.5 for v in expected):
+        return False
+    al, at, ar, ab = actual
+    actual_ratio = (al / w, at / h, ar / w, ab / h)
+    diff = sum(abs(float(e) - float(a)) for e, a in zip(expected, actual_ratio))
+    # 0.12 across 4 edges ≈ 3% average drift per edge — tolerates minor layout
+    # jitter while rejecting cross-screen-region matches.
+    return diff <= 0.12
 
 
 def _node_snapshot(node: UiNode) -> dict[str, Any]:
