@@ -22,3 +22,8 @@ android/.idea/
 *.log
 /tmp/
 ui_dumps/
+react_fallbacks/
+react_locator_cache/
+.claude/
+.playwright-cli/
+output/

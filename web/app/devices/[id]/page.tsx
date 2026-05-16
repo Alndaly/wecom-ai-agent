@@ -107,12 +107,16 @@ export default function DeviceDetailPage() {
   useEffect(() => {
     if (!Number.isFinite(id)) return;
     const loadLogs = () => {
-      api<RobotTaskLog[]>(`/robots/${id}/logs?limit=50`)
-        .then(setLogs)
+      // Backend returns DESC by created_at; flip to ASC so the panel reads
+      // top→bottom in execution order (observe → think → act → result).
+      api<RobotTaskLog[]>(`/robots/${id}/logs?limit=200`)
+        .then((rows) => setLogs([...rows].reverse()))
         .catch(() => {});
     };
     loadLogs();
-    const timer = setInterval(loadLogs, 5000);
+    // WS pushes new entries in real time (see task.log handler); this poll is
+    // just a 30s safety net for missed events.
+    const timer = setInterval(loadLogs, 30_000);
     return () => clearInterval(timer);
   }, [id]);
 
@@ -154,11 +158,36 @@ export default function DeviceDetailPage() {
       if (payload.ok === false) toast.error("设备命令失败", { description: message });
     }
     if (event === "device.ui_dump" && robot?.robot_id === payload.robot_id) {
-      if (pendingDumpRequest && payload.request_id && payload.request_id !== pendingDumpRequest) return;
+      // Only show the dialog when *this* operator clicked "获取 UI 树".
+      // ReAct-driven dumps (`reason: "react"`) and dumps initiated by other
+      // operators also fan out on this WS, but we silently ignore them —
+      // otherwise the dialog would pop up every step of an agent run.
+      if (!pendingDumpRequest) return;
+      if (payload.request_id !== pendingDumpRequest) return;
       setUiDump(payload);
       setDumping(false);
       setPendingDumpRequest(null);
       toast.success("UI 树已回传");
+    }
+    if (event === "task.log" && robot?.robot_id === payload.robot_id) {
+      // Append the freshly-arrived log row (oldest at top, newest at bottom).
+      // The polling effect will reconcile any missed rows every 30s; this
+      // path is the one that makes the trace feel live during a ReAct run.
+      const row: RobotTaskLog = {
+        id: Number(payload.id ?? Date.now()),
+        robot_id: 0,
+        task_id: payload.task_id ?? null,
+        level: payload.level ?? "info",
+        message: payload.message ?? "",
+        created_at: payload.created_at ?? new Date().toISOString(),
+      };
+      setLogs((prev) => {
+        if (row.id && prev.some((p) => p.id === row.id)) return prev;
+        return [...prev, row];
+      });
+    }
+    if (event === "robot.logs_cleared" && robot?.robot_id === payload.robot_id) {
+      setLogs([]);
     }
   });
 

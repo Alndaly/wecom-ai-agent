@@ -1,3 +1,0 @@
-=== fake ===
-[Root] txt="hello"
-  [TextView] txt="world"
