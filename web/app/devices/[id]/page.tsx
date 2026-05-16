@@ -806,6 +806,14 @@ function QueueRow({
             <span className="font-mono text-xs font-medium">#{item.task_id}</span>
             <span className="truncate text-xs text-muted-foreground">{queueKindLabel(item.kind)}</span>
           </div>
+          <div className="mt-1 line-clamp-2 break-words text-xs font-medium leading-snug">
+            {item.title}
+          </div>
+          {item.detail && (
+            <div className="mt-0.5 line-clamp-2 break-words text-[11px] leading-snug text-muted-foreground">
+              {item.detail}
+            </div>
+          )}
           <div className="mt-1 flex flex-wrap gap-2 font-mono text-[10.5px] text-muted-foreground">
             <span>priority={item.priority}</span>
             <span>wait={formatDuration(item.waited_ms)}</span>

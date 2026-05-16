@@ -62,6 +62,8 @@ class _Item:
     task_id: int = field(compare=False)
     kind: str = field(compare=False)
     enqueued_at: float = field(compare=False)
+    title: str = field(compare=False)
+    detail: str | None = field(compare=False)
 
 
 # ---- the queue -----------------------------------------------------------
@@ -80,12 +82,15 @@ class RobotQueue:
 
     async def enqueue(self, kind: str, task_id: int, *, priority: int) -> None:
         self._seq += 1
+        title, detail = await _task_labels(kind, task_id)
         item = _Item(
             priority=priority,
             seq=self._seq,
             task_id=task_id,
             kind=kind,
             enqueued_at=time.monotonic(),
+            title=title,
+            detail=detail,
         )
         await self._q.put(item)
         log.info(
@@ -127,28 +132,9 @@ class RobotQueue:
         pending = sorted(list(self._q._queue), key=lambda x: (x.priority, x.seq))  # type: ignore[attr-defined]
         return {
             "robot_id": self.robot_id,
-            "running": (
-                {
-                    "kind": self._current.kind,
-                    "task_id": self._current.task_id,
-                    "priority": self._current.priority,
-                    "waited_ms": int((time.monotonic() - self._current.enqueued_at) * 1000),
-                    "cancellable": True,
-                }
-                if self._current is not None
-                else None
-            ),
+            "running": _item_snapshot(self._current) if self._current is not None else None,
             "depth": len(pending),
-            "pending": [
-                {
-                    "kind": p.kind,
-                    "task_id": p.task_id,
-                    "priority": p.priority,
-                    "waited_ms": int((time.monotonic() - p.enqueued_at) * 1000),
-                    "cancellable": True,
-                }
-                for p in pending[:20]  # cap displayed
-            ],
+            "pending": [_item_snapshot(p) for p in pending[:20]],  # cap displayed
         }
 
     async def stop(self) -> None:
@@ -249,6 +235,39 @@ def snapshot(robot_id: str) -> dict:
     return q.snapshot() if q is not None else {
         "robot_id": robot_id, "running": None, "depth": 0, "pending": [],
     }
+
+
+def _item_snapshot(item: _Item) -> dict:
+    return {
+        "kind": item.kind,
+        "task_id": item.task_id,
+        "title": item.title,
+        "detail": item.detail,
+        "priority": item.priority,
+        "waited_ms": int((time.monotonic() - item.enqueued_at) * 1000),
+        "cancellable": True,
+    }
+
+
+async def _task_labels(kind: str, task_id: int) -> tuple[str, str | None]:
+    async with SessionLocal() as db:
+        task = await db.get(RobotTask, task_id)
+        payload = task.payload_json if task is not None else {}
+    if kind == "agent_goal":
+        goal = str(payload.get("goal") or "").strip()
+        return _clip(goal or f"语义指令 #{task_id}", 52), None
+    if kind == "send_text":
+        contact = str(payload.get("conversation_external_id") or "目标联系人").strip()
+        text = str(payload.get("text") or "").strip()
+        return f"发送给「{_clip(contact, 18)}」", _clip(text, 72) if text else None
+    return f"{kind} #{task_id}", None
+
+
+def _clip(text: str, limit: int) -> str:
+    value = " ".join(text.split())
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)] + "…"
 
 
 async def cancel(robot_id: str, task_id: int) -> bool:

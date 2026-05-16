@@ -231,6 +231,8 @@ export type RobotTaskLog = {
 export type RobotQueueItem = {
   kind: string;
   task_id: number;
+  title: string;
+  detail: string | null;
   priority: number;
   waited_ms: number;
   cancellable?: boolean;
