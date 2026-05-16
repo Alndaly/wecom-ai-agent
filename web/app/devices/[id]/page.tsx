@@ -12,6 +12,7 @@ import {
   MonitorUp,
   Radio,
   Send,
+  ShieldAlert,
   Square,
   Smartphone,
   Trash2,
@@ -44,6 +45,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import type { RobotQueueItem, RobotQueueSnapshot } from "@/lib/api";
 
 type ScreenFrame = {
   robot_id: string;
@@ -79,12 +81,8 @@ export default function DeviceDetailPage() {
   const [pendingDumpRequest, setPendingDumpRequest] = useState<string | null>(null);
   const [uiDump, setUiDump] = useState<UiDump | null>(null);
   const [logs, setLogs] = useState<RobotTaskLog[]>([]);
-  const [queue, setQueue] = useState<{
-    robot_id: string;
-    running: { kind: string; task_id: number; priority: number; waited_ms: number } | null;
-    depth: number;
-    pending: { kind: string; task_id: number; priority: number; waited_ms: number }[];
-  } | null>(null);
+  const [queue, setQueue] = useState<RobotQueueSnapshot | null>(null);
+  const [cancellingTaskId, setCancellingTaskId] = useState<number | null>(null);
   const [clearingLogs, setClearingLogs] = useState(false);
   const [clearLogsOpen, setClearLogsOpen] = useState(false);
   const [agentGoal, setAgentGoal] = useState("");
@@ -129,7 +127,7 @@ export default function DeviceDetailPage() {
   useEffect(() => {
     if (!Number.isFinite(id)) return;
     const loadQueue = () =>
-      api<NonNullable<typeof queue>>(`/robots/${id}/queue`)
+      api<RobotQueueSnapshot>(`/robots/${id}/queue`)
         .then(setQueue)
         .catch(() => {});
     loadQueue();
@@ -205,6 +203,9 @@ export default function DeviceDetailPage() {
         // Newest on top — prepend.
         return [row, ...prev];
       });
+    }
+    if (event === "task.updated") {
+      api<RobotQueueSnapshot>(`/robots/${id}/queue`).then(setQueue).catch(() => {});
     }
     if (event === "robot.logs_cleared" && robot?.robot_id === payload.robot_id) {
       setLogs([]);
@@ -302,6 +303,21 @@ export default function DeviceDetailPage() {
       toast.error("下发失败", { description: e?.message ?? String(e) });
     } finally {
       setAgentSubmitting(false);
+    }
+  }
+
+  async function cancelTask(taskId: number) {
+    if (!Number.isFinite(id)) return;
+    setCancellingTaskId(taskId);
+    try {
+      await api(`/robots/${id}/tasks/${taskId}/cancel`, { method: "POST" });
+      toast.success(`已请求中断任务 #${taskId}`);
+      const latest = await api<RobotQueueSnapshot>(`/robots/${id}/queue`);
+      setQueue(latest);
+    } catch (e: any) {
+      toast.error("中断失败", { description: e?.message ?? String(e) });
+    } finally {
+      setCancellingTaskId(null);
     }
   }
 
@@ -404,6 +420,11 @@ export default function DeviceDetailPage() {
               />
             </CardContent>
           </Card>
+          <TaskQueuePanel
+            queue={queue}
+            cancellingTaskId={cancellingTaskId}
+            onCancel={cancelTask}
+          />
         </aside>
 
         <main className="min-h-0">
@@ -705,6 +726,119 @@ function AgentCommandCard({
       </CardContent>
     </Card>
   );
+}
+
+function TaskQueuePanel({
+  queue,
+  cancellingTaskId,
+  onCancel,
+}: {
+  queue: RobotQueueSnapshot | null;
+  cancellingTaskId: number | null;
+  onCancel: (taskId: number) => void;
+}) {
+  const pending = queue?.pending ?? [];
+  const empty = !queue?.running && pending.length === 0;
+  return (
+    <Card className="rounded-lg shadow-sm">
+      <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-4">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <ShieldAlert className="h-4 w-4 text-muted-foreground" />
+          任务队列
+        </CardTitle>
+        <Badge variant={empty ? "secondary" : "warning"} className="h-6 font-mono">
+          {empty ? "idle" : `${(queue?.depth ?? 0) + (queue?.running ? 1 : 0)}`}
+        </Badge>
+      </CardHeader>
+      <CardContent className="space-y-3 p-3">
+        {queue?.running ? (
+          <QueueRow
+            item={queue.running}
+            status="running"
+            cancelling={cancellingTaskId === queue.running.task_id}
+            onCancel={onCancel}
+          />
+        ) : (
+          <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+            当前没有运行中的任务
+          </div>
+        )}
+        {pending.length > 0 && (
+          <div className="space-y-2">
+            <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              等待中
+            </div>
+            {pending.map((item) => (
+              <QueueRow
+                key={item.task_id}
+                item={item}
+                status="pending"
+                cancelling={cancellingTaskId === item.task_id}
+                onCancel={onCancel}
+              />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function QueueRow({
+  item,
+  status,
+  cancelling,
+  onCancel,
+}: {
+  item: RobotQueueItem;
+  status: "running" | "pending";
+  cancelling: boolean;
+  onCancel: (taskId: number) => void;
+}) {
+  return (
+    <div className="rounded-md border bg-background px-3 py-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge variant={status === "running" ? "success" : "outline"} className="h-5 px-1.5 text-[10px]">
+              {status === "running" ? "运行中" : "等待"}
+            </Badge>
+            <span className="font-mono text-xs font-medium">#{item.task_id}</span>
+            <span className="truncate text-xs text-muted-foreground">{queueKindLabel(item.kind)}</span>
+          </div>
+          <div className="mt-1 flex flex-wrap gap-2 font-mono text-[10.5px] text-muted-foreground">
+            <span>priority={item.priority}</span>
+            <span>wait={formatDuration(item.waited_ms)}</span>
+          </div>
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          disabled={cancelling || item.cancellable === false}
+          onClick={() => onCancel(item.task_id)}
+          className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
+          title="中断任务"
+        >
+          {cancelling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Square className="h-3.5 w-3.5" />}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function queueKindLabel(kind: string): string {
+  if (kind === "send_text") return "发送消息";
+  if (kind === "agent_goal") return "语义指令";
+  return kind;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min <= 0) return `${sec}s`;
+  return `${min}m${sec.toString().padStart(2, "0")}s`;
 }
 
 function TaskLogPanel({

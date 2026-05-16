@@ -184,6 +184,31 @@ async def get_robot_queue(
     return task_queue.snapshot(robot.robot_id)
 
 
+@router.post("/{rid}/tasks/{task_id}/cancel", response_model=RobotCommandOut)
+async def cancel_robot_task(
+    rid: int,
+    task_id: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RobotCommandOut:
+    """Cancel a queued or currently running backend-driven device task."""
+    robot = await db.get(Robot, rid)
+    if not robot or robot.team_id != user.team_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    task = await db.get(RobotTask, task_id)
+    if not task or task.robot_id != robot.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "task not found")
+    if task.status in {"completed", "failed", "cancelled", "timeout"}:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"task already {task.status}")
+
+    from app.services import task_queue
+
+    cancelled = await task_queue.cancel(robot.robot_id, task_id)
+    if not cancelled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "task is not cancellable")
+    return RobotCommandOut(dispatched=True)
+
+
 @router.delete("/{rid}/logs", status_code=status.HTTP_204_NO_CONTENT)
 async def clear_robot_logs(
     rid: int,
@@ -296,6 +321,23 @@ async def run_agent_goal_task(task_id: int) -> None:
                 log_sink=_sink,
                 force_llm=force_llm,
             )
+            if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
+        except asyncio.CancelledError:
+            task_row = await db.get(RobotTask, task_id)
+            if task_row is not None:
+                task_row.status = "cancelled"
+                task_row.last_error = "任务执行已中断"
+                db.add(RobotTaskLog(
+                    robot_id=robot.id, task_id=task.id, level="warn",
+                    message="[react] cancelled by operator",
+                ))
+                await db.commit()
+                await hub.broadcast_web(
+                    robot.team_id, "task.updated",
+                    {"task_id": task.id, "status": task_row.status, "error": task_row.last_error},
+                )
+            raise
         except Exception as e:  # noqa: BLE001
             log.exception("agent_goal crashed task=%s", task.id)
             task_row = await db.get(RobotTask, task_id)

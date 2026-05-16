@@ -24,6 +24,7 @@ values are internal — *lower number runs first*.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
 import time
 from dataclasses import dataclass, field
@@ -32,7 +33,7 @@ from typing import Awaitable, Callable
 from sqlalchemy import select
 
 from app.core.db import SessionLocal
-from app.models import Robot, RobotTask
+from app.models import Message, Robot, RobotTask
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class RobotQueue:
         self._seq = 0  # monotonic tie-breaker — preserves FIFO within priority
         self._consumer: asyncio.Task[None] | None = None
         self._current: _Item | None = None
+        self._current_task: asyncio.Task[None] | None = None
         self._registry: dict[str, Runner] = {}
 
     def register(self, kind: str, runner: Runner) -> None:
@@ -97,6 +99,26 @@ class RobotQueue:
                 self._run(), name=f"robot-queue-{self.robot_id}"
             )
 
+    async def cancel(self, task_id: int) -> bool:
+        pending = list(self._q._queue)  # type: ignore[attr-defined]
+        for item in pending:
+            if item.task_id == task_id:
+                pending.remove(item)
+                heapq.heapify(pending)
+                self._q._queue = pending  # type: ignore[attr-defined]
+                self._q.task_done()
+                await _mark_cancelled(task_id, "任务已从等待队列中取消")
+                log.info("queue robot=%s cancelled pending task=%s", self.robot_id, task_id)
+                return True
+
+        if self._current is not None and self._current.task_id == task_id:
+            await _audit(task_id, "warn", "收到中断请求，正在停止当前任务")
+            if self._current_task is not None and not self._current_task.done():
+                self._current_task.cancel()
+            log.info("queue robot=%s cancelling running task=%s", self.robot_id, task_id)
+            return True
+        return False
+
     def snapshot(self) -> dict:
         """For introspection / `/queue` endpoint."""
         # PriorityQueue exposes _queue (a heap list) — we copy it to peek
@@ -111,6 +133,7 @@ class RobotQueue:
                     "task_id": self._current.task_id,
                     "priority": self._current.priority,
                     "waited_ms": int((time.monotonic() - self._current.enqueued_at) * 1000),
+                    "cancellable": True,
                 }
                 if self._current is not None
                 else None
@@ -122,6 +145,7 @@ class RobotQueue:
                     "task_id": p.task_id,
                     "priority": p.priority,
                     "waited_ms": int((time.monotonic() - p.enqueued_at) * 1000),
+                    "cancellable": True,
                 }
                 for p in pending[:20]  # cap displayed
             ],
@@ -151,22 +175,40 @@ class RobotQueue:
                     item.task_id, "info",
                     f"开始执行 kind={item.kind} 等待={wait_ms}ms",
                 )
+                await _mark_running(item.task_id)
                 if runner is None:
                     log.warning("queue robot=%s no runner for kind=%s", self.robot_id, item.kind)
                     await _audit(item.task_id, "warn", f"未知 kind={item.kind}，跳过")
                 else:
+                    self._current_task = asyncio.create_task(
+                        runner(item.task_id),
+                        name=f"robot-task-{self.robot_id}-{item.task_id}",
+                    )
                     try:
-                        await runner(item.task_id)
+                        await self._current_task
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
+                        await _mark_cancelled(item.task_id, "任务执行已中断")
                     except Exception as e:  # noqa: BLE001
                         log.exception(
                             "queue robot=%s runner crashed kind=%s task=%s",
                             self.robot_id, item.kind, item.task_id,
                         )
                         await _audit(item.task_id, "error", f"执行崩溃：{e}")
+                    finally:
+                        self._current_task = None
                 self._current = None
                 self._q.task_done()
         except asyncio.CancelledError:
             log.info("queue consumer cancelled robot=%s", self.robot_id)
+            if self._current_task is not None and not self._current_task.done():
+                self._current_task.cancel()
+                try:
+                    await self._current_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             raise
 
 
@@ -207,6 +249,13 @@ def snapshot(robot_id: str) -> dict:
     return q.snapshot() if q is not None else {
         "robot_id": robot_id, "running": None, "depth": 0, "pending": [],
     }
+
+
+async def cancel(robot_id: str, task_id: int) -> bool:
+    q = _QUEUES.get(robot_id)
+    if q is None:
+        return False
+    return await q.cancel(task_id)
 
 
 async def shutdown() -> None:
@@ -265,3 +314,75 @@ async def _audit(task_id: int, level: str, message: str) -> None:
         log.exception("queue audit failed task=%s", task_id)
 
 
+async def _mark_running(task_id: int) -> None:
+    try:
+        async with SessionLocal() as db:
+            task = await db.get(RobotTask, task_id)
+            if task is None:
+                return
+            if task.status == "cancelled":
+                return
+            robot = await db.get(Robot, task.robot_id)
+            if robot is None:
+                return
+            task.status = "running"
+            task.last_error = None
+            await db.commit()
+            from app.core.ws_manager import hub
+
+            await hub.broadcast_web(
+                robot.team_id,
+                "task.updated",
+                {"task_id": task.id, "status": task.status, "error": task.last_error},
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("queue running mark failed task=%s", task_id)
+
+
+async def _mark_cancelled(task_id: int, message: str) -> None:
+    from app.services.send_orchestrator import append_task_log
+
+    try:
+        async with SessionLocal() as db:
+            task = await db.get(RobotTask, task_id)
+            if task is None:
+                return
+            robot = await db.get(Robot, task.robot_id)
+            if robot is None:
+                return
+            task.status = "cancelled"
+            task.last_error = message
+            if task.message_id:
+                msg = await db.get(Message, task.message_id)
+                if msg is not None:
+                    msg.status = "cancelled"
+            await db.commit()
+            await append_task_log(
+                db,
+                robot=robot,
+                task_id=task_id,
+                level="warn",
+                message=f"[queue] {message}",
+            )
+            from app.core.ws_manager import hub
+
+            await hub.broadcast_web(
+                robot.team_id,
+                "task.updated",
+                {"task_id": task.id, "status": task.status, "error": task.last_error},
+            )
+            if task.message_id and task.conversation_id:
+                from app.schemas import MessageOut
+
+                msg = await db.get(Message, task.message_id)
+                if msg is not None:
+                    await hub.broadcast_web(
+                        robot.team_id,
+                        "message.updated",
+                        {
+                            "conversation_id": task.conversation_id,
+                            "message": MessageOut.model_validate(msg).model_dump(mode="json"),
+                        },
+                    )
+    except Exception:  # noqa: BLE001
+        log.exception("queue cancel mark failed task=%s", task_id)

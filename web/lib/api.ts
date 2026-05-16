@@ -228,6 +228,21 @@ export type RobotTaskLog = {
   created_at: string;
 };
 
+export type RobotQueueItem = {
+  kind: string;
+  task_id: number;
+  priority: number;
+  waited_ms: number;
+  cancellable?: boolean;
+};
+
+export type RobotQueueSnapshot = {
+  robot_id: string;
+  running: RobotQueueItem | null;
+  depth: number;
+  pending: RobotQueueItem[];
+};
+
 export type Robot = {
   id: number;
   name: string;

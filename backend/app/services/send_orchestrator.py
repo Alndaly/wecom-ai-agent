@@ -197,6 +197,8 @@ async def run_send_task(task_id: int) -> None:
                 log_sink=_sink,
                 force_llm=force_llm,
             )
+            if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
             task = await db.get(RobotTask, task_id)
             if task is None:
                 return
@@ -233,6 +235,34 @@ async def run_send_task(task_id: int) -> None:
                 m = await db.get(Message, task.message_id)
                 if m:
                     await _broadcast_message_update(robot.team_id, m)
+        except asyncio.CancelledError:
+            task = await db.get(RobotTask, task_id)
+            if task is not None:
+                task.status = "cancelled"
+                task.last_error = "任务执行已中断"
+                if task.message_id:
+                    msg = await db.get(Message, task.message_id)
+                    if msg:
+                        msg.status = "cancelled"
+                db.add(
+                    RobotTaskLog(
+                        robot_id=robot.id,
+                        task_id=task.id,
+                        level="warn",
+                        message="[react] cancelled by operator",
+                    )
+                )
+                await db.commit()
+                await hub.broadcast_web(
+                    robot.team_id,
+                    "task.updated",
+                    {"task_id": task.id, "status": task.status, "error": task.last_error},
+                )
+                if task.message_id:
+                    m = await db.get(Message, task.message_id)
+                    if m:
+                        await _broadcast_message_update(robot.team_id, m)
+            raise
         except Exception as e:  # noqa: BLE001
             log.exception("react send crashed: %s", e)
 
