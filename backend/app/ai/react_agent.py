@@ -501,6 +501,18 @@ def _fast_decide(
     }
 
     if not _is_wecom_tree(obs.tree):
+        # Some vendors (Huawei EMUI/HarmonyOS, MIUI background-launch limits)
+        # silently block `startActivity` from a non-foreground service — the
+        # Intent dispatches but WeCom never comes forward. If a launcher icon
+        # is visible, tap it via a11y instead (same path a user takes); only
+        # fall back to the Intent when no icon is in view.
+        icon = _find_launcher_icon(obs, ("企业微信", "WeCom"))
+        if icon is not None:
+            return {
+                "thought": "当前不在企业微信，点击桌面图标进入。",
+                "action": "tap_node",
+                "args": {"node_id": icon.id},
+            }, "rule"
         return {
             "thought": "当前不在企业微信，先切到前台。",
             "action": "open_wecom",
@@ -660,6 +672,31 @@ def _fast_decide(
 def _is_wecom_tree(tree: str) -> bool:
     header = tree.splitlines()[0] if tree else ""
     return "pkg=com.tencent.wework" in header
+
+
+def _find_launcher_icon(obs: _Observation, names: tuple[str, ...]) -> UiNode | None:
+    """Find a launcher app icon node matching one of the given labels.
+
+    Prefers the smallest-area matching node so a banner/folder containing the
+    label as part of a larger composite doesn't outrank the actual icon.
+    """
+    candidates: list[UiNode] = []
+    for n in obs.nodes.values():
+        if len(n.bounds) != 4:
+            continue
+        label = (n.text or n.desc or "").strip()
+        if label in names:
+            candidates.append(n)
+    if not candidates:
+        return None
+    clickable = [n for n in candidates if n.clickable]
+    pool = clickable or candidates
+
+    def _area(n: UiNode) -> int:
+        l, t, r, b = n.bounds
+        return max(0, r - l) * max(0, b - t)
+
+    return min(pool, key=_area)
 
 
 def _stuck_opening_wecom(history: list[AgentStep]) -> bool:

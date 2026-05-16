@@ -59,6 +59,22 @@ class WeComAutomator(
             if (ready) {
                 Pair(true, "已打开 WeCom")
             } else {
+                // Vendors like Huawei EMUI/HarmonyOS silently block background
+                // startActivity. Fall back to tapping the launcher icon via a11y
+                // — same path a user takes, no special permission needed.
+                val tapped = tapLauncherIconByLabel(svc, listOf("企业微信", "WeCom"))
+                if (tapped) {
+                    val ok = withTimeoutOrNull(5_000) {
+                        while (true) {
+                            val root = svc.rootInActiveWindow
+                            if (root?.packageName?.toString() == wecomPkg && root.childCount > 0) {
+                                return@withTimeoutOrNull true
+                            }
+                            delay(200)
+                        }
+                    } == true
+                    if (ok) return Pair(true, "已通过桌面图标打开 WeCom")
+                }
                 val root = svc.rootInActiveWindow
                 val pkg = root?.packageName?.toString() ?: "null"
                 Pair(false, "已发送打开请求，但未进入 WeCom 前台：pkg=$pkg children=${root?.childCount ?: 0}")
@@ -66,6 +82,20 @@ class WeComAutomator(
         } catch (e: Exception) {
             Pair(false, "openWeCom: ${e.message}")
         }
+    }
+
+    private fun tapLauncherIconByLabel(
+        svc: AccessibilityService,
+        labels: List<String>,
+    ): Boolean {
+        val root = svc.rootInActiveWindow ?: return false
+        val match = root.findFirst { node ->
+            val text = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
+            text in labels
+        } ?: return false
+        var n: AccessibilityNodeInfo? = match
+        while (n != null && !n.isClickable) n = n.parent
+        return (n ?: match).tap()
     }
 
     // ====================================================================
