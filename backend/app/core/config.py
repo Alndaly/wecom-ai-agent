@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     react_fallback_enabled: bool = True
     react_max_steps: int = 6
     react_step_timeout_sec: float = 12.0
+    # When False (default): deterministic locators try first, LLM is fallback
+    # (cheaper and faster for routine flows). When True: every step goes to
+    # the LLM with UI tree + screenshot, no rule shortcut. AI always picks a
+    # node id (never raw x/y) — backend resolves to coordinates.
+    react_force_llm: bool = False
     # ---- Conversational agent (ReAct + Tools / Skills / MCP) ----
     agent_mode_enabled: bool = True
     agent_max_steps: int = 5

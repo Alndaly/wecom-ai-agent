@@ -101,6 +101,9 @@ class AIBehaviorIn(BaseModel):
     max_tokens: int = Field(default=8192, ge=64, le=32768)
     agent_mode: bool = True
     agent_max_steps: int = Field(default=5, ge=1, le=20)
+    # 决策模式：False = 规则快路径优先、LLM 兜底（默认）；True = 每一步都走 LLM。
+    # AI 都只能选节点 ID，由后端解析坐标（不会让 AI 猜 x/y）。
+    react_force_llm: bool = False
 
 
 class ParserIn(BaseModel):

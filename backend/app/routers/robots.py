@@ -15,6 +15,7 @@ from app.core.security import new_robot_token
 from app.core.ws_manager import hub
 from app.deps import current_user
 from app.models import Robot, RobotTask, RobotTaskLog, User
+from app.services import settings_service
 from app.schemas import (
     AgentRunIn,
     AgentRunOut,
@@ -259,12 +260,19 @@ async def _run_agent_goal(*, robot_id: int, task_id: int) -> None:
                 )
 
         log.info("agent_goal start task=%s goal=%r max_steps=%d", task.id, goal, max_steps)
+        ai_cfg = await settings_service.get(db, robot.team_id, "ai")
+        force_llm = bool(
+            ai_cfg.get("react_force_llm")
+            if ai_cfg.get("react_force_llm") is not None
+            else settings.react_force_llm
+        )
         try:
             result = await run_react(
                 db, robot, goal,
                 max_steps=max_steps,
                 step_timeout=settings.react_step_timeout_sec,
                 log_sink=_sink,
+                force_llm=force_llm,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("agent_goal crashed task=%s", task.id)

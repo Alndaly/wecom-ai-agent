@@ -77,6 +77,7 @@ type AIBehaviorCfg = {
   max_tokens: number;
   agent_mode: boolean;
   agent_max_steps: number;
+  react_force_llm: boolean;
 };
 type ParserCfg = {
   backend: "builtin" | "mineru_local" | "mineru_api";
@@ -921,6 +922,41 @@ function AIBehaviorCard({ value, onSaved }: { value: AIBehaviorCfg; onSaved: () 
             />
           </div>
         </div>
+
+        <div className="space-y-3 rounded-md border bg-muted/30 p-3 text-sm">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="font-medium">设备 ReAct 决策模式</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                AI 仅决定要操作哪个节点，坐标始终由后端按节点 bounds 解析，**不会让 AI 猜 x / y**。
+              </p>
+            </div>
+            <Select
+              value={v.react_force_llm ? "llm_only" : "rule_first"}
+              onValueChange={(val) =>
+                setV({ ...v, react_force_llm: val === "llm_only" })
+              }
+            >
+              <SelectTrigger className="w-56">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="rule_first">
+                  规则快路径优先（LLM 兜底）
+                </SelectItem>
+                <SelectItem value="llm_only">
+                  完全由 AI 判断（每步走 LLM）
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            ·「规则快路径优先」：常见 send-text 等流程走缓存 locator，命中失败再调 LLM —— 省成本、低延迟。
+            <br />
+            ·「完全由 AI 判断」：每步都把 UI 树（+ 可选截图）发给 LLM 决策 —— 适合调试新场景或非常规流程，单次成本高。
+          </p>
+        </div>
+
         <Button onClick={save} disabled={busy} className="w-full sm:w-auto">
           <Save className="h-4 w-4" /> 保存 AI 行为
         </Button>

@@ -110,7 +110,16 @@ async def run_react(
     max_steps: int = 6,
     step_timeout: float = 12.0,
     log_sink: LogSink = None,
+    force_llm: bool = False,
 ) -> AgentResult:
+    """Drive the device toward `goal` step-by-step.
+
+    `force_llm=True` bypasses the deterministic fast path and asks the LLM at
+    every iteration (with UI tree + optional screenshot). Useful when you want
+    the agent to never short-circuit to rules — e.g. testing the LLM's UI
+    judgment on a tricky flow. AI still picks **node ids**, not coordinates;
+    the backend resolves bounds → tap_xy / input_text.
+    """
     started = time.monotonic()
     steps: list[AgentStep] = []
 
@@ -122,7 +131,10 @@ async def run_react(
             except Exception:  # noqa: BLE001
                 pass
 
-    await _log("info", f"[react] goal={goal!r} max_steps={max_steps}")
+    await _log(
+        "info",
+        f"[react] goal={goal!r} max_steps={max_steps} mode={'llm_only' if force_llm else 'rule+llm'}",
+    )
     provider = await get_provider(db, robot.team_id)
     fallback_provider = await get_fallback_provider(db, robot.team_id)
     llm_cfg = await settings_service.get(db, robot.team_id, "llm")
@@ -146,7 +158,10 @@ async def run_react(
             return AgentResult(ok=False, summary=f"observe 失败：{e}", steps=steps)
 
         # ---- decide ----
-        decision, decision_source = _fast_decide(goal, obs, steps, locator_store)
+        if force_llm:
+            decision, decision_source = None, "llm"
+        else:
+            decision, decision_source = _fast_decide(goal, obs, steps, locator_store)
         if decision is None:
             decision_source = "llm"
             if use_vision:

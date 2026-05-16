@@ -17,6 +17,7 @@ from app.core.ws_manager import hub
 from app.device import DeviceClient
 from app.models import Conversation, Message, Robot, RobotTask, RobotTaskLog
 from app.schemas import MessageOut
+from app.services import settings_service
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +163,8 @@ async def _run_send_via_react(*, robot_id: int, task_id: int) -> None:
             except Exception:  # noqa: BLE001
                 log.debug("open_wecom pre-flight failed; continuing")
 
+            ai_cfg = await settings_service.get(db, robot.team_id, "ai")
+            force_llm = bool(ai_cfg.get("react_force_llm") if ai_cfg.get("react_force_llm") is not None else settings.react_force_llm)
             result = await run_react(
                 db,
                 robot,
@@ -169,6 +172,7 @@ async def _run_send_via_react(*, robot_id: int, task_id: int) -> None:
                 max_steps=settings.react_max_steps,
                 step_timeout=settings.react_step_timeout_sec,
                 log_sink=_sink,
+                force_llm=force_llm,
             )
             task = await db.get(RobotTask, task_id)
             if task is None:

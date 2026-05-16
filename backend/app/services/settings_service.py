@@ -42,6 +42,7 @@ _ALLOWED: dict[str, set[str]] = {
         "max_tokens",
         "agent_mode",
         "agent_max_steps",
+        "react_force_llm",
     },
     "parser": {
         "backend",
@@ -82,6 +83,7 @@ def _env_defaults(scope: str) -> dict[str, Any]:
             "max_tokens": settings.ai_max_tokens,
             "agent_mode": settings.agent_mode_enabled,
             "agent_max_steps": settings.agent_max_steps,
+            "react_force_llm": settings.react_force_llm,
         }
     if scope == "parser":
         return {
