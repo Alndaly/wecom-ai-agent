@@ -91,11 +91,13 @@ device/            包装 WS 命令通道，提供类型安全接口
 
 services/          业务粘合层
   conversation.py  ingest_inbound_message（每条客户消息的入口）—— 去重、
-                   系统消息过滤、按会话加锁、AI 分发、多条回复扇出
+                   系统消息过滤、入站落库、待反馈状态、唤醒自动回复调度
+  auto_reply_scheduler.py
+                   每机器人公平轮转待反馈会话，批量聚合未读，限制同会话连续回复
+  task_queue.py    每机器人优先级队列；任务可视化、可取消、启动恢复
   send_orchestrator.py
                    create_and_dispatch_send_text（建 Message+RobotTask
-                   并 spawn _run_send_via_react）、update_task_on_callback、
-                   append_task_log
+                   并入队）、run_send_task、update_task_on_callback、append_task_log
   retention.py     消息每日清理（默认 30 天）
   settings_service.py
                    团队级运行时配置，叠加在 env 默认值之上
@@ -299,23 +301,28 @@ robots 1──* robot_tasks 1──* robot_task_logs
 3. 再剥一次 `[N条]` 前缀；忽略 bot 自身回声（`收到您说的「…」`）、纯时间分
    隔线，以及 **WeCom 系统通知**（周报 banner / 登录提醒等 —— 见
    `_is_wecom_system_message`）。
-4. 持久化 `Message`，递增 `conv.unread_count`，广播 `message.new` +
+4. 真客户入站持久化为 `Message(feedback_status="pending")`，递增
+   `conv.unread_count`，广播 `message.new` +
    `conversation.updated`。
+5. 如果 `conv.mode ∈ {ai, mixed}`，只唤醒
+   `auto_reply_scheduler.wake_robot(robot.id)`；入库函数不直接跑 AI。
+
+系统消息不会落库，也不会占用待反馈状态，避免和未读客户消息的公平调度冲突。
 
 ### 5.3 AI 分发（后端）
 
-同一个函数，持久化之后：
+`services/auto_reply_scheduler.py` 是自动回复入口：
 
-1. 如果 `conv.mode == "human"` 跳过。
-2. 拿**会话级锁**（`_CONV_LOCKS[conv.id]`）。这把锁让连发的 5 条消息
-   3 秒内不会扇成 5 个并发的 agent run。第二条入站拿到锁之后会调
-   `_has_been_replied_after(conv.id, msg.created_at)`，如果上一批已经覆盖
-   到了，便宜跳过。
-3. 调用 `ai.workflow.handle_inbound`：
+1. 每个 robot 一个调度协程，读取 `sender_type=customer` 且
+   `feedback_status in (pending, processing)` 的入站消息。
+2. 同一个会话最多连续处理 2 轮；如果还有其他会话待反馈，必须切换会话。
+3. 一轮最多取 20 条待反馈消息并标记为 `processing`。AI 可以把多条未读总结成
+   1-2 条回复，不要求一条入站对应一条出站。
+4. 调用 `ai.workflow.handle_inbound`：
    - 拉历史（最近 `context_window` 条）；
    - 拉 system prompt（按团队的 `ai_prompts.default` 覆盖 env 默认）；
    - 拉 `user_profiles.summary`；
-   - 拉**未回复链**（最后一条出站之后的所有入站，封顶 20 条）；
+   - 拉**待反馈链**（`pending/processing` 的客户入站，封顶 20 条）；
    - 跑检索（`kb.retriever.retrieve`）—— query 是整条链拼起来的，所以连发
      多条客户问题能拿到一次更准的检索，而不是 N 次窄检索；
    - 按 `ai_cfg.agent_mode` 分叉：
@@ -323,13 +330,15 @@ robots 1──* robot_tasks 1──* robot_task_logs
        `ai.conv_agent.run_conv_agent`（见 §6）；
      - **关 agent** → `_generate` 单跳一次 LLM，把检索结果拼到 system
        message 前面。
-4. 返回的 `Decision` 有 `action ∈ {reply, suggest, skip}`，再加一个可选的
+5. 返回的 `Decision` 有 `action ∈ {reply, suggest, skip}`，再加一个可选的
    `replies: list[str]`。conv-agent 可以单条 `text` 也可以最多 6 条
    `replies`（多气泡）—— `Decision.all_texts` 把两种形态都展平。
-5. `mixed` 模式下，`confidence < threshold` 的回复降级为 `suggest` —— 通过
+6. `mixed` 模式下，`confidence < threshold` 的回复降级为 `suggest` —— 通过
    `ai.suggestion` 推到工作台，由人审核。
-6. 不管什么决策都写一条 `AIReplyLog`。右栏 KB 命中通过 `kb.hits` WS
+7. 不管什么决策都写一条 `AIReplyLog`。右栏 KB 命中通过 `kb.hits` WS
    事件流过去。
+8. 调度器把待反馈消息更新为 `queued/suggested/skipped/failed`；真正发送成功后
+   再由发送任务更新为 `replied`。
 
 ### 5.4 发送下发（后端）
 
@@ -338,8 +347,8 @@ robots 1──* robot_tasks 1──* robot_task_logs
 
 1. 建出站 `Message`（status=`pending`）。
 2. 建 `RobotTask`（`type=send_text` / `payload_json={contact, text}` /
-   `status=dispatched`）。
-3. `asyncio.create_task(_run_send_via_react(...))` —— **fire-and-forget**。
+   `status=dispatched`，可包含 `feedback_message_ids`）。
+3. 入 `services/task_queue` 的每机器人优先级队列。
 4. 广播 `message.new`。
 
 注意：后端不再发 `task.dispatch` 给安卓。设备侧那套确定性自动化已经被拆掉
@@ -347,7 +356,7 @@ robots 1──* robot_tasks 1──* robot_task_logs
 
 ### 5.5 设备自动化（后端 ↔ 安卓 多步）
 
-`_run_send_via_react`：
+`task_queue` consumer 调 `run_send_task`：
 
 1. 预热 `open_wecom`，避免 agent 第一次 observe 时看到的是 launcher。
 2. 调 `ai.react_agent.run_react(robot, goal, max_steps, …, force_llm)` ——
@@ -356,6 +365,8 @@ robots 1──* robot_tasks 1──* robot_task_logs
    `robot_task_logs` + 广播 `task.log`。运营在设备详情页实时看到轨迹。
 4. 完成后改 task 为 `completed`/`failed`，改 message 为 `sent`/`failed`，
    广播 `task.updated` + `message.updated`。
+5. 如果 operator 取消等待中任务，队列直接标 `cancelled`；如果取消运行中任务，
+   consumer 会 cancel 当前 coroutine，ReAct runner 收到取消后写失败反馈。
 
 agent 循环本身详见 §7。
 
@@ -606,8 +617,8 @@ mask 解释为「保留已保存的值」。`routers/settings.py` 的 `_mask_api
 `/devices/[id]` —— 三栏布局：
 - 顶：身份卡 + 控制状态（实时屏开关、最近命令）
 - 中：实时屏卡片
-- 右栏：语义指令卡（→ `/agent/run`）+ 任务日志面板（带清空，AlertDialog
-  二次确认）
+- 右栏：语义指令卡（→ `/agent/run`）+ 当前任务队列（运行中 / 等待中 /
+  可取消）+ 任务日志面板（带清空，AlertDialog 二次确认）
 
 `/knowledge` —— KB 卡片。删除会级联 docs + chunks + 向量 + 图谱。
 `/knowledge/[id]` —— 拖拽多文件上传、粘贴文本、文档表格按行删、检索探针。
@@ -699,17 +710,23 @@ bounds 内滑（不是全屏）并且**滑完恢复滚动位置**，用户感知
    MCP 服务器（best-effort）。
 4. `_hydrate_vector_store()` —— 把 SQL 里的 chunk embedding 灌进当前的
    向量存储。**任何后端都跑**（Milvus 幂等，memory 必须）。
-5. `asyncio.create_task(retention.run_loop())` —— 每日消息清理，shutdown
+5. `_bootstrap_task_queue()` —— 注册 `send_text` / `agent_goal` runner，并把
+   上次留下的 `dispatched/queued` 任务重新入队。
+6. `_bootstrap_auto_reply_scheduler()` —— 扫描仍处于 `pending/processing` 的
+   待反馈入站消息并唤醒对应 robot。
+7. `asyncio.create_task(retention.run_loop())` —— 每日消息清理，shutdown
    可取消。
 
 Shutdown 时：
 
 1. `retention_task.cancel()` + await。
-2. `mcp_adapter.shutdown()` —— 关掉每个 MCP stdio 子进程。
+2. `task_queue.shutdown()` —— 停掉每个机器人队列 consumer。
+3. `auto_reply_scheduler.shutdown()` —— 停掉自动回复调度协程。
+4. `mcp_adapter.shutdown()` —— 关掉每个 MCP stdio 子进程。
 
-会话锁字典、工具注册表、MCP session 都是进程全局；**多 worker 部署会出
-问题**。生产环境暂时只能跑 1 个 uvicorn worker，直到我们加上 Redis 分布式
-锁 + 共享注册表（详见 `services/conversation.py` 里的 TODO）。
+任务队列、自动回复调度状态、工具注册表、MCP session 都是进程全局；**多
+worker 部署会出问题**。生产环境暂时只能跑 1 个 uvicorn worker，直到我们加上
+共享队列、Redis pub/sub 和分布式调度状态。
 
 
 ## 14. 配置速查
@@ -793,9 +810,9 @@ RETENTION_SWEEP_INTERVAL_SEC=21600
 
 走读时应该心里有数：
 
-1. **单 worker 假设**。`_CONV_LOCKS`、工具注册表、MCP session、WS Hub、
-   `request_id` future 全部在进程内存里。生产用 1 个 uvicorn worker。HA 需
-   要加 Redis pub/sub + Redis 锁。
+1. **单 worker 假设**。任务队列、自动回复调度器、工具注册表、MCP session、
+   WS Hub、`request_id` future 全部在进程内存里。生产用 1 个 uvicorn
+   worker。HA 需要加 Redis pub/sub、共享队列和分布式调度状态。
 2. **memory 向量 / 图谱存储不持久**。生产必须用 Milvus + Neo4j。hydrate
    步骤让 memory 在重启后能从 SQL 恢复，但图谱状态除非用 Neo4j 否则每次
    重启都丢。

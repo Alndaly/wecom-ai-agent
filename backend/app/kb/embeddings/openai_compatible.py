@@ -31,7 +31,7 @@ class OpenAIEmbedding(EmbeddingProvider):
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )
                 if r.status_code >= 400:
-                    raise RuntimeError(f"embedding HTTP {r.status_code}: {r.text[:300]}")
+                    raise RuntimeError(f"embedding HTTP {r.status_code}: {r.text}")
                 data = r.json()
                 try:
                     out.extend(d["embedding"] for d in data["data"])

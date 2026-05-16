@@ -48,8 +48,9 @@ async def lifespan(_: FastAPI):
     await _bootstrap_agent_tools()
     await _hydrate_vector_store()
     await _bootstrap_task_queue()
+    await _bootstrap_auto_reply_scheduler()
     # background retention sweeper — cancel on shutdown
-    from app.services import retention, task_queue as _tq
+    from app.services import auto_reply_scheduler as _ars, retention, task_queue as _tq
     retention_task = asyncio.create_task(retention.run_loop(), name="retention-loop")
     try:
         yield
@@ -59,6 +60,10 @@ async def lifespan(_: FastAPI):
             await retention_task
         except (asyncio.CancelledError, Exception):
             pass
+        try:
+            await _ars.shutdown()
+        except Exception:  # noqa: BLE001
+            logging.exception("auto reply scheduler shutdown failed")
         try:
             await _tq.shutdown()
         except Exception:  # noqa: BLE001
@@ -126,6 +131,9 @@ async def _hydrate_vector_store() -> None:
 async def _bootstrap_task_queue() -> None:
     """Register every runner with the per-robot priority queue, then re-queue
     any tasks that were `dispatched` when the process last died."""
+    if not settings.task_queue_enabled:
+        logging.info("task queue disabled; skip runner registration and recovery")
+        return
     try:
         from app.services import task_queue
         from app.services.send_orchestrator import run_send_task
@@ -138,6 +146,15 @@ async def _bootstrap_task_queue() -> None:
             logging.info("task queue: recovered %d in-flight task(s) from previous run", n)
     except Exception:  # noqa: BLE001
         logging.exception("task queue bootstrap failed")
+
+
+async def _bootstrap_auto_reply_scheduler() -> None:
+    try:
+        from app.services import auto_reply_scheduler
+
+        await auto_reply_scheduler.recover_pending()
+    except Exception:  # noqa: BLE001
+        logging.exception("auto reply scheduler bootstrap failed")
 
 
 async def _bootstrap_agent_tools() -> None:

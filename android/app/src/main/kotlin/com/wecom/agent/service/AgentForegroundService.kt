@@ -19,13 +19,15 @@ import com.wecom.agent.model.MessageReceivedPayload
 import com.wecom.agent.model.ScreenFramePayload
 import com.wecom.agent.net.BackendClient
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.time.Instant
-import java.util.UUID
+import java.security.MessageDigest
 
 /**
  * Foreground service that owns the WebSocket lifecycle and device primitives.
@@ -59,6 +61,8 @@ class AgentForegroundService : Service() {
     private var scanTier2Job: Job? = null
     private var scanTier3Job: Job? = null
     private var chatScanJob: Job? = null
+    private val uiAutomationMutex = Mutex()
+    @Volatile private var reactCommandActive = false
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
@@ -72,6 +76,15 @@ class AgentForegroundService : Service() {
     private data class RecentAutomatedOutput(val content: String, val at: Long)
     private val recentAutomatedOutputs = ArrayDeque<RecentAutomatedOutput>()
     private val automatedOutputTtlMs = 10 * 60_000L
+    private data class RecentObservedInput(
+        val src: String,
+        val sender: String,
+        val senderType: String,
+        val content: String,
+        val at: Long,
+    )
+    private val recentObservedInputs = ArrayDeque<RecentObservedInput>()
+    private val observedInputTtlMs = 3 * 60_000L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -113,9 +126,15 @@ class AgentForegroundService : Service() {
         MessageNotificationListener.registerCallback { sender, content, postTime ->
             forwardInboundMessage(sender, content, postTime, viaNotification = true)
         }
-        WeComAccessibilityService.onChatMessage = { sender, content, fromSelf ->
+        WeComAccessibilityService.onChatMessage = { sender, content, fromSelf, messageKey ->
             if (a11yInboundEnabled) {
-                forwardChatMessage(sender, content, System.currentTimeMillis(), fromSelf = fromSelf)
+                forwardChatMessage(
+                    sender,
+                    content,
+                    System.currentTimeMillis(),
+                    fromSelf = fromSelf,
+                    messageKey = messageKey,
+                )
             }
         }
 
@@ -331,10 +350,11 @@ class AgentForegroundService : Service() {
     // ----- periodic 消息 tab scanner ----------------------------------------
     //  Notifications miss messages when WeCom is foregrounded (no system
     //  notification fires). To catch those, we walk the conversation list at
-    //  three cadences. All three skip cleanly when:
+    //  three cadences. Scans can navigate within WeCom back to the 消息 tab,
+    //  but they skip cleanly when:
     //    - a11y ingest is off (user disabled the checkbox)
     //    - WeCom isn't in the foreground (don't hijack other apps)
-    //    - user isn't on the 消息 tab (don't scroll their 通讯录/工作台)
+    //    - a backend ReAct command is currently controlling the UI
     private fun startMessageListScanners() {
         if (scanTier1Job != null) {
             Log.d(tag, "message list scanners already running")
@@ -349,7 +369,7 @@ class AgentForegroundService : Service() {
             delay(1_000L)  // prime the baseline before a fresh unread preview arrives
             while (isActive) {
                 if (a11yInboundEnabled) {
-                    val r = scanner.scanVisible()
+                    val r = runScanner("tier1") { scanner.scanVisible() }
                     Log.i(tag, "scan tier1 ok=${r.ok} ${r.message}")
                     if (!r.ok) broadcastLog("scan tier1: ${r.message}")
                 }
@@ -361,7 +381,7 @@ class AgentForegroundService : Service() {
             delay(60_000L)
             while (isActive) {
                 if (a11yInboundEnabled) {
-                    val r = scanner.scanPagesDown(pages = 3)
+                    val r = runScanner("tier2") { scanner.scanPagesDown(pages = 3) }
                     Log.d(tag, "scan tier2 ok=${r.ok} ${r.message}")
                     if (r.ok) broadcastLog("scan tier2: ${r.message}")
                 }
@@ -374,7 +394,7 @@ class AgentForegroundService : Service() {
             delay(10 * 60_000L)
             while (isActive) {
                 if (a11yInboundEnabled) {
-                    val r = scanner.scanToBottom(maxSwipes = 30)
+                    val r = runScanner("tier3") { scanner.scanToBottom(maxSwipes = 30) }
                     Log.d(tag, "scan tier3 ok=${r.ok} ${r.message}")
                     if (r.ok) broadcastLog("scan tier3: ${r.message}")
                 }
@@ -389,6 +409,18 @@ class AgentForegroundService : Service() {
                 }
                 delay(2_000L)
             }
+        }
+    }
+
+    private suspend fun runScanner(label: String, block: suspend () -> ScanReport): ScanReport {
+        if (reactCommandActive) return ScanReport.skipped("设备正在执行任务，跳过 $label")
+        if (!uiAutomationMutex.tryLock()) return ScanReport.skipped("设备正在执行任务，跳过 $label")
+        return try {
+            withTimeout(2_500L) { block() }
+        } catch (e: TimeoutCancellationException) {
+            ScanReport.skipped("$label 超时，跳过")
+        } finally {
+            uiAutomationMutex.unlock()
         }
     }
 
@@ -442,108 +474,117 @@ class AgentForegroundService : Service() {
             sendCommandAck(command, false, "missing request_id")
             return
         }
-        broadcastLog("ReAct ← $command (req=${requestId.take(8)})")
+        broadcastLog("ReAct ← $command (req=$requestId)")
         val started = System.currentTimeMillis()
         var data: kotlinx.serialization.json.JsonElement? = null
         val automator = WeComAutomator(this) { msg -> broadcastLog("ReAct: $msg") }
 
         val result: Pair<Boolean, String> = try {
-            when (command) {
-                "screenshot_once" -> {
-                    val svc = WeComAccessibilityService.instance
-                    if (svc == null) {
-                        Pair(false, "无障碍未启用")
-                    } else {
-                        val frame = svc.captureScreenJpegBase64(quality = 55, allowCached = false)
-                        data = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
-                        Pair(frame.error == null, frame.error ?: "已截图")
+            reactCommandActive = true
+            withTimeout(commandTimeoutMs(command)) {
+                uiAutomationMutex.withLock {
+                when (command) {
+                    "screenshot_once" -> {
+                        val svc = WeComAccessibilityService.instance
+                        if (svc == null) {
+                            Pair(false, "无障碍未启用")
+                        } else {
+                            val frame = svc.captureScreenJpegBase64(quality = 55, allowCached = false)
+                            data = json.encodeToJsonElement(ScreenFramePayload.serializer(), frame)
+                            Pair(frame.error == null, frame.error ?: "已截图")
+                        }
                     }
-                }
-                "tap_text" -> {
-                    val text = obj["text"]?.jsonPrimitive?.contentOrNull
-                    if (text.isNullOrBlank()) Pair(false, "缺少 text 参数")
-                    else automator.reactTapText(text)
-                }
-                "tap_node" -> {
-                    val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    if (nodeId == null) Pair(false, "缺少 node_id")
-                    else automator.reactTapNode(nodeId, x, y)
-                }
-                "tap_xy" -> {
-                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    if (x == null || y == null) Pair(false, "缺少 x/y")
-                    else automator.reactTapXY(x, y)
-                }
-                "double_tap_node" -> {
-                    val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    if (nodeId == null) Pair(false, "缺少 node_id")
-                    else automator.reactDoubleTapNode(nodeId, x, y)
-                }
-                "double_tap_xy" -> {
-                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    if (x == null || y == null) Pair(false, "缺少 x/y")
-                    else automator.reactDoubleTapXY(x, y)
-                }
-                "long_press_node" -> {
-                    val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
-                    if (nodeId == null) Pair(false, "缺少 node_id")
-                    else automator.reactLongPressNode(nodeId, x, y, dur)
-                }
-                "long_press_xy" -> {
-                    val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
-                    if (x == null || y == null) Pair(false, "缺少 x/y")
-                    else automator.reactLongPressXY(x, y, dur)
-                }
-                "drag_xy" -> {
-                    val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y1 = obj["y1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val x2 = obj["x2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y2 = obj["y2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 450L
-                    if (x1 == null || y1 == null || x2 == null || y2 == null)
-                        Pair(false, "缺少 x1/y1/x2/y2")
-                    else automator.reactDragXY(x1, y1, x2, y2, dur)
-                }
-                "swipe" -> {
-                    val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y1 = obj["y1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val x2 = obj["x2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val y2 = obj["y2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                    val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 300L
-                    if (x1 == null || y1 == null || x2 == null || y2 == null)
-                        Pair(false, "缺少 x1/y1/x2/y2")
-                    else automator.reactSwipe(x1, y1, x2, y2, dur)
-                }
-                "input_text" -> {
-                    val text = obj["text"]?.jsonPrimitive?.contentOrNull
-                    val mode = obj["mode"]?.jsonPrimitive?.contentOrNull ?: "replace"
-                    if (text == null) {
-                        Pair(false, "缺少 text")
-                    } else {
-                        val r = automator.reactInputText(text, mode)
-                        if (r.first) rememberAutomatedOutput(text)
-                        r
+                    "tap_text" -> {
+                        val text = obj["text"]?.jsonPrimitive?.contentOrNull
+                        if (text.isNullOrBlank()) Pair(false, "缺少 text 参数")
+                        else automator.reactTapText(text)
                     }
+                    "tap_node" -> {
+                        val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        if (nodeId == null) Pair(false, "缺少 node_id")
+                        else automator.reactTapNode(nodeId, x, y)
+                    }
+                    "tap_xy" -> {
+                        val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        if (x == null || y == null) Pair(false, "缺少 x/y")
+                        else automator.reactTapXY(x, y)
+                    }
+                    "double_tap_node" -> {
+                        val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        if (nodeId == null) Pair(false, "缺少 node_id")
+                        else automator.reactDoubleTapNode(nodeId, x, y)
+                    }
+                    "double_tap_xy" -> {
+                        val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        if (x == null || y == null) Pair(false, "缺少 x/y")
+                        else automator.reactDoubleTapXY(x, y)
+                    }
+                    "long_press_node" -> {
+                        val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
+                        if (nodeId == null) Pair(false, "缺少 node_id")
+                        else automator.reactLongPressNode(nodeId, x, y, dur)
+                    }
+                    "long_press_xy" -> {
+                        val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
+                        if (x == null || y == null) Pair(false, "缺少 x/y")
+                        else automator.reactLongPressXY(x, y, dur)
+                    }
+                    "drag_xy" -> {
+                        val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y1 = obj["y1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val x2 = obj["x2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y2 = obj["y2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 450L
+                        if (x1 == null || y1 == null || x2 == null || y2 == null)
+                            Pair(false, "缺少 x1/y1/x2/y2")
+                        else automator.reactDragXY(x1, y1, x2, y2, dur)
+                    }
+                    "swipe" -> {
+                        val x1 = obj["x1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y1 = obj["y1"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val x2 = obj["x2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val y2 = obj["y2"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 300L
+                        if (x1 == null || y1 == null || x2 == null || y2 == null)
+                            Pair(false, "缺少 x1/y1/x2/y2")
+                        else automator.reactSwipe(x1, y1, x2, y2, dur)
+                    }
+                    "input_text" -> {
+                        val text = obj["text"]?.jsonPrimitive?.contentOrNull
+                        val mode = obj["mode"]?.jsonPrimitive?.contentOrNull ?: "replace"
+                        if (text == null) {
+                            Pair(false, "缺少 text")
+                        } else {
+                            val r = automator.reactInputText(text, mode)
+                            if (r.first) rememberAutomatedOutput(text)
+                            r
+                        }
+                    }
+                    "back" -> automator.reactBack()
+                    "home" -> automator.reactHome()
+                    "open_wecom" -> automator.openWeCom()
+                    else -> Pair(false, "未知命令 $command")
                 }
-                "back" -> automator.reactBack()
-                "home" -> automator.reactHome()
-                "open_wecom" -> automator.openWeCom()
-                else -> Pair(false, "未知命令 $command")
+                }
             }
+        } catch (e: TimeoutCancellationException) {
+            Pair(false, "设备命令等待超时")
         } catch (e: Exception) {
             Log.w(tag, "react command $command failed", e)
             Pair(false, e.message ?: e::class.java.simpleName)
+        } finally {
+            reactCommandActive = false
         }
         val ok = result.first
         val msg = result.second
@@ -561,6 +602,14 @@ class AgentForegroundService : Service() {
             ),
         )
         client?.sendEvent("device.command_result", payload)
+    }
+
+    private fun commandTimeoutMs(command: String): Long {
+        return when (command) {
+            "open_wecom" -> 12_000L
+            "screenshot_once" -> 10_000L
+            else -> 8_000L
+        }
     }
 
     private fun sendCommandAck(command: String, ok: Boolean, message: String? = null) {
@@ -602,6 +651,10 @@ class AgentForegroundService : Service() {
         postTimeMs: Long,
         viaNotification: Boolean,
     ) {
+        Log.i(
+            tag,
+            "callback detected src=${if (viaNotification) "notif" else "a11y"} sender=$sender content=$content",
+        )
         forwardMessage(sender, content, postTimeMs, senderType = "customer", src = if (viaNotification) "notif" else "a11y")
     }
 
@@ -610,13 +663,31 @@ class AgentForegroundService : Service() {
         content: String,
         postTimeMs: Long,
         fromSelf: Boolean,
+        messageKey: String,
     ) {
         if (fromSelf && isRecentAutomatedOutput(content)) {
-            Log.i(tag, "skip automated self echo sender=$sender content=${content.take(60)}")
-            broadcastLog("跳过自动发送回显[$sender] ${content.take(40)}")
+            Log.i(tag, "skip automated self echo sender=$sender content=$content")
+            broadcastLog("跳过自动发送回显[$sender] $content")
             return
         }
-        forwardMessage(sender, content, postTimeMs, senderType = if (fromSelf) "human" else "customer", src = if (fromSelf) "a11y-self" else "a11y")
+        val src = if (fromSelf) "a11y-self" else "a11y"
+        val senderType = if (fromSelf) "human" else "customer"
+        if (isRecentObservedInput(src, sender, senderType, content)) {
+            Log.i(tag, "skip repeated a11y observation src=$src sender=$sender senderType=$senderType content=$content")
+            return
+        }
+        Log.i(
+            tag,
+            "callback detected src=$src sender=$sender key=$messageKey content=$content",
+        )
+        forwardMessage(
+            sender,
+            content,
+            postTimeMs,
+            senderType = senderType,
+            src = src,
+            stableKey = messageKey,
+        )
     }
 
     @Synchronized
@@ -638,8 +709,8 @@ class AgentForegroundService : Service() {
         gcAutomatedOutputs(now)
         return recentAutomatedOutputs.any { item ->
             normalized == item.content ||
-                normalized.startsWith(item.content.take(80)) ||
-                item.content.startsWith(normalized.take(80))
+                normalized.startsWith(item.content) ||
+                item.content.startsWith(normalized)
         }
     }
 
@@ -649,9 +720,65 @@ class AgentForegroundService : Service() {
         }
     }
 
+    @Synchronized
+    private fun isRecentObservedInput(
+        src: String,
+        sender: String,
+        senderType: String,
+        content: String,
+    ): Boolean {
+        val normalizedSender = sender.trim().lowercase()
+        val normalizedContent = normalizeMessageContent(content)
+        if (normalizedSender.isBlank() || normalizedContent.isBlank()) return false
+        val now = System.currentTimeMillis()
+        gcObservedInputs(now)
+        val seen = recentObservedInputs.any { item ->
+            item.src == src &&
+                item.sender == normalizedSender &&
+                item.senderType == senderType &&
+                item.content == normalizedContent
+        }
+        if (!seen) {
+            recentObservedInputs.addLast(
+                RecentObservedInput(src, normalizedSender, senderType, normalizedContent, now)
+            )
+        }
+        return seen
+    }
+
+    private fun gcObservedInputs(now: Long) {
+        while (recentObservedInputs.isNotEmpty() && now - recentObservedInputs.first().at > observedInputTtlMs) {
+            recentObservedInputs.removeFirst()
+        }
+    }
+
     private fun normalizeMessageContent(content: String): String {
         return content.trim().replace(Regex("""\s+"""), " ")
     }
+
+    private fun stableInboundId(
+        src: String,
+        sender: String,
+        content: String,
+        postTimeMs: Long,
+        stableKey: String? = null,
+    ): String {
+        val normalizedSender = sender.trim().lowercase()
+        val normalizedContent = normalizeMessageContent(content)
+        val cleanStableKey = stableKey?.trim()?.takeIf { it.isNotEmpty() }
+        val identity = cleanStableKey?.let { "stable:${sha256Hex(it).take(20)}" } ?: postTimeMs.toString()
+        val raw = "$src|${cleanStableKey ?: postTimeMs.toString()}|$normalizedSender|$normalizedContent"
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(raw.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(20)
+        return "$src:$identity:$digest"
+    }
+
+    private fun sha256Hex(value: String): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
 
     private fun forwardMessage(
         sender: String,
@@ -659,10 +786,12 @@ class AgentForegroundService : Service() {
         postTimeMs: Long,
         senderType: String,
         src: String,
+        stableKey: String? = null,
     ) {
+        val externalId = stableInboundId(src, sender, content, postTimeMs, stableKey)
         val payload = MessageReceivedPayload(
             contact = Contact(external_id = sender, nickname = sender),
-            external_msg_id = "rt_${postTimeMs}_${UUID.randomUUID().toString().take(8)}",
+            external_msg_id = externalId,
             type = "text",
             content = content,
             sender_type = senderType,
@@ -673,10 +802,10 @@ class AgentForegroundService : Service() {
             enqueuePendingInbound(PendingInbound(payload, src, senderType))
         }
         broadcastLog(
-            if (sent) "上报消息[$src/$senderType] $sender :: ${content.take(40)}"
-            else "上报暂存(未连接)[$src/$senderType] $sender :: ${content.take(40)}"
+            if (sent) "上报消息[$src/$senderType] $sender :: $content"
+            else "上报暂存(未连接)[$src/$senderType] $sender :: $content"
         )
-        Log.i(tag, "message[$src/$senderType] sent=$sent queued=${!sent} sender=$sender content=${content.take(60)}")
+        Log.i(tag, "callback sent src=$src senderType=$senderType sent=$sent queued=${!sent} external_msg_id=$externalId sender=$sender content=$content")
     }
 
     private fun sendInboundPayload(payload: MessageReceivedPayload): Boolean {
@@ -689,7 +818,7 @@ class AgentForegroundService : Service() {
         pendingInbound.addLast(item)
         while (pendingInbound.size > pendingInboundCap) {
             val dropped = pendingInbound.removeFirst()
-            Log.w(tag, "drop pending inbound src=${dropped.src} senderType=${dropped.senderType} content=${dropped.payload.content.take(60)}")
+            Log.w(tag, "drop pending inbound src=${dropped.src} senderType=${dropped.senderType} content=${dropped.payload.content}")
         }
     }
 

@@ -22,7 +22,7 @@
   → 知识库检索（Milvus + Neo4j）
   → AI 生成 or 转人工
   → 风控校验
-  → 下发 Android 执行
+  → 后端设备队列 + ReAct 原语驱动 Android 执行
   → 回写消息与运营记录
 ```
 

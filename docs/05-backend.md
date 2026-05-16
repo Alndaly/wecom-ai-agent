@@ -45,7 +45,11 @@ backend/
       android.py           # /ws/android  Android 客户端
     services/
       conversation.py
-      task_dispatcher.py
+      auto_reply_scheduler.py
+      task_queue.py
+      send_orchestrator.py
+      retention.py
+      settings_service.py
   alembic/                 # 迁移（MVP2 引入）
   pyproject.toml
   README.md

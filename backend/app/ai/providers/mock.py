@@ -49,4 +49,4 @@ def _craft(user_text: str) -> tuple[str, float]:
         if pat.search(text):
             return reply, conf
     # generic fallback — low confidence so mixed mode will escalate
-    return (f"收到您说的「{text[:30]}」,我马上确认一下。", 0.5)
+    return (f"收到您说的「{text}」,我马上确认一下。", 0.5)

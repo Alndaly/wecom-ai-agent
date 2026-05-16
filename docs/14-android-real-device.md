@@ -47,7 +47,7 @@ APP 最上方有「权限状态」一行：
 
 勾上「Dry-run」→「启动 Agent」。这时：
 - WebSocket 连上后端,设备显示在线
-- 任何 `task.dispatch` 都会立刻 `task.completed`,**不真碰企微 UI**
+- 后端 ReAct 发来的 `device.command` 会走 dry-run 分支,**不真碰企微 UI**
 - NotificationListener **仍然会真的**抓企微通知 → 上报后端
 
 去 Web 工作台试试：
@@ -83,16 +83,16 @@ cat backend/var/ui_dumps/robot_xxxx-YYYY...-CHAT-manual.txt
     ...
 ```
 
-如果 `Automator.findEditable` / `clickSendButton` 找不到节点，你可以根据 dump 调整
-[`WeComAutomator.kt`](../android/app/src/main/kotlin/com/wecom/agent/service/WeComAutomator.kt) 里的策略
-（已经按"特征 → 位置"层层兜底,大概率不需要改）。
+如果后端 ReAct 无法定位输入框或发送按钮，优先看 dump 中的真实节点文本、可编辑属性、
+clickable 属性和 bounds。不要把某个机型的坐标、固定节点 id 或固定屏幕尺寸写进代码；
+应该补充可泛化的观察字段或后端 locator 规则。
 
 ### 第 6 步 · 关掉 dry-run，真发一条
 
 填好「测试联系人昵称」+「测试文本」→「本地发送测试」。
 
 预期：
-- Agent 打开企微 → 点搜索 → 输入昵称 → 点首条结果 → 输入文本 → 点发送
+- 后端 ReAct 通过 `device.command` 驱动 Agent 打开企微 → 搜索联系人 → 进入聊天 → 输入文本 → 点发送
 - APP 日志显示 `本地测试发送成功`
 - 真实企微聊天里收到这条文本
 
@@ -114,7 +114,7 @@ cat backend/var/ui_dumps/robot_xxxx-YYYY...-CHAT-manual.txt
 ## 14.4 已知局限（路线图）
 
 - [ ] **群组消息** 当前归 `sender#groupName` 一个 contact,后续在协议层加 `group_id` 字段
-- [ ] **图片 / 文件** TaskExecutor 只支持 `send_text`,`send_image` / `send_file` 仍是 stub
+- [ ] **图片 / 文件** 当前主链路只实现 `send_text`，`send_image` / `send_file` 仍待接入后端队列和 ReAct 原语
 - [ ] **多账号同机** 企微多账号切换没做,目前 1 robot = 1 账号
 - [ ] **OCR 兜底** 没有真实抠图,极端复杂版式的消息可能漏抓——会在 NotificationListener 命中率掉到 < 90% 时上 ML Kit
 - [ ] **企微大版本兼容** 没有版本检测自动切策略,只能靠你 dump 后改 Automator
@@ -130,8 +130,8 @@ cat backend/var/ui_dumps/robot_xxxx-YYYY...-CHAT-manual.txt
 
 | 后端事件 | Android 侧处理 |
 | --- | --- |
-| `task.dispatch` (`send_text`) | `TaskExecutor.runSendText` → `WeComAutomator.sendText` |
-| `task.completed` / `task.failed` | `AgentForegroundService.handleEvent` |
+| `device.command` | `AgentForegroundService.handleReactCommand` → `WeComAutomator` 通用原语 |
+| `device.command_result` ← | Android 执行原语后的结果回传 |
 | `device.ui_dump` ← | `dumpAndUpload` (按 「采集 UI 树」 触发) |
 | `message.received` ← | `MessageNotificationListener.onMessage` / `WeComAccessibilityService.onChatMessage` |
 | `device.hello` / `device.heartbeat` ← | `AgentForegroundService.heartbeatJob` |

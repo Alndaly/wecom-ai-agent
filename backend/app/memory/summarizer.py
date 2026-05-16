@@ -81,7 +81,7 @@ async def maybe_refresh(
     await db.commit()
     log.info(
         "memory.refresh contact=%s inbound_total=%s summary=%s",
-        contact.id, inbound_count, summary[:60],
+        contact.id, inbound_count, summary,
     )
     return profile
 
@@ -100,7 +100,7 @@ async def _summarize(db: AsyncSession, team_id: int, transcript: str) -> tuple[s
     # cleanup: drop trailing punctuation noise from mock provider templates
     text = text.replace("收到您说的「", "").replace("」,我马上确认一下。", "").strip()
     if not text:
-        text = transcript[:120]
+        text = transcript
     return text, res.confidence
 
 

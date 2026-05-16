@@ -46,10 +46,23 @@ class WeComAutomator(
                 }
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             ctx.startActivity(intent)
-            // Give the launcher a moment to settle so the next primitive (usually
-            // a UI dump) sees the WeCom tree rather than the previous app.
-            delay(700)
-            Pair(true, "已打开 WeCom")
+            val svc = a11y() ?: return false to "无障碍未启用"
+            val ready = withTimeoutOrNull(5_000) {
+                while (true) {
+                    val root = svc.rootInActiveWindow
+                    if (root?.packageName?.toString() == wecomPkg && root.childCount > 0) {
+                        return@withTimeoutOrNull true
+                    }
+                    delay(200)
+                }
+            } == true
+            if (ready) {
+                Pair(true, "已打开 WeCom")
+            } else {
+                val root = svc.rootInActiveWindow
+                val pkg = root?.packageName?.toString() ?: "null"
+                Pair(false, "已发送打开请求，但未进入 WeCom 前台：pkg=$pkg children=${root?.childCount ?: 0}")
+            }
         } catch (e: Exception) {
             Pair(false, "openWeCom: ${e.message}")
         }
@@ -261,8 +274,8 @@ class WeComAutomator(
         n ?: return
         sb.append("  ".repeat(depth))
         val cls = n.className?.toString()?.substringAfterLast('.') ?: "?"
-        val txt = (n.text?.toString() ?: "").take(40)
-        val desc = (n.contentDescription?.toString() ?: "").take(40)
+        val txt = n.text?.toString() ?: ""
+        val desc = n.contentDescription?.toString() ?: ""
         val id = n.viewIdResourceName?.substringAfterLast('/') ?: ""
         val flags = buildString {
             if (n.isClickable) append("C")

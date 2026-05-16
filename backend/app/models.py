@@ -90,7 +90,7 @@ class Conversation(Base):
     operator_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     unread_count: Mapped[int] = mapped_column(Integer, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_message_preview: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    last_message_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     contact: Mapped[Contact] = relationship(lazy="joined")
@@ -111,8 +111,14 @@ class Message(Base):
     type: Mapped[str] = mapped_column(String(16), default="text")
     content: Mapped[str] = mapped_column(Text)
     status: Mapped[str | None] = mapped_column(String(16), nullable=True)  # for out only
+    feedback_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    feedback_trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    feedback_reply_task_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     external_msg_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    task_id: Mapped[int | None] = mapped_column(ForeignKey("robot_tasks.id"), nullable=True)
+    task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("robot_tasks.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -142,7 +148,9 @@ class RobotTaskLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     robot_id: Mapped[int] = mapped_column(ForeignKey("robots.id"), index=True)
-    task_id: Mapped[int | None] = mapped_column(ForeignKey("robot_tasks.id"), nullable=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("robot_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     level: Mapped[str] = mapped_column(String(16), default="info")
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -1,44 +1,54 @@
 # 任务调度
 
 ## 职责
-统一封装所有「下发给 Android 的动作」，提供：
-- 任务创建
-- 设备路由（按 `robot_id`）
-- WS 下发
-- 回执处理
-- 重试 / 超时
-- 同设备串行（避免页面竞态）
+统一封装所有后端驱动设备的动作，提供：
+- 任务创建与审计日志
+- 按 `robot_id` 路由
+- 每设备串行执行，避免页面竞态
+- 任务队列可视化
+- 等待中 / 运行中任务取消
+- 启动时恢复未完成任务
 
 ## 任务类型
-| type | payload | MVP |
+| type | payload | 当前状态 |
 | --- | --- | --- |
-| `send_text` | `{conversation_external_id, text}` | 1 |
-| `send_image` | `{conversation_external_id, image_url}` | 2 |
-| `send_file` | `{conversation_external_id, file_url, filename}` | 2 |
-| `add_friend` | `{search_keyword, hello_text}` | 4 |
-| `update_remark` | `{contact_external_id, remark, tags[]}` | 4 |
-| `post_moments` | `{text, image_urls[]}` | 4 |
+| `send_text` | `{contact_external_id, text, feedback_message_ids?}` | 已实现 |
+| `agent_goal` | `{goal, max_steps?, force_llm?}` | 已实现 |
+| `send_image` | `{conversation_external_id, image_url}` | 规划中 |
+| `send_file` | `{conversation_external_id, file_url, filename}` | 规划中 |
+| `add_friend` | `{search_keyword, hello_text}` | 规划中 |
+| `post_moments` | `{text, image_urls[]}` | 规划中 |
 
 ## 模型
 - `robot_tasks(id, robot_id, type, payload_json, status, attempts, max_attempts, last_error, conversation_id?, message_id?, created_at, updated_at)`
-- 状态：`pending` → `dispatched` → `running` → `completed` / `failed` / `timeout`
+- `robot_task_logs(id, task_id?, robot_id, level, message, payload_json, created_at)`
+- 状态：`pending` / `dispatched` / `queued` / `running` → `completed` / `failed` / `timeout` / `cancelled`
 
 ## 关键流程
 ```
-service.create_task(...)
-  → 写库 status=pending
-  → enqueue(robot_id)
-  → 若 Android 在线 → WS dispatch & status=dispatched
-  → Android 回 task.completed/failed → 落库 + 广播 task.updated
-  → message_id 关联的 messages.status 同步更新
+send_orchestrator.create_and_dispatch_send_text(...)
+  → 写 Message(status=pending)
+  → 写 RobotTask(status=dispatched)
+  → task_queue.enqueue(robot_id, kind=send_text, priority=...)
+  → queue consumer 标 running 并调用 runner
+  → runner 通过 ReAct + device.command 驱动 Android
+  → 写 task.log / task.updated / message.updated
+  → 若 payload 有 feedback_message_ids，同步入站 feedback_status
 ```
 
-## 超时与重试
-- WS 下发后 60s 无回执 → 标 `timeout`
-- 失败可重试 ≤ `max_attempts`（默认 2）
-- 重试间隔指数退避（5s → 20s → 60s）
+后端不再把完整 `send_text` 脚本作为 `task.dispatch` 丢给 Android。Android 只执行 `device.command` 原语，发送策略由后端 ReAct 根据实时 UI dump 决策。
+
+## 可视化与取消
+- `GET /robots/{id}/queue` 返回当前运行任务和等待队列。
+- `POST /robots/{id}/tasks/{task_id}/cancel` 取消等待中任务，或取消当前运行 coroutine。
+- 队列写 `[queue] waiting / starting / cancelled` 等日志，Web 设备页可以实时展示。
+
+## 恢复
+FastAPI 启动时 `recover_pending_tasks()` 会把遗留在 `dispatched/queued` 的任务重新入队。已经 `completed/failed/cancelled/timeout` 的任务不会恢复。
 
 ## 验收
-- [ ] 创建 `send_text` 任务能下发到指定设备
-- [ ] Android 回执后任务状态正确更新
-- [ ] 设备离线时任务停在 `pending`，上线后自动续发
+- [ ] 创建 `send_text` 任务能进入指定设备队列
+- [ ] 队列同一时间只运行一个设备任务
+- [ ] 等待中任务可以取消
+- [ ] 运行中任务可以中断并写 `cancelled`
+- [ ] Android 原语执行结果能推动任务状态更新

@@ -7,7 +7,7 @@ Schema (multi-tenant enforced via scalar filter at query-time):
   kb_id       INT64
   doc_id      INT64
   chunk_id    INT64
-  text        VARCHAR(8000)
+  text        VARCHAR(65535)
 
 Selected by env VECTOR_STORE=milvus; falls back to memory if pymilvus is
 absent or the server is unreachable.
@@ -62,7 +62,7 @@ class MilvusVectorStore(VectorStore):
         schema.add_field("kb_id", DataType.INT64)
         schema.add_field("doc_id", DataType.INT64)
         schema.add_field("chunk_id", DataType.INT64)
-        schema.add_field("text", DataType.VARCHAR, max_length=8000)
+        schema.add_field("text", DataType.VARCHAR, max_length=65535)
 
         index_params = self.client.prepare_index_params()
         index_params.add_index(
@@ -90,7 +90,7 @@ class MilvusVectorStore(VectorStore):
                 "kb_id": int(m.get("kb_id") or 0),
                 "doc_id": int(m.get("doc_id") or 0),
                 "chunk_id": int(m.get("chunk_id") or 0),
-                "text": (m.get("text") or "")[:7990],
+                "text": m.get("text") or "",
             }
             for v, m in zip(vectors, metas)
         ]

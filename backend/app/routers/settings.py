@@ -301,12 +301,12 @@ async def test_llm(
             )
         return ProbeOut(
             ok=True,
-            detail=result.text[:80] or "(empty)",
+            detail=result.text or "(empty)",
             latency_ms=result.latency_ms,
             model=actual,
         )
     except Exception as e:  # noqa: BLE001
-        return ProbeOut(ok=False, detail=str(e)[:300])
+        return ProbeOut(ok=False, detail=str(e))
 
 
 @router.post("/test/embedding", response_model=ProbeOut)
@@ -344,7 +344,7 @@ async def test_embedding(
             dim=len(vec),
         )
     except Exception as e:  # noqa: BLE001
-        return ProbeOut(ok=False, detail=str(e)[:300])
+        return ProbeOut(ok=False, detail=str(e))
 
 
 @router.post("/test/vector_store", response_model=ProbeOut)
@@ -361,7 +361,7 @@ async def test_vector_store(user: User = Depends(current_user)) -> ProbeOut:
         await store.delete_by_meta("team_id", -1)
         return ProbeOut(ok=True, detail=f"backend={store.name}")
     except Exception as e:  # noqa: BLE001
-        return ProbeOut(ok=False, detail=str(e)[:300])
+        return ProbeOut(ok=False, detail=str(e))
 
 
 @router.post("/test/parser", response_model=ProbeOut)
@@ -400,19 +400,19 @@ async def test_parser(
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode != 0:
                 err = (stderr or stdout or b"").decode("utf-8", errors="replace")
-                return ProbeOut(ok=False, detail=f"`{cmd} --version` exit={proc.returncode}: {err[:200]}")
+                return ProbeOut(ok=False, detail=f"`{cmd} --version` exit={proc.returncode}: {err}")
             ver = (stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
             head = ver[0] if ver else "(no output)"
             return ProbeOut(
                 ok=True,
-                detail=head[:200],
+                detail=head,
                 model=f"mineru_local · {cmd}",
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
         except FileNotFoundError:
             return ProbeOut(ok=False, detail=f"未找到命令: {cmd}（请先 pip install -U mineru[all]）")
         except Exception as e:  # noqa: BLE001
-            return ProbeOut(ok=False, detail=str(e)[:300])
+            return ProbeOut(ok=False, detail=str(e))
 
     if backend == "mineru_api":
         token = (cfg.get("api_key") or "").strip()
@@ -440,19 +440,19 @@ async def test_parser(
             if r.status_code == 401:
                 return ProbeOut(ok=False, detail="401 unauthorized（token 无效或已过期）")
             if r.status_code >= 500:
-                return ProbeOut(ok=False, detail=f"{r.status_code} {r.text[:200]}")
+                return ProbeOut(ok=False, detail=f"{r.status_code} {r.text}")
             env = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
             code = env.get("code")
             msg = env.get("msg") or env.get("message") or ""
             ok = code in (0, 200) or "ok" in str(msg).lower()
             return ProbeOut(
                 ok=bool(ok),
-                detail=f"code={code} msg={msg or '(empty)'}"[:200],
+                detail=f"code={code} msg={msg or '(empty)'}",
                 model=f"mineru_api · {cfg.get('model_version') or 'vlm'}",
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
         except Exception as e:  # noqa: BLE001
-            return ProbeOut(ok=False, detail=str(e)[:300])
+            return ProbeOut(ok=False, detail=str(e))
 
     return ProbeOut(ok=False, detail=f"unknown backend: {backend}")
 
@@ -463,4 +463,4 @@ async def test_graph_store(user: User = Depends(current_user)) -> ProbeOut:
         store = get_graph_store()
         return ProbeOut(ok=True, detail=f"backend={store.name}")
     except Exception as e:  # noqa: BLE001
-        return ProbeOut(ok=False, detail=str(e)[:300])
+        return ProbeOut(ok=False, detail=str(e))

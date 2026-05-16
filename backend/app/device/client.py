@@ -170,8 +170,4 @@ class DeviceClient:
 
 
 def _safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    out = dict(payload)
-    if "text" in out:
-        text = str(out["text"])
-        out["text"] = f"<text len={len(text)} preview={text[:24]!r}>"
-    return out
+    return dict(payload)

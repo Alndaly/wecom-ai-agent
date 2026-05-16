@@ -32,6 +32,7 @@ from typing import Awaitable, Callable
 
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models import Message, Robot, RobotTask
 
@@ -134,7 +135,7 @@ class RobotQueue:
             "robot_id": self.robot_id,
             "running": _item_snapshot(self._current) if self._current is not None else None,
             "depth": len(pending),
-            "pending": [_item_snapshot(p) for p in pending[:20]],  # cap displayed
+            "pending": [_item_snapshot(p) for p in pending],
         }
 
     async def stop(self) -> None:
@@ -223,6 +224,15 @@ def get_queue(robot_id: str) -> RobotQueue:
 async def enqueue(
     robot_id: str, kind: str, task_id: int, *, priority: int
 ) -> None:
+    if not settings.task_queue_enabled:
+        await _mark_cancelled(task_id, "任务队列已禁用，当前仅记录消息回调")
+        log.info(
+            "queue disabled robot=%s kind=%s task=%s ignored",
+            robot_id,
+            kind,
+            task_id,
+        )
+        return
     await get_queue(robot_id).enqueue(kind, task_id, priority=priority)
 
 
@@ -255,19 +265,12 @@ async def _task_labels(kind: str, task_id: int) -> tuple[str, str | None]:
         payload = task.payload_json if task is not None else {}
     if kind == "agent_goal":
         goal = str(payload.get("goal") or "").strip()
-        return _clip(goal or f"语义指令 #{task_id}", 52), None
+        return goal or f"语义指令 #{task_id}", None
     if kind == "send_text":
         contact = str(payload.get("conversation_external_id") or "目标联系人").strip()
         text = str(payload.get("text") or "").strip()
-        return f"发送给「{_clip(contact, 18)}」", _clip(text, 72) if text else None
+        return f"发送给「{contact}」", text if text else None
     return f"{kind} #{task_id}", None
-
-
-def _clip(text: str, limit: int) -> str:
-    value = " ".join(text.split())
-    if len(value) <= limit:
-        return value
-    return value[: max(0, limit - 1)] + "…"
 
 
 async def cancel(robot_id: str, task_id: int) -> bool:
@@ -293,6 +296,9 @@ async def recover_pending_tasks() -> int:
     send) that re-running it usually just sends the message again. For
     high-assurance flows the runner should check Message.status before
     starting (TODO)."""
+    if not settings.task_queue_enabled:
+        log.info("queue recovery skipped: task queue disabled")
+        return 0
     enqueued = 0
     async with SessionLocal() as db:
         # Resolve robot.id → robot.robot_id once.

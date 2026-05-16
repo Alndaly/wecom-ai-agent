@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
+import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -20,8 +21,8 @@ import kotlin.coroutines.resume
  * Every tier restores the list back to its original scroll position when
  * done, so the user's view isn't permanently scrolled.
  *
- * All scans require WeCom to be foreground AND the 消息 tab to be the active
- * tab — otherwise we'd be hijacking another part of the UI.
+ * All scans require WeCom to be foreground. If WeCom is foreground but another
+ * page/tab is active, the scanner first navigates back to 消息, then harvests.
  */
 class MessageListScanner(
     private val log: (String) -> Unit,
@@ -31,7 +32,7 @@ class MessageListScanner(
     suspend fun scanVisible(): ScanReport {
         val svc = WeComAccessibilityService.instance ?: return ScanReport.skipped("无障碍服务未运行")
         if (!svc.isWeComForeground()) return ScanReport.skipped("WeCom 不在前台")
-        if (!svc.isOnMessagesTab()) return ScanReport.skipped("未在「消息」Tab")
+        ensureMessagesTab(svc).takeIf { !it.ok }?.let { return it }
         svc.forceHarvestHomeList()
         return ScanReport.ok("已扫描可见区域")
     }
@@ -47,7 +48,7 @@ class MessageListScanner(
     private suspend fun scanWithSwipes(maxSwipes: Int, stopOnStagnant: Boolean): ScanReport {
         val svc = WeComAccessibilityService.instance ?: return ScanReport.skipped("无障碍服务未运行")
         if (!svc.isWeComForeground()) return ScanReport.skipped("WeCom 不在前台")
-        if (!svc.isOnMessagesTab()) return ScanReport.skipped("未在「消息」Tab")
+        ensureMessagesTab(svc).takeIf { !it.ok }?.let { return it }
         val bounds = svc.getMessagesListBounds() ?: return ScanReport.skipped("未找到会话列表")
 
         // First harvest the top of the list.
@@ -94,6 +95,55 @@ class MessageListScanner(
         return ScanReport.ok("已下滑 $swipes 次并恢复")
     }
 
+    private suspend fun ensureMessagesTab(svc: WeComAccessibilityService): ScanReport {
+        if (svc.isOnMessagesTab()) return ScanReport.ok("已在「消息」Tab")
+
+        if (svc.currentPage == WeComAccessibilityService.Page.CHAT) {
+            val backOk = svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+            log(if (backOk) "从聊天页返回消息列表" else "从聊天页返回失败")
+            delay(700)
+            if (svc.isOnMessagesTab()) return ScanReport.ok("已返回「消息」Tab")
+        }
+
+        val tapped = tapMessagesTab(svc)
+        if (!tapped) return ScanReport.skipped("未找到可点击的「消息」Tab")
+        delay(800)
+        return if (svc.isOnMessagesTab()) {
+            ScanReport.ok("已切到「消息」Tab")
+        } else {
+            ScanReport.skipped("已尝试切到「消息」Tab，但未识别到会话列表")
+        }
+    }
+
+    private suspend fun tapMessagesTab(svc: AccessibilityService): Boolean {
+        val root = svc.rootInActiveWindow ?: return false
+        val screenHeight = svc.resources.displayMetrics.heightPixels
+        val bottomStart = (screenHeight * 0.72f).toInt()
+        val candidates = mutableListOf<AccessibilityNodeInfo>()
+
+        fun walk(n: AccessibilityNodeInfo?) {
+            n ?: return
+            val text = n.text?.toString()?.trim().orEmpty()
+            if (text == "消息") {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() >= bottomStart) candidates.add(n)
+            }
+            for (i in 0 until n.childCount) walk(n.getChild(i))
+        }
+        walk(root)
+
+        val node = candidates.firstOrNull() ?: return false
+        var target: AccessibilityNodeInfo? = node
+        while (target != null && !target.isClickable) target = target.parent
+        if (target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) return true
+
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        if (r.isEmpty) return false
+        return tap(svc, r.centerX().toFloat(), r.centerY().toFloat())
+    }
+
     /** Cheap state-hash of the current list view — used to detect when we've
      *  reached the bottom (subsequent swipes don't change anything). */
     private fun listFingerprint(svc: WeComAccessibilityService): String {
@@ -128,6 +178,27 @@ class MessageListScanner(
             lineTo(x2, y2)
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        return suspendCancellableCoroutine { cont ->
+            val ok = svc.dispatchGesture(
+                gesture,
+                object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(g: GestureDescription?) {
+                        if (cont.isActive) cont.resume(true)
+                    }
+                    override fun onCancelled(g: GestureDescription?) {
+                        if (cont.isActive) cont.resume(false)
+                    }
+                },
+                null,
+            )
+            if (!ok) cont.resume(false)
+        }
+    }
+
+    private suspend fun tap(svc: AccessibilityService, x: Float, y: Float): Boolean {
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 80)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         return suspendCancellableCoroutine { cont ->
             val ok = svc.dispatchGesture(

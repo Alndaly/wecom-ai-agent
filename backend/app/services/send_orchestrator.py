@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -16,12 +17,15 @@ from app.core.db import SessionLocal
 from app.core.ws_manager import hub
 from app.device import DeviceClient
 from app.models import Conversation, Message, Robot, RobotTask, RobotTaskLog
+from app.models import utcnow
 from app.schemas import MessageOut
 from app.services import settings_service
 
 log = logging.getLogger(__name__)
 
 _REACT_PREFIX = "[react] "
+_MAX_AUTO_REPLY_SEND_ATTEMPTS = 2
+_AUTO_REPLY_RETRY_DELAY_SEC = 5.0
 
 
 # Per-device serialisation is the job of services.task_queue (one consumer
@@ -37,7 +41,10 @@ async def create_and_dispatch_send_text(
     text: str,
     sender_type: str,
     sender_id: int | None,
+    feedback_message_ids: list[int] | None = None,
 ) -> tuple[Message, RobotTask]:
+    if not settings.task_queue_enabled:
+        raise RuntimeError("task queue disabled")
     msg = Message(
         conversation_id=conv.id,
         direction="out",
@@ -53,7 +60,11 @@ async def create_and_dispatch_send_text(
     task = RobotTask(
         robot_id=robot.id,
         type="send_text",
-        payload_json={"conversation_external_id": contact_external_id, "text": text},
+        payload_json={
+            "conversation_external_id": contact_external_id,
+            "text": text,
+            "feedback_message_ids": feedback_message_ids or [],
+        },
         status="dispatched",
         conversation_id=conv.id,
         message_id=msg.id,
@@ -71,7 +82,7 @@ async def create_and_dispatch_send_text(
 
     msg.task_id = task.id
     conv.last_message_at = msg.created_at
-    conv.last_message_preview = text[:200]
+    conv.last_message_preview = text
 
     await db.commit()
     await db.refresh(msg)
@@ -202,21 +213,18 @@ async def run_send_task(task_id: int) -> None:
             task = await db.get(RobotTask, task_id)
             if task is None:
                 return
+            retry_task_id: int | None = None
 
             if result.ok:
                 task.status = "completed"
                 task.last_error = None
+                await _mark_feedback_messages(db, task, "replied")
                 if task.message_id:
                     msg = await db.get(Message, task.message_id)
                     if msg:
                         msg.status = "sent"
             else:
-                task.status = "failed"
-                task.last_error = _REACT_PREFIX + result.summary
-                if task.message_id:
-                    msg = await db.get(Message, task.message_id)
-                    if msg:
-                        msg.status = "failed"
+                retry_task_id = await _handle_send_failure(db, robot, task, _REACT_PREFIX + result.summary)
             db.add(
                 RobotTaskLog(
                     robot_id=robot.id,
@@ -226,6 +234,16 @@ async def run_send_task(task_id: int) -> None:
                 )
             )
             await db.commit()
+            if retry_task_id is not None:
+                from app.services import task_queue
+
+                await asyncio.sleep(_AUTO_REPLY_RETRY_DELAY_SEC)
+                await task_queue.enqueue(
+                    robot.robot_id,
+                    "send_text",
+                    retry_task_id,
+                    priority=task_queue.PRIORITY_BACKGROUND,
+                )
             await hub.broadcast_web(
                 robot.team_id,
                 "task.updated",
@@ -235,11 +253,13 @@ async def run_send_task(task_id: int) -> None:
                 m = await db.get(Message, task.message_id)
                 if m:
                     await _broadcast_message_update(robot.team_id, m)
+            await _wake_auto_reply_if_pending(db, robot.id, task.conversation_id)
         except asyncio.CancelledError:
             task = await db.get(RobotTask, task_id)
             if task is not None:
                 task.status = "cancelled"
                 task.last_error = "任务执行已中断"
+                await _mark_feedback_messages(db, task, "failed")
                 if task.message_id:
                     msg = await db.get(Message, task.message_id)
                     if msg:
@@ -262,6 +282,7 @@ async def run_send_task(task_id: int) -> None:
                     m = await db.get(Message, task.message_id)
                     if m:
                         await _broadcast_message_update(robot.team_id, m)
+                await _wake_auto_reply_if_pending(db, robot.id, task.conversation_id)
             raise
         except Exception as e:  # noqa: BLE001
             log.exception("react send crashed: %s", e)
@@ -276,3 +297,80 @@ def _goal_for_task(task: RobotTask) -> str | None:
     if not text:
         return None
     return f"打开与「{contact}」的聊天，并发送下面这段文本：{text}"
+
+
+async def _mark_feedback_messages(db: AsyncSession, task: RobotTask, status: str) -> None:
+    ids = (task.payload_json or {}).get("feedback_message_ids") or []
+    if not ids:
+        return
+    rows = (
+        await db.execute(
+            select(Message).where(
+                Message.id.in_(ids),
+                Message.direction == "in",
+                Message.sender_type == "customer",
+            )
+        )
+    ).scalars().all()
+    for msg in rows:
+        if status == "failed" and msg.feedback_status == "replied":
+            continue
+        msg.feedback_status = status
+        msg.feedback_at = utcnow()
+
+
+async def _handle_send_failure(
+    db: AsyncSession, robot: Robot, task: RobotTask, error: str
+) -> int | None:
+    task.attempts = int(task.attempts or 0) + 1
+    task.last_error = error
+    if task.attempts < min(int(task.max_attempts or 1), _MAX_AUTO_REPLY_SEND_ATTEMPTS):
+        task.status = "dispatched"
+        await _mark_feedback_messages(db, task, "pending")
+        if task.message_id:
+            msg = await db.get(Message, task.message_id)
+            if msg:
+                msg.status = "pending"
+        db.add(
+            RobotTaskLog(
+                robot_id=robot.id,
+                task_id=task.id,
+                level="warn",
+                message=f"{error}; 将重试 {task.attempts}/{task.max_attempts}",
+            )
+        )
+        return task.id
+
+    task.status = "failed"
+    await _mark_feedback_messages(db, task, "failed")
+    if task.message_id:
+        msg = await db.get(Message, task.message_id)
+        if msg:
+            msg.status = "failed"
+    return None
+
+
+async def _wake_auto_reply_if_pending(
+    db: AsyncSession, robot_pk: int, conv_id: int | None
+) -> None:
+    if not settings.auto_reply_enabled:
+        return
+    if conv_id is None:
+        return
+    row = (
+        await db.execute(
+            select(Message.id)
+            .where(
+                Message.conversation_id == conv_id,
+                Message.direction == "in",
+                Message.sender_type == "customer",
+                Message.feedback_status.in_(("pending", "processing")),
+            )
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return
+    from app.services import auto_reply_scheduler
+
+    auto_reply_scheduler.wake_robot(robot_pk)

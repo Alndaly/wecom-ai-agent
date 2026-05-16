@@ -58,7 +58,7 @@ async def parse(
             raise RuntimeError(f"mineru cli timed out after {timeout_sec}s")
 
         if proc.returncode != 0:
-            err = (stderr or b"").decode("utf-8", errors="replace")[:2000]
+            err = (stderr or b"").decode("utf-8", errors="replace")
             raise RuntimeError(f"mineru cli exit={proc.returncode}: {err}")
 
         return _collect_markdown(output_dir)

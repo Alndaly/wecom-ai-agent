@@ -60,7 +60,7 @@ class RetrievalResult:
                 }.get(h.source, h.source)
                 parts.append(
                     f"[{i}] ({label}, score={h.score:.2f}, chunk={h.chunk_id}) "
-                    f"{_clip(h.text, 1000)}"
+                    f"{' '.join((h.text or '').split())}"
                 )
         if self.graph_facts:
             parts.append("【关联实体】")
@@ -71,13 +71,6 @@ class RetrievalResult:
 
 _SECTION_RE = re.compile(r"\b\d+(?:\.\d+)+\b")
 _PAGE_DOTS_RE = re.compile(r"[.．…]{2,}\s*\d{1,4}")
-
-
-def _clip(text: str, limit: int) -> str:
-    text = " ".join((text or "").split())
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "…"
 
 
 def _looks_like_toc(text: str) -> bool:

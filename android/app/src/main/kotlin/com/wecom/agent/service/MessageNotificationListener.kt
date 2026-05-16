@@ -54,7 +54,7 @@ class MessageNotificationListener : NotificationListenerService() {
             }
             pending.addLast(Triple(sender, content, postTime))
             while (pending.size > pendingCap) pending.removeFirst()
-            Log.w("MsgNotifListener", "notification queued because foreground callback is not registered sender=$sender content=${content.take(40)}")
+            Log.w("MsgNotifListener", "notification queued because foreground callback is not registered sender=$sender content=$content")
             return false
         }
     }
@@ -100,13 +100,13 @@ class MessageNotificationListener : NotificationListenerService() {
             Notification.EXTRA_TEXT_LINES,
         )
         if (title.isEmpty() || rawText.isEmpty()) {
-            Log.i(tag, "skip notif: missing title/text title=${title.take(40)} text=${rawText.take(40)} extras=${extras.keySet()}")
+            Log.i(tag, "skip notif: missing title/text title=$title text=$rawText extras=${extras.keySet()}")
             return
         }
 
         // ignore the persistent "您有 N 条未读消息" summary
         if (isSummaryNotification(cleanText(rawText), cleanText(title))) {
-            Log.i(tag, "skip notif: summary title=${title.take(40)} text=${rawText.take(60)}")
+            Log.i(tag, "skip notif: summary title=$title text=$rawText")
             return
         }
 
@@ -115,23 +115,23 @@ class MessageNotificationListener : NotificationListenerService() {
         val cleanText = cleanText(rawText)
         val cleanTitle = cleanText(title)
         if (cleanText.isEmpty()) {
-            Log.i(tag, "skip notif: empty after clean title=${title.take(40)} text=${rawText.take(60)}")
+            Log.i(tag, "skip notif: empty after clean title=$title text=$rawText")
             return
         }
 
         val (sender, content) = parseSenderAndContent(cleanTitle, cleanText)
         if (content.isEmpty()) {
-            Log.i(tag, "skip notif: empty parsed sender=${sender.take(40)} raw=${cleanText.take(60)}")
+            Log.i(tag, "skip notif: empty parsed sender=$sender raw=$cleanText")
             return
         }
 
         val key = "${sbn.postTime}|$sender|$content"
         if (!rememberKey(key)) {
-            Log.d(tag, "skip notif: duplicate sender=${sender.take(40)} content=${content.take(60)}")
+            Log.d(tag, "skip notif: duplicate sender=$sender content=$content")
             return
         }
 
-        Log.i(tag, "inbound: $sender :: ${content.take(60)}")
+        Log.i(tag, "inbound: $sender :: $content")
         if (!dispatch(sender, content, sbn.postTime)) {
             requestAgentStartIfConfigured()
         }

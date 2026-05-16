@@ -52,7 +52,7 @@ class OpenAICompatibleProvider(LLMProvider):
             )
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if r.status_code >= 400:
-            raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:300]}")
+            raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text}")
         data = r.json()
         try:
             choice = data["choices"][0]

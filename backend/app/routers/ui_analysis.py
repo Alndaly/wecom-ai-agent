@@ -87,7 +87,7 @@ async def analyze_ui(
     user_text = (
         f"目标联系人: {body.contact_name}\n"
         f"当前页面: {body.current_page}\n"
-        f"UI树:\n{body.tree[:12000]}"
+        f"UI树:\n{body.tree}"
     )
 
     messages: list[dict[str, Any]] = [
@@ -118,7 +118,7 @@ async def analyze_ui(
     if resp.status_code >= 400:
         return UiAnalysisOut(
             ok=False,
-            error=f"LLM HTTP {resp.status_code}: {resp.text[:300]}",
+            error=f"LLM HTTP {resp.status_code}: {resp.text}",
             latency_ms=latency_ms,
         )
 
@@ -131,8 +131,8 @@ async def analyze_ui(
     try:
         parsed = json.loads(_strip_json(text))
     except Exception as e:  # noqa: BLE001
-        log.warning("ui analysis parse failed: %s", text[:500])
-        return UiAnalysisOut(ok=False, error=f"parse failed: {e}", raw=text[:1000], latency_ms=latency_ms)
+        log.warning("ui analysis parse failed: %s", text)
+        return UiAnalysisOut(ok=False, error=f"parse failed: {e}", raw=text, latency_ms=latency_ms)
 
     return UiAnalysisOut(
         ok=True,

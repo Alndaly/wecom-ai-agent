@@ -34,7 +34,7 @@ class WeComAccessibilityService : AccessibilityService() {
             private set
 
         /** Set by AgentForegroundService; called for every fresh visible message bubble. */
-        @Volatile var onChatMessage: ((sender: String, content: String, fromSelf: Boolean) -> Unit)? = null
+        @Volatile var onChatMessage: ((sender: String, content: String, fromSelf: Boolean, messageKey: String) -> Unit)? = null
     }
 
     private val tag = "WeComA11y"
@@ -48,7 +48,13 @@ class WeComAccessibilityService : AccessibilityService() {
         private set
 
     /** Dedupe per-session: we never re-fire the same visible bubble within a short window. */
-    private data class RecentBubble(val chat: String, val content: String, val fromSelf: Boolean, val at: Long)
+    private data class RecentBubble(
+        val chat: String,
+        val content: String,
+        val fromSelf: Boolean,
+        val at: Long,
+        val boundsKey: String = "",
+    )
     private data class ChatBubble(val content: String, val fromSelf: Boolean, val bounds: android.graphics.Rect)
     private data class BubbleRole(val fromSelf: Boolean, val anchor: android.graphics.Rect)
     private val recent = ArrayDeque<RecentBubble>()
@@ -59,6 +65,7 @@ class WeComAccessibilityService : AccessibilityService() {
      *  only emit rows whose preview *changes* compared to this baseline so we
      *  don't re-fire all history on startup. */
     private val homeListBaseline = HashMap<String, String>()
+    private val emittedUnreadHomePreviews = HashSet<String>()
     private var homeBaselineReady = false
     private var lastChatHarvestAt = 0L
     private data class CachedScreenshot(val atMs: Long, val quality: Int, val frame: ScreenFramePayload)
@@ -126,10 +133,7 @@ class WeComAccessibilityService : AccessibilityService() {
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(root)
-        if (found && currentChatTitle.isNullOrEmpty()) {
-            // Make sure maybeHarvestChat has a title to dedupe against.
-            currentChatTitle = inferChatTitle()
-        }
+        if (found) refreshChatTitle(root)
         return found
     }
 
@@ -187,8 +191,8 @@ class WeComAccessibilityService : AccessibilityService() {
         val id = nodes.size + 1
         val cls = n.className?.toString()?.substringAfterLast('.') ?: "?"
         val viewId = n.viewIdResourceName?.substringAfterLast('/') ?: ""
-        val txt = (n.text?.toString() ?: "").take(60)
-        val desc = (n.contentDescription?.toString() ?: "").take(60)
+        val txt = n.text?.toString() ?: ""
+        val desc = n.contentDescription?.toString() ?: ""
         val bounds = android.graphics.Rect().also { n.getBoundsInScreen(it) }
         nodes.add(
             DumpedNode(
@@ -333,44 +337,98 @@ class WeComAccessibilityService : AccessibilityService() {
         }
         Log.d(tag, "page=$currentPage cls=$cls")
         if (currentPage == Page.CHAT) {
-            val title = inferChatTitle()
-            if (title != currentChatTitle) {
-                baselineChatTitle = null
-                baselineReady = false
-            }
-            currentChatTitle = title
+            refreshChatTitle()
         } else {
             baselineChatTitle = null
             baselineReady = false
+            currentChatTitle = null
         }
         if (currentPage != Page.HOME) {
             // re-prime the home-list baseline on next entry to avoid replaying
             // stale previews after a navigation away.
             homeListBaseline.clear()
+            emittedUnreadHomePreviews.clear()
             homeBaselineReady = false
         }
     }
 
-    private fun inferChatTitle(): String? {
-        val root = rootInActiveWindow ?: return null
-        // Conventionally the chat title is in a TextView near the top, often a sibling of a back arrow.
-        val candidates = mutableListOf<AccessibilityNodeInfo>()
+    private fun refreshChatTitle(root: AccessibilityNodeInfo? = rootInActiveWindow): String? {
+        val title = inferChatTitle(root)
+        if (!title.isNullOrBlank() && title != currentChatTitle) {
+            Log.i(tag, "chat title changed old=$currentChatTitle new=$title")
+            baselineChatTitle = null
+            baselineReady = false
+            currentChatTitle = title
+        }
+        return currentChatTitle
+    }
+
+    private data class ChatTitleCandidate(
+        val text: String,
+        val id: String,
+        val bounds: android.graphics.Rect,
+    )
+
+    private fun inferChatTitle(root: AccessibilityNodeInfo? = rootInActiveWindow): String? {
+        root ?: return null
+        val candidates = mutableListOf<ChatTitleCandidate>()
         fun walk(n: AccessibilityNodeInfo?) {
             n ?: return
             val cls = n.className?.toString() ?: ""
-            if (cls.contains("TextView", ignoreCase = true)) candidates.add(n)
+            if (cls.contains("TextView", ignoreCase = true)) {
+                val text = n.text?.toString().orEmpty().trim()
+                if (text.isNotEmpty() && looksLikeChatTitleText(text)) {
+                    val r = android.graphics.Rect()
+                    n.getBoundsInScreen(r)
+                    if (isInChatHeaderTitleZone(r)) {
+                        candidates.add(
+                            ChatTitleCandidate(
+                                text = text,
+                                id = n.viewIdResourceName?.substringAfterLast('/').orEmpty(),
+                                bounds = r,
+                            )
+                        )
+                    }
+                }
+            }
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(root)
-        // pick the top-most TextView with non-empty text and y < 250px (rough header zone)
-        return candidates
-            .filter { it.text?.isNotBlank() == true }
-            .minByOrNull {
-                val r = android.graphics.Rect()
-                it.getBoundsInScreen(r)
-                r.top
-            }
-            ?.text?.toString()
+        return candidates.maxByOrNull { chatTitleScore(it) }?.text
+    }
+
+    private fun isInChatHeaderTitleZone(bounds: android.graphics.Rect): Boolean {
+        if (bounds.isEmpty) return false
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        val headerBottom = (screenHeight * 0.13f).toInt()
+        if (bounds.top < 0 || bounds.centerY() > headerBottom) return false
+        // Avoid left back button text/icons and right-side action labels. The
+        // title normally sits in the middle band; keep this proportional so it
+        // works across devices.
+        if (bounds.centerX() < screenWidth * 0.18f) return false
+        if (bounds.centerX() > screenWidth * 0.82f) return false
+        return true
+    }
+
+    private fun looksLikeChatTitleText(text: String): Boolean {
+        if (text.isBlank()) return false
+        if (text.startsWith("@") || text.startsWith("＠")) return false
+        if (looksLikeTimestamp(text)) return false
+        if (looksLikeUnreadBadge(text)) return false
+        if (looksLikeBottomTabLabel(text)) return false
+        if (looksLikeNonMessageText(text)) return false
+        if (text in setOf("消息", "邮件", "文档", "工作台", "通讯录", "设置")) return false
+        return true
+    }
+
+    private fun chatTitleScore(c: ChatTitleCandidate): Int {
+        val screenWidth = resources.displayMetrics.widthPixels
+        val centerDelta = kotlin.math.abs(c.bounds.centerX() - screenWidth / 2)
+        val centerScore = (screenWidth / 2 - centerDelta).coerceAtLeast(0) / 10
+        val idScore = if (c.id == "ncq") 120 else 0
+        val widthScore = c.bounds.width().coerceAtMost(screenWidth / 2) / 20
+        return idScore + centerScore + widthScore - c.bounds.top / 8
     }
 
     // -------------------------------------------------------- harvest chat
@@ -378,14 +436,30 @@ class WeComAccessibilityService : AccessibilityService() {
     fun forceHarvestCurrentChat() {
         val root = rootInActiveWindow ?: return
         if (root.packageName?.toString() != "com.tencent.wework") return
-        if (looksLikeChatPage(root)) maybeHarvestChat(reason = "force")
+        if (looksLikeChatPage(root)) primeCurrentChatBaseline(reason = "force")
+    }
+
+    private fun primeCurrentChatBaseline(reason: String) {
+        val root = rootInActiveWindow ?: return
+        val title = refreshChatTitle(root) ?: "当前聊天"
+        val screenWidth = resources.displayMetrics.widthPixels
+        val now = System.currentTimeMillis()
+        gc(now)
+
+        val candidates = collectChatBubbles(root, screenWidth)
+        for (bubble in candidates) {
+            recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+        }
+        baselineChatTitle = title
+        baselineReady = true
+        lastChatHarvestAt = now
+        Log.d(tag, "baseline refreshed chat=$title candidates=${candidates.size} reason=$reason")
     }
 
     private fun maybeHarvestChat(reason: String) {
         val cb = onChatMessage ?: return
         val root = rootInActiveWindow ?: return
-        val title = currentChatTitle ?: inferChatTitle() ?: "当前聊天"
-        currentChatTitle = title
+        val title = refreshChatTitle(root) ?: "当前聊天"
 
         // Heuristic for message bubbles: collect visible TextView bubbles in
         // the message area, then classify left/right alignment. Customer
@@ -396,6 +470,32 @@ class WeComAccessibilityService : AccessibilityService() {
         lastChatHarvestAt = now
         gc(now)
 
+        val candidates = collectChatBubbles(root, screenWidth)
+
+        if (!baselineReady || baselineChatTitle != title) {
+            for (bubble in candidates) {
+                recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+            }
+            baselineChatTitle = title
+            baselineReady = true
+            Log.d(tag, "baseline chat=$title candidates=${candidates.size} reason=$reason")
+            return
+        }
+
+        var emitted = 0
+        for (bubble in candidates) {
+            if (alreadySeen(title, bubble)) continue
+            recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+            cb(title, bubble.content, bubble.fromSelf, bubble.boundsKey())
+            emitted++
+            Log.d(tag, "harvest chat=$title self=${bubble.fromSelf} reason=$reason content=${bubble.content}")
+        }
+        if (emitted == 0) {
+            Log.d(tag, "chat scan no new title=$title candidates=${candidates.size} reason=$reason")
+        }
+    }
+
+    private fun collectChatBubbles(root: AccessibilityNodeInfo, screenWidth: Int): List<ChatBubble> {
         val candidates = mutableListOf<ChatBubble>()
         val messageList = findChatMessageList(root) ?: root
         fun walk(n: AccessibilityNodeInfo?) {
@@ -408,38 +508,7 @@ class WeComAccessibilityService : AccessibilityService() {
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(messageList)
-
-        if (!baselineReady || baselineChatTitle != title) {
-            val shouldEmitLatest = reason != "force" && reason != "window_state" && candidates.isNotEmpty()
-            val baselineOnly = if (shouldEmitLatest) candidates.dropLast(1) else candidates
-            for (bubble in baselineOnly) {
-                recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now))
-            }
-            baselineChatTitle = title
-            baselineReady = true
-            if (shouldEmitLatest) {
-                val latest = candidates.last()
-                if (!alreadySeen(title, latest)) {
-                    recent.addLast(RecentBubble(title, latest.content, latest.fromSelf, now))
-                    cb(title, latest.content, latest.fromSelf)
-                    Log.d(tag, "harvest first chat=$title self=${latest.fromSelf} reason=$reason content=${latest.content.take(60)}")
-                }
-            }
-            Log.d(tag, "baseline chat=$title candidates=${candidates.size} emitLatest=$shouldEmitLatest reason=$reason")
-            return
-        }
-
-        var emitted = 0
-        for (bubble in candidates) {
-            if (alreadySeen(title, bubble)) continue
-            recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now))
-            cb(title, bubble.content, bubble.fromSelf)
-            emitted++
-            Log.d(tag, "harvest chat=$title self=${bubble.fromSelf} reason=$reason content=${bubble.content.take(60)}")
-        }
-        if (emitted == 0) {
-            Log.d(tag, "chat scan no new title=$title candidates=${candidates.size} reason=$reason")
-        }
+        return candidates
     }
 
     private fun classifyMessageBubble(
@@ -473,6 +542,10 @@ class WeComAccessibilityService : AccessibilityService() {
             .maxByOrNull { it.width() }
             ?: role.anchor
         return ChatBubble(content = content, fromSelf = role.fromSelf, bounds = bubbleRect)
+    }
+
+    private fun ChatBubble.boundsKey(): String {
+        return "${bounds.left / 8}:${bounds.top / 8}:${bounds.right / 8}:${bounds.bottom / 8}"
     }
 
     private fun messageBubbleRole(node: AccessibilityNodeInfo): BubbleRole? {
@@ -516,7 +589,7 @@ class WeComAccessibilityService : AccessibilityService() {
 
     private fun looksLikeNonMessageText(content: String): Boolean {
         val s = content.trim()
-        if (s.length <= 1) return true
+        if (s.isEmpty()) return true
         if (Regex("""^(上午|下午)?\s*\d{1,2}:\d{2}$""").matches(s)) return true
         if (Regex("""^(昨天|今天|刚刚|星期[一二三四五六日天]|周[一二三四五六日天])$""").matches(s)) return true
         if (Regex("""^\d{4}/\d{1,2}/\d{1,2}$""").matches(s)) return true
@@ -559,7 +632,11 @@ class WeComAccessibilityService : AccessibilityService() {
 
     private fun alreadySeen(sender: String, bubble: ChatBubble): Boolean {
         for (item in recent) {
-            if (item.chat == sender && item.content == bubble.content && item.fromSelf == bubble.fromSelf) return true
+            if (
+                item.chat == sender &&
+                item.content == bubble.content &&
+                item.fromSelf == bubble.fromSelf
+            ) return true
         }
         return false
     }
@@ -640,9 +717,10 @@ class WeComAccessibilityService : AccessibilityService() {
                 if (!row.hasUnread) continue
                 if (row.preview.isEmpty()) continue
                 if (isOutboundPreview(row.preview)) continue
-                if (alreadySeen(row.name, row.preview)) continue
-                recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now))
-                cb(row.name, row.preview, false)
+                val key = "home:${row.name}:${row.preview}"
+                if (!emittedUnreadHomePreviews.add(key)) continue
+                recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now, boundsKey = key))
+                cb(row.name, row.preview, false, key)
                 emittedUnread++
             }
             homeBaselineReady = true
@@ -658,13 +736,14 @@ class WeComAccessibilityService : AccessibilityService() {
             val changed = prev != row.preview
             if (!changed && !row.hasUnread) continue
             homeListBaseline[row.name] = row.preview
-            if (alreadySeen(row.name, row.preview)) continue
-            recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now))
-            cb(row.name, row.preview, false)
+            val key = "home:${row.name}:${row.preview}"
+            if (!emittedUnreadHomePreviews.add(key)) continue
+            recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now, boundsKey = key))
+            cb(row.name, row.preview, false, key)
             emitted++
             Log.d(
                 tag,
-                "home harvest name=${row.name} unread=${row.hasUnread} changed=$changed preview=${row.preview.take(60)}",
+                "home harvest name=${row.name} unread=${row.hasUnread} changed=$changed preview=${row.preview}",
             )
         }
         Log.i(tag, "home harvest checked rows=${rows.size} unreadRows=${rows.count { it.hasUnread }} emitted=$emitted")
@@ -679,7 +758,8 @@ class WeComAccessibilityService : AccessibilityService() {
             if (t == "消息") {
                 val r = android.graphics.Rect()
                 n.getBoundsInScreen(r)
-                if (r.centerY() < 180) {
+                val headerCutoff = (resources.displayMetrics.heightPixels * 0.12f).toInt()
+                if (r.centerY() < headerCutoff) {
                     found = true
                     return
                 }
@@ -709,9 +789,9 @@ class WeComAccessibilityService : AccessibilityService() {
             return emptyList()
         }
         val out = mutableListOf<HomeListRow>()
-        val headerCutoff = 200  // skip the top title bar
-        val footerCutoff =
-            resources.displayMetrics.heightPixels - 160  // skip the bottom tabs
+        val screenHeight = resources.displayMetrics.heightPixels
+        val headerCutoff = (screenHeight * 0.09f).toInt()
+        val footerCutoff = (screenHeight * 0.90f).toInt()
 
         for (i in 0 until list.childCount) {
             val row = list.getChild(i) ?: continue
@@ -748,8 +828,9 @@ class WeComAccessibilityService : AccessibilityService() {
             val fallback = idBased ?: parseHomeRowByTextShape(texts)
             val parsed = fallback ?: continue
             val (name, preview, hasUnread) = parsed
-            if (preview.length < 2) continue
+            if (preview.isBlank()) continue
             out.add(HomeListRow(name = name, preview = preview, hasUnread = hasUnread))
+            Log.d(tag, "home row parsed name=$name unread=$hasUnread preview=$preview")
         }
         Log.i(tag, "home rows parsed=${out.size} listChildren=${list.childCount}")
         return out
@@ -793,22 +874,65 @@ class WeComAccessibilityService : AccessibilityService() {
         val candidates = mutableListOf<Pair<Int, AccessibilityNodeInfo>>()
         fun walk(n: AccessibilityNodeInfo?) {
             n ?: return
-            if (n.isScrollable) {
-                val r = android.graphics.Rect()
-                n.getBoundsInScreen(r)
-                val rowishChildren = (0 until n.childCount).count { idx ->
-                    val child = n.getChild(idx) ?: return@count false
-                    val cr = android.graphics.Rect()
-                    child.getBoundsInScreen(cr)
-                    cr.height() > 80 && cr.width() > resources.displayMetrics.widthPixels * 0.45f
+            val cls = n.className?.toString().orEmpty()
+            if (n.isScrollable || cls.contains("RecyclerView", true)) {
+                val score = conversationListScore(n)
+                if (score > 0) {
+                    candidates.add(score to n)
                 }
-                val score = rowishChildren * 10 + r.height() / 100 + r.width() / 200
-                candidates.add(score to n)
             }
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(root)
         return candidates.maxByOrNull { it.first }?.second
+    }
+
+    private fun conversationListScore(node: AccessibilityNodeInfo): Int {
+        val r = android.graphics.Rect()
+        node.getBoundsInScreen(r)
+        if (r.height() <= 0 || r.width() <= 0) return 0
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        if (r.width() < screenWidth * 0.45f) return 0
+        if (r.bottom < screenHeight * 0.20f) return 0
+
+        var rowishChildren = 0
+        var knownFieldCount = 0
+        var unreadBadgeCount = 0
+        for (idx in 0 until node.childCount) {
+            val child = node.getChild(idx) ?: continue
+            val cr = android.graphics.Rect()
+            child.getBoundsInScreen(cr)
+            if (cr.height() > screenHeight * 0.035f && cr.width() > screenWidth * 0.45f) {
+                rowishChildren++
+            }
+            collectTextIds(child) { id, text ->
+                if (id in setOf("hrr", "mdj", "ko_", "g80")) knownFieldCount++
+                if (id == "ko_" && looksLikeUnreadBadge(text)) unreadBadgeCount++
+            }
+        }
+        if (rowishChildren == 0 && knownFieldCount == 0) return 0
+        return rowishChildren * 10 +
+            knownFieldCount * 8 +
+            unreadBadgeCount * 20 +
+            r.height() / 100 +
+            r.width() / 200
+    }
+
+    private fun collectTextIds(
+        node: AccessibilityNodeInfo,
+        visit: (id: String, text: String) -> Unit,
+    ) {
+        val cls = node.className?.toString().orEmpty()
+        if (cls.contains("TextView", true)) {
+            val text = node.text?.toString().orEmpty().trim()
+            val id = node.viewIdResourceName?.substringAfterLast('/').orEmpty()
+            if (text.isNotEmpty() || id.isNotEmpty()) visit(id, text)
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectTextIds(child, visit)
+        }
     }
 
     private fun looksLikeTimestamp(s: String): Boolean {

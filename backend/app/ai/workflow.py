@@ -96,8 +96,7 @@ async def handle_inbound(
     state = AIState(conv=conv, robot=robot, inbound=message)
     log.info(
         "[workflow] inbound conv=%s mode=%s trace=%s text=%r",
-        conv.id, conv.mode, state.trace_id,
-        (message.content[:80] + "…") if len(message.content) > 80 else message.content,
+        conv.id, conv.mode, state.trace_id, message.content,
     )
 
     # 1. mode gate
@@ -114,10 +113,17 @@ async def handle_inbound(
     )
 
     # 2. context
-    state.history = await _load_history(db, conv.id, state.context_window)
     state.prompt = await _load_prompt(db, conv.team_id, ai_cfg)
     state.memory_summary = await _load_memory(db, conv.contact_id)
     state.unreplied_chain = await _load_unreplied_chain(db, conv.id)
+    state.history = await _load_history(db, conv.id, state.context_window)
+    # Keep current-turn messages out of the history window. They are added
+    # below as a clearly labelled "unreplied" bundle. If the same text appears
+    # in both places the LLM tends to miscount history as "the user asked three
+    # times", which is exactly the duplicate-reply failure we are fixing.
+    unreplied_ids = {m.id for m in state.unreplied_chain}
+    if unreplied_ids:
+        state.history = [m for m in state.history if m.id not in unreplied_ids]
     # If the customer fired several messages in a row, run retrieval on the
     # concatenated text so the KB step sees the full intent, not just the
     # latest fragment ("还有，价格怎么算？" alone is uninformative).
@@ -153,27 +159,18 @@ async def handle_inbound(
 # nodes
 # ---------------------------------------------------------------------------
 async def _load_unreplied_chain(db: AsyncSession, conversation_id: int) -> list[Message]:
-    """Return inbound messages newer than the last outbound — in chrono order.
-
-    If the bot/operator has never replied in this conversation, returns every
-    inbound (capped to avoid prompt blow-up).
-    """
-    last_out = (
-        await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conversation_id, Message.direction == "out")
-            .order_by(desc(Message.created_at))
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    """Return customer messages still awaiting feedback, in chrono order."""
     stmt = (
         select(Message)
-        .where(Message.conversation_id == conversation_id, Message.direction == "in")
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.direction == "in",
+            Message.sender_type == "customer",
+            Message.feedback_status.in_(("pending", "processing")),
+        )
         .order_by(Message.created_at.asc())
         .limit(20)  # hard cap to keep prompt bounded
     )
-    if last_out is not None:
-        stmt = stmt.where(Message.created_at > last_out.created_at)
     rows = (await db.execute(stmt)).scalars().all()
     return list(rows)
 
@@ -241,7 +238,10 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
     msgs: list[ChatMessage] = [ChatMessage(role="system", content="\n\n".join(system_parts))]
     for m in state.history:
         role = "user" if m.direction == "in" else "assistant"
-        msgs.append(ChatMessage(role=role, content=m.content))
+        label = "历史客户消息（已处理，仅供背景）" if role == "user" else "历史客服回复（已发送，仅供背景）"
+        msgs.append(ChatMessage(role=role, content=f"【{label}】{m.content}"))
+    chain_texts = [m.content for m in state.unreplied_chain] or [state.inbound.content]
+    msgs.append(ChatMessage(role="user", content=_format_unreplied_turn(chain_texts)))
     try:
         result = await provider.chat(
             msgs,
@@ -303,6 +303,18 @@ def _agent_enabled(ai_cfg: dict) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _format_unreplied_turn(chain: list[str]) -> str:
+    cleaned = [c for c in chain if c]
+    if not cleaned:
+        return "【本轮未回复消息】（空）"
+    if len(cleaned) == 1:
+        return f"【本轮未回复消息，共 1 条】\n[1] {cleaned[0]}"
+    lines = [f"【本轮未回复消息，共 {len(cleaned)} 条，按时间从早到晚】"]
+    lines.extend(f"[{i}] {content}" for i, content in enumerate(cleaned, 1))
+    lines.append("请只基于本轮未回复消息判断客户当前是否连续发送、是否需要合并回复。")
+    return "\n".join(lines)
 
 
 def _llm_result_insufficient(text: str, confidence: float) -> bool:

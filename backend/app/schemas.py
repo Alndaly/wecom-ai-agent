@@ -126,6 +126,10 @@ class MessageOut(ORM):
     type: str
     content: str
     status: str | None = None
+    feedback_status: str | None = None
+    feedback_trace_id: str | None = None
+    feedback_at: datetime | None = None
+    feedback_reply_task_ids: list[int] | None = None
     external_msg_id: str | None = None
     task_id: int | None = None
     created_at: datetime

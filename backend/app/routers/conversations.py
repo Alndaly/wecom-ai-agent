@@ -6,10 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete as sa_delete, desc, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.ws_manager import hub
 from app.deps import current_user
-from app.models import AIReplyLog, Contact, Conversation, Message, Robot, RobotTask, User
+from app.models import AIReplyLog, Contact, Conversation, Message, Robot, RobotTask, RobotTaskLog, User
+from app.models import utcnow
 from app.schemas import (
     ConversationOut,
     ConversationPatch,
@@ -143,12 +145,21 @@ async def delete_conversation(
     conv = await _get_conv(db, cid, user.team_id)
     # 1. AIReplyLog ← message_id (FK) — wipe entire conv
     await db.execute(sa_delete(AIReplyLog).where(AIReplyLog.conversation_id == cid))
-    # 2. Messages reference robot_tasks via FK; tasks reference conv via FK too.
-    #    Order: clear Message.task_id (FK), delete RobotTask rows for this conv,
-    #    delete messages, then the conversation row.
+    # 2. Messages and task logs reference robot_tasks via FK; tasks reference
+    #    conv via FK too. For a hard-delete conversation, remove task logs for
+    #    those tasks first, then tasks, then messages and the conversation row.
     await db.execute(
         sa_update(Message).where(Message.conversation_id == cid).values(task_id=None)
     )
+    task_ids = (
+        await db.execute(
+            select(RobotTask.id).where(RobotTask.conversation_id == cid)
+        )
+    ).scalars().all()
+    if task_ids:
+        await db.execute(
+            sa_delete(RobotTaskLog).where(RobotTaskLog.task_id.in_(task_ids))
+        )
     await db.execute(sa_delete(RobotTask).where(RobotTask.conversation_id == cid))
     await db.execute(sa_delete(Message).where(Message.conversation_id == cid))
     await db.delete(conv)
@@ -172,6 +183,8 @@ async def send_message(
     contact = await db.get(Contact, conv.contact_id)
     if not robot or not contact:
         raise HTTPException(status.HTTP_409_CONFLICT, "robot or contact missing")
+    if not settings.task_queue_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "task queue disabled")
     msg, task = await create_and_dispatch_send_text(
         db,
         robot=robot,
@@ -180,8 +193,32 @@ async def send_message(
         text=body.content,
         sender_type="human",
         sender_id=user.id,
+        feedback_message_ids=await _pending_feedback_ids(db, conv.id),
     )
     return MessageSendOut(
         message=MessageOut.model_validate(msg),
         task=TaskOut.model_validate(task),
     )
+
+
+async def _pending_feedback_ids(db: AsyncSession, conv_id: int) -> list[int]:
+    rows = (
+        await db.execute(
+            select(Message)
+            .where(
+                Message.conversation_id == conv_id,
+                Message.direction == "in",
+                Message.sender_type == "customer",
+                Message.feedback_status.in_(("pending", "processing")),
+            )
+            .order_by(Message.created_at.asc())
+            .limit(20)
+        )
+    ).scalars().all()
+    now = utcnow()
+    ids: list[int] = []
+    for msg in rows:
+        msg.feedback_status = "queued"
+        msg.feedback_at = now
+        ids.append(msg.id)
+    return ids

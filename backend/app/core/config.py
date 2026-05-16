@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     ai_confidence_threshold: float = 0.55  # below → escalate to human
     ai_context_window: int = 10  # how many recent messages to feed
     ai_max_tokens: int = 8192  # output ceiling per reply
+    # Master kill-switch for device-driving tasks. Keep this off while testing
+    # raw message callback coverage so inbound messages only log + persist.
+    task_queue_enabled: bool = True
+    auto_reply_enabled: bool = True
+    inbound_content_dedupe_enabled: bool = False
     # When a deterministic UI task fails, escalate to the ReAct fallback agent
     # (observes UI tree, asks LLM, executes primitives). Off by default — it
     # costs extra LLM calls per failure.
@@ -89,6 +94,7 @@ class Settings(BaseSettings):
 
     # ---- Long-term memory ----
     memory_summary_every: int = 10  # generate / refresh summary every N inbound msgs
+    memory_refresh_enabled: bool = False
     # ---- Message retention ----
     # Daily sweep deletes messages older than this. Set to 0 to disable.
     message_retention_days: int = 30

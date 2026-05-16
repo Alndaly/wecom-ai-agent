@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import delete as sa_delete, select
+from sqlalchemy import delete as sa_delete, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -14,7 +14,18 @@ from app.core.db import SessionLocal, get_db
 from app.core.security import new_robot_token
 from app.core.ws_manager import hub
 from app.deps import current_user
-from app.models import Robot, RobotTask, RobotTaskLog, User
+from app.models import (
+    AIReplyLog,
+    Contact,
+    Conversation,
+    Message,
+    Robot,
+    RobotTask,
+    RobotTaskLog,
+    User,
+    UserMemory,
+    UserProfile,
+)
 from app.services import settings_service
 from app.schemas import (
     AgentRunIn,
@@ -143,8 +154,36 @@ async def delete_robot(
     robot = await db.get(Robot, rid)
     if not robot or robot.team_id != user.team_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
-    await db.delete(robot)
+
+    conv_ids = (
+        await db.execute(
+            select(Conversation.id).where(Conversation.robot_id == robot.id)
+        )
+    ).scalars().all()
+    contact_ids = (
+        await db.execute(select(Contact.id).where(Contact.robot_id == robot.id))
+    ).scalars().all()
+    task_ids = (
+        await db.execute(select(RobotTask.id).where(RobotTask.robot_id == robot.id))
+    ).scalars().all()
+
+    if conv_ids:
+        await db.execute(sa_delete(AIReplyLog).where(AIReplyLog.conversation_id.in_(conv_ids)))
+        await db.execute(sa_update(Message).where(Message.conversation_id.in_(conv_ids)).values(task_id=None))
+    if task_ids:
+        await db.execute(sa_delete(RobotTaskLog).where(RobotTaskLog.task_id.in_(task_ids)))
+    await db.execute(sa_delete(RobotTaskLog).where(RobotTaskLog.robot_id == robot.id))
+    await db.execute(sa_delete(RobotTask).where(RobotTask.robot_id == robot.id))
+    if conv_ids:
+        await db.execute(sa_delete(Message).where(Message.conversation_id.in_(conv_ids)))
+        await db.execute(sa_delete(Conversation).where(Conversation.id.in_(conv_ids)))
+    if contact_ids:
+        await db.execute(sa_delete(UserMemory).where(UserMemory.contact_id.in_(contact_ids)))
+        await db.execute(sa_delete(UserProfile).where(UserProfile.contact_id.in_(contact_ids)))
+        await db.execute(sa_delete(Contact).where(Contact.id.in_(contact_ids)))
+    await db.execute(sa_delete(Robot).where(Robot.id == robot.id))
     await db.commit()
+    await hub.broadcast_web(user.team_id, "robot.deleted", {"robot_id": robot.robot_id, "id": rid})
 
 
 @router.get("/{rid}/logs", response_model=list[RobotTaskLogOut])
@@ -253,6 +292,8 @@ async def run_agent_goal(
     robot = await db.get(Robot, rid)
     if not robot or robot.team_id != user.team_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    if not settings.task_queue_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "task queue disabled")
     if not hub.is_android_online(robot.robot_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "robot offline")
 
@@ -266,7 +307,7 @@ async def run_agent_goal(
     await db.flush()
     db.add(RobotTaskLog(
         robot_id=robot.id, task_id=task.id, level="info",
-        message=f"agent_goal received: {goal[:200]}",
+        message=f"agent_goal received: {goal}",
     ))
     await db.commit()
     await db.refresh(task)

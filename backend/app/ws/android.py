@@ -97,6 +97,15 @@ async def _handle_event(robot: Robot, data: dict) -> None:
 
     if event == "message.received":
         evt = AndroidMessageReceived.model_validate(payload)
+        log.info(
+            "[message-callback] ws received robot=%s contact=%s sender_type=%s "
+            "external_msg_id=%s content=%r",
+            robot.robot_id,
+            evt.contact.external_id,
+            evt.sender_type,
+            evt.external_msg_id,
+            evt.content or "",
+        )
         async with SessionLocal() as db:
             r = await db.get(Robot, robot.id)
             if r:
@@ -107,7 +116,7 @@ async def _handle_event(robot: Robot, data: dict) -> None:
                         robot.robot_id,
                         evt.contact.external_id,
                         evt.sender_type,
-                        (evt.content or "")[:80],
+                        evt.content or "",
                     )
                 else:
                     log.info(
@@ -116,7 +125,7 @@ async def _handle_event(robot: Robot, data: dict) -> None:
                         evt.contact.external_id,
                         evt.sender_type,
                         msg.direction,
-                        (msg.content or "")[:80],
+                        msg.content or "",
                     )
         return
 
@@ -229,8 +238,8 @@ def _robot_payload(robot_id: str, payload: dict) -> dict:
 def _save_ui_dump(robot: Robot, payload: dict) -> dict:
     """Persist a UI tree dump under var/ui_dumps/ so we can calibrate locators."""
     request_id = payload.get("request_id")
-    reason = (payload.get("reason") or "manual").replace("/", "_")[:64]
-    page = (payload.get("current_page") or "UNKNOWN")[:32]
+    reason = (payload.get("reason") or "manual").replace("/", "_")
+    page = payload.get("current_page") or "UNKNOWN"
     tree = payload.get("tree") or ""
     nodes = payload.get("nodes") or []
     base = Path("var/ui_dumps")

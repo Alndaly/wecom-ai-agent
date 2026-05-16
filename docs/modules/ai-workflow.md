@@ -21,7 +21,7 @@ class Decision:
 
 | action | 含义 | 后续动作 |
 | --- | --- | --- |
-| `reply` | AI 直接回复 | 自动创建 `send_text` 任务，下发 Android |
+| `reply` | AI 直接回复 | 自动创建 `send_text` 任务，进入每机器人队列 |
 | `suggest` | AI 仅生成建议（混合模式 + 低置信） | 走 `ai.suggestion` 推 Web 工作台右栏 |
 | `skip` | 不参与（mode=human / 人工锁中 / LLM 失败） | 无动作 |
 
@@ -42,8 +42,12 @@ confidence_gate    mixed mode 且 confidence < threshold → suggest
   ↓
 finalize           写 ai_reply_logs
   ↓ (action=reply)
-dispatch_task      在 services/conversation.py 中调用 send_text dispatcher
+enqueue_task        auto_reply_scheduler 调 send_orchestrator 创建 send_text 任务
 ```
+
+自动回复不是在入站落库函数里直接执行。`conversation.py` 只把真实客户消息标为
+`feedback_status=pending` 并唤醒 `auto_reply_scheduler`。调度器按 robot 公平轮转：
+同一会话最多连续处理 2 轮；一轮最多聚合 20 条待反馈入站；回复任务最多创建 2 条。
 
 ## LLMProvider 抽象
 
@@ -72,13 +76,12 @@ GET  /ai/prompts/default               → 默认提示词
 GET  /ai/logs?conversation_id=&limit=  → 决策日志
 ```
 
-## 接管锁（与人工协同）
+## 人工协同
 
-> MVP2 暂未引入 Redis 锁；目前依赖 `conversation.mode`：客服在 Web 把会话切到 `human` 即等价于"锁住 AI"。
-> 真正的 Redis 锁（`lock:conversation:{id}`，TTL 10 分钟）放在 MVP5，与多 worker、风控一起做。
+当前依赖 `conversation.mode`：客服在 Web 把会话切到 `human` 后，自动回复调度器不会为该会话继续触发 AI。人工发送会覆盖本会话待反馈客户消息并记录到 `feedback_reply_task_ids`。
 
 ## 验收（MVP2）已通过 ✅
-- [x] mode=ai 时，客户消息 → AI 在 ≤ 3s 内自动回复，消息标 `sender_type=ai`
+- [x] mode=ai 时，客户消息 → AI 自动创建队列任务，消息标 `sender_type=ai`
 - [x] mode=mixed 且置信度低 → AI 不发送，仅推 `ai.suggestion` 给 Web
 - [x] mode=human → AI 跳过，仅推 Web
 - [x] 每次决策都写 `ai_reply_logs`，含 `trace_id`

@@ -175,6 +175,10 @@ export type Message = {
   type: string;
   content: string;
   status: string | null;
+  feedback_status: string | null;
+  feedback_trace_id: string | null;
+  feedback_at: string | null;
+  feedback_reply_task_ids: number[] | null;
   external_msg_id: string | null;
   task_id: number | null;
   created_at: string;

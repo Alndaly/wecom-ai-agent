@@ -4,65 +4,132 @@ Handles the inbound side (Android → backend) and broadcasts to Web hub.
 """
 from __future__ import annotations
 
-import asyncio
 import re
+import logging
 from datetime import datetime, timedelta
 
-# Per-conversation lock. Serialises the AI reply path so that bursts of
-# inbound messages from the same customer don't kick off N concurrent agent
-# runs (which would each see a different subset of the unreplied chain and
-# duplicate replies). The first lock holder processes the whole chain; queued
-# arrivals re-enter, see "no unreplied tail" and exit cheaply.
-_CONV_LOCKS: dict[int, asyncio.Lock] = {}
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.ws_manager import hub
+from app.memory import summarizer
+from app.models import Contact, Conversation, Message, Robot, utcnow
+from app.schemas import (
+    AndroidMessageReceived,
+    ConversationOut,
+    MessageOut,
+)
+
+log = logging.getLogger(__name__)
 
 
-def _lock_for(conv_id: int) -> asyncio.Lock:
-    lock = _CONV_LOCKS.get(conv_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _CONV_LOCKS[conv_id] = lock
-    return lock
+def _normalize_message_content(content: str) -> str:
+    return " ".join((content or "").strip().split())
 
 
-async def _has_been_replied_after(
-    db: AsyncSession, conv_id: int, after: datetime
-) -> bool:
-    """True iff there's an outbound message in this conversation strictly after
-    `after`. Used to skip processing an inbound that a previous batch already
-    answered."""
-    row = (
-        await db.execute(
-            select(Message.id)
-            .where(
-                Message.conversation_id == conv_id,
-                Message.direction == "out",
-                Message.created_at > after,
-            )
-            .limit(1)
-        )
-    ).first()
-    return row is not None
+def _looks_like_same_long_message(a: str, b: str) -> bool:
+    left = _normalize_message_content(a)
+    right = _normalize_message_content(b)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    # Accessibility may report the same outgoing bubble twice: once with the
+    # full text and once clipped to the visible line range. Treat long prefix
+    # matches as the same self/outbound message, but avoid collapsing short
+    # test messages such as "1", "2", "12".
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    return len(shorter) >= 40 and longer.startswith(shorter)
 
 
 async def _has_recent_outbound_same_content(
     db: AsyncSession, conv_id: int, content: str, now: datetime
 ) -> bool:
-    row = (
+    rows = (
         await db.execute(
-            select(Message.id)
+            select(Message.content)
             .where(
                 Message.conversation_id == conv_id,
                 Message.direction == "out",
-                Message.content == content,
                 Message.created_at > now - timedelta(minutes=3),
+            )
+            .order_by(Message.created_at.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+    return any(_looks_like_same_long_message(existing, content) for existing in rows)
+
+
+async def _has_recent_inbound_same_content(
+    db: AsyncSession,
+    conv_id: int,
+    content: str,
+    now: datetime,
+    external_msg_id: str | None,
+    window_seconds: int = 90,
+) -> bool:
+    current_source = _source_from_external_msg_id(external_msg_id)
+    row = (
+        await db.execute(
+            select(Message.external_msg_id)
+            .where(
+                Message.conversation_id == conv_id,
+                Message.direction == "in",
+                Message.sender_type == "customer",
+                Message.content == content,
+                Message.created_at > now - timedelta(seconds=window_seconds),
             )
             .limit(1)
         )
-    ).first()
-    return row is not None
+    ).scalars().all()
+    for previous_external_msg_id in row:
+        previous_source = _source_from_external_msg_id(previous_external_msg_id)
+        if current_source is None or previous_source is None:
+            return True
+        if current_source != previous_source:
+            return True
+    return False
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+
+async def _is_cross_channel_replay(
+    db: AsyncSession,
+    conv_id: int,
+    content: str,
+    now: datetime,
+    external_msg_id: str | None,
+) -> bool:
+    current_source = _source_from_external_msg_id(external_msg_id)
+    if current_source not in {"a11y", "notif"}:
+        return False
+    rows = (
+        await db.execute(
+            select(Message.external_msg_id)
+            .where(
+                Message.conversation_id == conv_id,
+                Message.direction == "in",
+                Message.sender_type == "customer",
+                Message.content == content,
+                Message.created_at > now - timedelta(minutes=5),
+            )
+            .order_by(Message.created_at.desc())
+            .limit(10)
+        )
+    ).scalars().all()
+    for previous_external_msg_id in rows:
+        previous_source = _source_from_external_msg_id(previous_external_msg_id)
+        if previous_source in {"a11y", "notif"} and previous_source != current_source:
+            return True
+    return False
+
+
+def _source_from_external_msg_id(external_msg_id: str | None) -> str | None:
+    if not external_msg_id or ":" not in external_msg_id:
+        return None
+    source = external_msg_id.split(":", 1)[0]
+    if source in {"notif", "a11y", "a11y-self"}:
+        return source
+    return None
 
 # WeCom aggregates >1 pending unread messages in a single chat into a single
 # notification whose body is prefixed with "[N条]". The Android listener strips
@@ -102,6 +169,17 @@ _SYSTEM_CONTENT_PATTERNS = [
     re.compile(r"群发助手|审批结果|打卡提醒|日报提醒"),
 ]
 
+_UNRELIABLE_CONTACT_NAMES: set[str] = {
+    "",
+    "当前聊天",
+    "消息",
+    "邮件",
+    "文档",
+    "工作台",
+    "通讯录",
+    "设置",
+}
+
 
 def _clean_content(text: str) -> str:
     return _AGG_PREFIX_RX.sub("", text or "").strip()
@@ -118,18 +196,6 @@ def _is_wecom_system_message(sender_name: str, content: str) -> bool:
             return True
     return False
 
-from app.ai import workflow as ai_workflow
-from app.core.ws_manager import hub
-from app.memory import summarizer
-from app.models import Contact, Conversation, Message, Robot, utcnow
-from app.schemas import (
-    AndroidMessageReceived,
-    ConversationOut,
-    MessageOut,
-)
-from app.services.send_orchestrator import create_and_dispatch_send_text
-
-
 async def ingest_inbound_message(
     db: AsyncSession, robot: Robot, evt: AndroidMessageReceived
 ) -> Message | None:
@@ -139,6 +205,7 @@ async def ingest_inbound_message(
     outbound conversation history only; they are persisted so future answers
     see the full chat, but they never kick off an auto-reply.
     """
+    now = utcnow()
     # dedupe by external_msg_id when provided
     if evt.external_msg_id:
         existing = (
@@ -147,7 +214,37 @@ async def ingest_inbound_message(
             )
         ).scalar_one_or_none()
         if existing:
-            return None
+            age = now - existing.created_at
+            if age <= timedelta(minutes=5):
+                log.info(
+                    "[message-callback] duplicate external_msg_id skipped conv=%s msg=%s external_msg_id=%s content=%r",
+                    existing.conversation_id,
+                    existing.id,
+                    evt.external_msg_id,
+                    evt.content or "",
+                )
+                return None
+            log.warning(
+                "[message-callback] stale external_msg_id collision accepted existing_msg=%s age=%s external_msg_id=%s content=%r",
+                existing.id,
+                age,
+                evt.external_msg_id,
+                evt.content or "",
+            )
+            evt.external_msg_id = None
+
+    cleaned = _clean_content(evt.content)
+    contact_key = (evt.contact.external_id or evt.contact.nickname or "").strip()
+    if not cleaned:
+        return None  # nothing left after stripping notification noise
+    if contact_key in _UNRELIABLE_CONTACT_NAMES:
+        log.warning(
+            "[message-callback] skipped unreliable contact robot=%s contact=%r content=%r",
+            robot.robot_id,
+            contact_key,
+            cleaned,
+        )
+        return None
 
     # upsert contact
     contact = (
@@ -193,30 +290,43 @@ async def ingest_inbound_message(
     # the AI reply that was generated milliseconds later on the server.
     # Client timestamps are kept in the wire schema for analytics but
     # MUST NOT be used for ordering.
-    now = utcnow()
-    cleaned = _clean_content(evt.content)
     from_customer = evt.sender_type == "customer"
-    if not cleaned:
-        return None  # nothing left after stripping notification noise
     if _TIME_ONLY_RX.match(cleaned):
         return None  # chat timestamp separators are not customer messages
     if from_customer and _BOT_ECHO_RX.match(cleaned):
         return None  # our own confirmation template echoed back from UI scraping
     if from_customer and _is_wecom_system_message(evt.contact.nickname, cleaned):
         # WeCom platform notification — don't persist, don't reply.
-        import logging
-        logging.info(
+        log.info(
             "skip WeCom system message from %r: %r",
-            evt.contact.nickname, cleaned[:60],
+            evt.contact.nickname, cleaned,
+        )
+        return None
+    duplicate_inbound = False
+    if from_customer:
+        duplicate_inbound = await _is_cross_channel_replay(
+            db, conv.id, cleaned, now, evt.external_msg_id
+        ) or (
+            settings.inbound_content_dedupe_enabled
+            and await _has_recent_inbound_same_content(
+                db, conv.id, cleaned, now, evt.external_msg_id
+            )
+        )
+    if duplicate_inbound:
+        log.info(
+            "[message-callback] duplicate conv=%s contact=%s external_msg_id=%s content=%r",
+            conv.id,
+            evt.contact.external_id,
+            evt.external_msg_id,
+            cleaned,
         )
         return None
     if not from_customer and await _has_recent_outbound_same_content(db, conv.id, cleaned, now):
-        import logging
-        logging.info(
+        log.info(
             "skip self echo already recorded conv=%s contact=%s content=%r",
             conv.id,
             evt.contact.external_id,
-            cleaned[:60],
+            cleaned,
         )
         return None
     msg = Message(
@@ -227,19 +337,32 @@ async def ingest_inbound_message(
         content=cleaned,
         external_msg_id=evt.external_msg_id,
         created_at=now,
+        feedback_status="pending" if from_customer else None,
     )
     db.add(msg)
 
     if from_customer:
         conv.unread_count = (conv.unread_count or 0) + 1
     conv.last_message_at = now
-    conv.last_message_preview = cleaned[:200]
+    conv.last_message_preview = cleaned
 
     await db.commit()
     await db.refresh(msg)
     await db.refresh(conv)
     # eagerly load contact for serialization
     await db.refresh(conv, attribute_names=["contact"])
+    log.info(
+        "[message-callback] persisted robot=%s conv=%s msg=%s contact=%s sender_type=%s "
+        "feedback_status=%s external_msg_id=%s content=%r",
+        robot.robot_id,
+        conv.id,
+        msg.id,
+        evt.contact.external_id,
+        evt.sender_type,
+        msg.feedback_status,
+        evt.external_msg_id,
+        cleaned,
+    )
 
     # broadcast
     await hub.broadcast_web(
@@ -256,58 +379,44 @@ async def ingest_inbound_message(
         ConversationOut.model_validate(conv).model_dump(mode="json"),
     )
 
-    # MVP2: trigger AI auto-reply when mode allows.
-    # Per-conversation lock: if a previous burst is still being processed, we
-    # queue here briefly and exit when the lock-holder has already covered our
-    # message (via the unreplied-chain mechanism).
-    if from_customer and conv.mode in ("ai", "mixed"):
-        lock = _lock_for(conv.id)
-        async with lock:
-            # Did the previous lock-holder already reply past this inbound?
-            # If yes, skip — our content is already covered in their batch.
-            if await _has_been_replied_after(db, conv.id, msg.created_at):
-                import logging
-                logging.info(
-                    "[conv %s] inbound msg %s already covered by a previous batch — skipping",
-                    conv.id, msg.id,
-                )
-            else:
-                try:
-                    decision = await ai_workflow.handle_inbound(
-                        db, robot=robot, conv=conv, message=msg
-                    )
-                except Exception:
-                    import logging
-                    logging.exception("AI workflow failed")
-                    decision = None
+    if not settings.auto_reply_enabled:
+        log.info(
+            "[message-callback] auto-reply disabled conv=%s msg=%s mode=%s",
+            conv.id,
+            msg.id,
+            conv.mode,
+        )
+    elif from_customer and conv.mode in ("ai", "mixed"):
+        from app.services import auto_reply_scheduler
 
-                if decision is not None:
-                    await ai_workflow.broadcast_kb_hits(robot.team_id, conv.id, decision)
-                    if decision.action == "reply":
-                        for text in decision.all_texts:
-                            await create_and_dispatch_send_text(
-                                db,
-                                robot=robot,
-                                conv=conv,
-                                contact_external_id=contact.external_id,
-                                text=text,
-                                sender_type="ai",
-                                sender_id=None,
-                            )
-                            # Tiny gap between bubbles so the device executor
-                            # doesn't try to nav→input→send all at once.
-                            if len(decision.all_texts) > 1:
-                                await asyncio.sleep(0.2)
-                    elif decision.action == "suggest":
-                        await ai_workflow.broadcast_suggestion(
-                            robot.team_id, conv.id, decision
-                        )
+        log.info(
+            "auto-reply wake robot=%s conv=%s msg=%s mode=%s source=message.received",
+            robot.robot_id,
+            conv.id,
+            msg.id,
+            conv.mode,
+        )
+        auto_reply_scheduler.wake_robot(robot.id)
+    elif from_customer:
+        log.info(
+            "auto-reply skipped conv=%s msg=%s mode=%s",
+            conv.id,
+            msg.id,
+            conv.mode,
+        )
 
-    # MVP3: refresh long-term memory in the background of the request
-    try:
-        await summarizer.maybe_refresh(db, contact=contact, conv=conv)
-    except Exception:
-        import logging
-        logging.exception("memory refresh failed")
+    # MVP3: refresh long-term memory in the background of the request.
+    # Disabled by default while validating raw message-callback coverage.
+    if settings.memory_refresh_enabled:
+        try:
+            await summarizer.maybe_refresh(db, contact=contact, conv=conv)
+        except Exception:
+            log.exception("memory refresh failed")
+    else:
+        log.info(
+            "[message-callback] memory refresh disabled conv=%s msg=%s",
+            conv.id,
+            msg.id,
+        )
 
     return msg

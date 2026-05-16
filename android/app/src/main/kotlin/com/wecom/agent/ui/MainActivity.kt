@@ -330,7 +330,7 @@ class MainActivity : Activity() {
                 if (nl < 0) return
                 idx = nl + 1
             }
-            logTv.text = "日志:（已截断,只保留最近 ${maxLogLines * 3 / 4} 行）\n" + text.substring(idx)
+            logTv.text = "日志:（只显示最近 ${maxLogLines * 3 / 4} 行）\n" + text.substring(idx)
         }
     }
 
