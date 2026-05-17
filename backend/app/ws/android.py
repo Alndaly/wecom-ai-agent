@@ -58,8 +58,13 @@ async def android_ws(
         while True:
             data = await ws.receive_json()
             await _handle_event(robot, data)
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as e:
+        log.info(
+            "android ws disconnect event robot=%s code=%s reason=%s",
+            robot.robot_id,
+            getattr(e, "code", None),
+            getattr(e, "reason", None),
+        )
     except Exception as e:
         log.warning("android ws error: %s", e)
     finally:

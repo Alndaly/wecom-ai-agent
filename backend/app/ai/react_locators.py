@@ -121,9 +121,17 @@ class LocatorStore:
         target: str | None = None,
         screen_size: tuple[int, int] | None = None,
     ) -> UiNode | None:
+        current_fingerprint = _device_fingerprint(self.robot, screen_size=screen_size)
+        if not _fingerprint_matches(self.data.get("device_fingerprint"), current_fingerprint):
+            log.info(
+                "react locator cache ignored robot=%s reason=device_fingerprint_mismatch",
+                self.robot.robot_id,
+            )
+            return None
         entries = [
             e for e in self.data.get("locators", [])
             if e.get("role") == role and e.get("enabled", True)
+            and _fingerprint_matches(e.get("device_fingerprint"), current_fingerprint)
         ]
         entries.sort(key=lambda e: (int(e.get("success_count") or 0), e.get("updated_at") or ""), reverse=True)
         for entry in entries[:5]:
@@ -154,9 +162,17 @@ class LocatorStore:
             meta_size = obs_meta.get("screen_size") if isinstance(obs_meta, dict) else None
             if isinstance(meta_size, (list, tuple)) and len(meta_size) == 2:
                 screen_size = (int(meta_size[0] or 0), int(meta_size[1] or 0))
+        current_fingerprint = _device_fingerprint(self.robot, screen_size=screen_size)
+        if not _fingerprint_matches(self.data.get("device_fingerprint"), current_fingerprint):
+            log.info(
+                "react locator cache reset robot=%s reason=device_fingerprint_changed",
+                self.robot.robot_id,
+            )
+            self.data["locators"] = []
         locator = _locator_from_node(
             role=role, action=action, node=node, source=source, target=target, screen_size=screen_size
         )
+        locator["device_fingerprint"] = current_fingerprint
         locator["last_observation"] = obs_meta
         locators = [e for e in self.data.get("locators", []) if e.get("role") != role]
         old = next((e for e in self.data.get("locators", []) if e.get("role") == role), None)
@@ -166,6 +182,7 @@ class LocatorStore:
             locator["created_at"] = old.get("created_at") or locator["created_at"]
         locators.append(locator)
         self.data["locators"] = locators
+        self.data["device_fingerprint"] = current_fingerprint
         self.data["updated_at"] = _now()
         self._save()
         log.info(
@@ -244,7 +261,13 @@ class LocatorStore:
         return meta_path
 
     def _load(self) -> dict[str, Any]:
-        empty = {"version": 2, "robot_id": self.robot.robot_id, "locators": [], "created_at": _now()}
+        empty = {
+            "version": 2,
+            "robot_id": self.robot.robot_id,
+            "device_fingerprint": None,
+            "locators": [],
+            "created_at": _now(),
+        }
         if not self.path.exists():
             return empty
         try:
@@ -264,6 +287,7 @@ class LocatorStore:
                 data["locators"] = []
                 data["version"] = 2
             data.setdefault("locators", [])
+            data.setdefault("device_fingerprint", None)
             return data
         except Exception as e:  # noqa: BLE001
             log.warning("react locator cache load failed path=%s error=%s", self.path, e)
@@ -303,6 +327,43 @@ def role_for_decision(action: str, args: dict[str, Any], node: UiNode | None, go
         if _looks_like_search_label(label) or _looks_like_search_node(node):
             return "search_entry"
     return None
+
+
+def _device_fingerprint(
+    robot: Robot, *, screen_size: tuple[int, int] | None = None
+) -> dict[str, Any]:
+    """Return the hardware/runtime fingerprint a locator cache is valid for.
+
+    Node ids and even structural classes can vary across phones, Android
+    versions, app builds, and resolutions. The cache is already scoped by
+    robot_id; this fingerprint additionally protects the "same robot id but
+    different physical/runtime surface" case.
+    """
+    width, height = screen_size or (None, None)
+    if width is None:
+        width = robot.screen_width
+    if height is None:
+        height = robot.screen_height
+    return {
+        "schema": 1,
+        "device_type": _norm_str(robot.device_type),
+        "manufacturer": _norm_str(robot.manufacturer),
+        "model": _norm_str(robot.model),
+        "android_version": _norm_str(robot.android_version),
+        "sdk_int": int(robot.sdk_int) if robot.sdk_int is not None else None,
+        "app_version": _norm_str(robot.app_version),
+        "screen_width": int(width) if width else None,
+        "screen_height": int(height) if height else None,
+    }
+
+
+def _fingerprint_matches(cached: Any, current: dict[str, Any]) -> bool:
+    return isinstance(cached, dict) and cached == current
+
+
+def _norm_str(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
 
 
 def _locator_from_node(

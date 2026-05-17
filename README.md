@@ -28,6 +28,14 @@ uvicorn app.main:app --reload --port 8000
 启动后会播种默认账号：`admin@example.com / admin123`。
 OpenAPI: <http://localhost:8000/docs>
 
+任务执行依赖 Celery + Redis。Docker Compose 会同时启动 `redis` 和 `celery`；
+本地分开跑时另开一个终端：
+
+```bash
+cd backend
+celery -A app.worker.celery_app worker -Q device_tasks --loglevel=INFO --concurrency=8 --prefetch-multiplier=1
+```
+
 ### 2. Web
 
 ```bash

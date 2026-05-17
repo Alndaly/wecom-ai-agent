@@ -132,6 +132,8 @@ class RobotTask(Base):
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     # pending/dispatched/running/completed/failed/timeout
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    queue_seq: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=2)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -1,7 +1,10 @@
 from app.ai.react_agent import AgentResult, _guard_decision
 from app.ai.react_agent import AgentStep, _Observation, _post_back_verdict, _post_tap_verdict, _stuck_repeating
 from app.ai.react_agent import _degraded_wecom_observation, _find_sent_message_echo, _node_expectation, _swipe_coords
+from app.ai import react_locators
+from app.ai.react_locators import LocatorStore
 from app.device import UiNode
+from app.models import Robot
 
 
 def _bounds(screen: tuple[int, int], left: float, top: float, right: float, bottom: float) -> list[int]:
@@ -44,6 +47,29 @@ def _button_node(node_id: int, text: str = "", screen: tuple[int, int] = (1000, 
         text=text,
         clickable=True,
         bounds=_bounds(screen, 0.82, 0.9, 0.98, 0.98),
+    )
+
+
+def _robot(
+    *,
+    robot_id: str = "robot_test",
+    model: str = "Pixel 8",
+    screen: tuple[int, int] = (1000, 2000),
+) -> Robot:
+    return Robot(
+        id=1,
+        team_id=1,
+        name="test robot",
+        robot_id=robot_id,
+        token_hash="hash",
+        device_type="android",
+        manufacturer="Google",
+        model=model,
+        android_version="15",
+        sdk_int=35,
+        app_version="1.0.0",
+        screen_width=screen[0],
+        screen_height=screen[1],
     )
 
 
@@ -249,6 +275,83 @@ def test_stuck_repeating_ignores_locator_role_when_same_node_keeps_failing() -> 
     ]
 
     assert _stuck_repeating(steps, n=3) is True
+
+
+def test_locator_cache_matches_same_device_even_when_node_id_changes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(react_locators, "_CACHE_DIR", tmp_path / "react_locator_cache")
+    robot = _robot()
+    screen = (1000, 2000)
+    store = LocatorStore(robot)
+    store.remember_success(
+        role="send_button",
+        action="tap_node",
+        node=_button_node(2, "发送", screen),
+        obs_meta={"screen_size": list(screen)},
+        source="llm",
+        screen_size=screen,
+    )
+
+    reloaded = LocatorStore(robot)
+    matched = reloaded.match(
+        "send_button",
+        {99: _button_node(99, "发送", screen)},
+        screen_size=screen,
+    )
+
+    assert matched is not None
+    assert matched.id == 99
+
+
+def test_locator_cache_rejects_different_device_fingerprint(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(react_locators, "_CACHE_DIR", tmp_path / "react_locator_cache")
+    screen = (1000, 2000)
+    store = LocatorStore(_robot(model="Pixel 8", screen=screen))
+    store.remember_success(
+        role="send_button",
+        action="tap_node",
+        node=_button_node(2, "发送", screen),
+        obs_meta={"screen_size": list(screen)},
+        source="llm",
+        screen_size=screen,
+    )
+
+    other_screen = (1200, 2400)
+    reloaded = LocatorStore(_robot(model="Samsung S25", screen=other_screen))
+    matched = reloaded.match(
+        "send_button",
+        {99: _button_node(99, "发送", other_screen)},
+        screen_size=other_screen,
+    )
+
+    assert matched is None
+
+
+def test_locator_cache_resets_old_entries_when_device_fingerprint_changes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(react_locators, "_CACHE_DIR", tmp_path / "react_locator_cache")
+    screen = (1000, 2000)
+    store = LocatorStore(_robot(model="Pixel 8", screen=screen))
+    store.remember_success(
+        role="send_button",
+        action="tap_node",
+        node=_button_node(2, "发送", screen),
+        obs_meta={"screen_size": list(screen)},
+        source="llm",
+        screen_size=screen,
+    )
+
+    other_screen = (1200, 2400)
+    changed = LocatorStore(_robot(model="Samsung S25", screen=other_screen))
+    changed.remember_success(
+        role="message_input",
+        action="input_text",
+        node=_editable_node(7, screen=other_screen),
+        obs_meta={"screen_size": list(other_screen)},
+        source="llm",
+        screen_size=other_screen,
+    )
+
+    roles = [entry["role"] for entry in changed.data["locators"]]
+    assert roles == ["message_input"]
 
 
 def test_swipe_coords_scale_with_observed_screen_size() -> None:

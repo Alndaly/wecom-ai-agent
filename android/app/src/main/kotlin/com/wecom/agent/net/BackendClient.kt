@@ -68,7 +68,11 @@ class BackendClient(
                     override fun onMessage(webSocket: WebSocket, text: String) {
                         try {
                             val evt = json.decodeFromString(WireEvent.serializer(), text)
-                            onEvent(evt.event, evt.payload)
+                            try {
+                                onEvent(evt.event, evt.payload)
+                            } catch (e: Exception) {
+                                Log.e(tag, "event handler failed event=${evt.event}", e)
+                            }
                         } catch (e: Exception) {
                             Log.w(tag, "decode failed: $text", e)
                         }
@@ -77,7 +81,7 @@ class BackendClient(
                     override fun onMessage(webSocket: WebSocket, bytes: ByteString) { /* unused */ }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                        Log.w(tag, "ws failure", t)
+                        Log.w(tag, "ws failure response_code=${response?.code} response_msg=${response?.message}", t)
                         onState("disconnected")
                         if (!closed.isCompleted) closed.complete(Unit)
                     }

@@ -24,7 +24,7 @@ POST   /robots/{id}/tasks/{task_id}/cancel           → RobotCommandOut
 POST   /robots/{id}/agent/run     {goal, ...}        → RobotTask
 ```
 
-`/queue` 返回当前运行任务和等待队列，等待项包含 `task_id`、`kind`、`priority`、`waited_ms`、`cancellable` 等字段。取消接口可以取消等待中的任务，也可以向正在运行的 ReAct 任务发送取消。
+`/queue` 返回当前运行任务和等待队列，等待项包含 `task_id`、`kind`、`priority`、`waited_ms`、`cancellable` 等字段。取消接口只取消等待中的任务；运行中的 ReAct 任务正在控制真实设备 UI，当前不做跨进程中断。
 
 ### Conversations
 ```

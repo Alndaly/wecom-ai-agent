@@ -221,7 +221,7 @@ async def get_robot_queue(
     robot = await db.get(Robot, rid)
     if not robot or robot.team_id != user.team_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
-    return task_queue.snapshot(robot.robot_id)
+    return await task_queue.snapshot(robot.robot_id)
 
 
 @router.post("/{rid}/tasks/{task_id}/cancel", response_model=RobotCommandOut)

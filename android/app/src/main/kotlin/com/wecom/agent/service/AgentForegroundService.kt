@@ -80,6 +80,8 @@ class AgentForegroundService : Service() {
     private var commandWorkerJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var configuredBaseUrl: String = ""
+    private data class ConnectionConfig(val baseUrl: String, val robotId: String, val token: String)
+    @Volatile private var activeConnectionConfig: ConnectionConfig? = null
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
     private data class PendingInbound(
@@ -134,7 +136,19 @@ class AgentForegroundService : Service() {
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: return START_NOT_STICKY
         configuredBaseUrl = base
         a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
+        val nextConfig = ConnectionConfig(base, rid, token)
         Log.i(tag, "service starting base=$base robot_id=$rid token_len=${token.length} a11yInbound=$a11yInboundEnabled")
+
+        if (client != null && activeConnectionConfig == nextConfig) {
+            Log.i(tag, "service start ignored; same connection config already active")
+            updateNotification(if (connected) "connected $rid" else "connecting $rid")
+            broadcastState(if (connected) "connected" else "connecting")
+            broadcastLog("服务已在运行，忽略重复启动")
+            startMessageListScanners()
+            startHeartbeatLoop(rid)
+            return START_STICKY
+        }
+
         updateNotification("connecting $rid")
         broadcastState("connecting")
         broadcastLog("服务启动，正在连接 $base")
@@ -157,7 +171,10 @@ class AgentForegroundService : Service() {
         }
 
         client?.stop()
+        heartbeatJob?.cancel()
+        heartbeatJob = null
         connected = false
+        activeConnectionConfig = nextConfig
         client = BackendClient(
             baseWsUrl = base,
             robotId = rid,
@@ -176,6 +193,12 @@ class AgentForegroundService : Service() {
         ).also { it.start() }
 
         startMessageListScanners()
+        startHeartbeatLoop(rid)
+        return START_STICKY
+    }
+
+    private fun startHeartbeatLoop(rid: String) {
+        if (heartbeatJob?.isActive == true) return
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             while (!connected && isActive) delay(200L)
@@ -193,7 +216,6 @@ class AgentForegroundService : Service() {
                 )
             }
         }
-        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -205,6 +227,7 @@ class AgentForegroundService : Service() {
         WeComAccessibilityService.onChatMessage = null
         releaseWakeLock()
         connected = false
+        activeConnectionConfig = null
         broadcastState("disconnected")
         broadcastLog("服务已停止")
         scope.cancel()

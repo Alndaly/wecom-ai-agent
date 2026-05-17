@@ -336,7 +336,7 @@ function LLMCard({ value, onSaved }: { value: LlmCfg; onSaved: () => void }) {
     try {
       const r = await api<ProbeResult>("/settings/test/llm", {
         method: "POST",
-        body: JSON.stringify(v),
+        body: JSON.stringify({ ...v, active_profile: active?.id || editingId }),
       });
       setProbe(r);
     } catch (e: any) {
@@ -545,7 +545,7 @@ function EmbeddingCard({ value, onSaved }: { value: EmbedCfg; onSaved: () => voi
     try {
       const r = await api<ProbeResult>("/settings/test/embedding", {
         method: "POST",
-        body: JSON.stringify(v),
+        body: JSON.stringify({ ...v, active_profile: active?.id || editingId }),
       });
       setProbe(r);
     } catch (e: any) {

@@ -14,7 +14,7 @@ from app.core.logging_config import setup_logging
 from app.core.security import hash_password
 from app.models import Team, User
 from app.routers import ai as ai_router
-from app.routers import auth, conversations, kb, media, memory, robots
+from app.routers import auth, conversations, internal_tasks, kb, media, memory, robots
 from app.routers import settings as settings_router
 from app.routers import ui_analysis
 from app.ws import android as ws_android
@@ -51,7 +51,7 @@ async def lifespan(_: FastAPI):
     await _bootstrap_task_queue()
     await _bootstrap_auto_reply_scheduler()
     # background retention sweeper — cancel on shutdown
-    from app.services import auto_reply_scheduler as _ars, retention, task_queue as _tq
+    from app.services import auto_reply_scheduler as _ars, retention
     retention_task = asyncio.create_task(retention.run_loop(), name="retention-loop")
     try:
         yield
@@ -65,10 +65,6 @@ async def lifespan(_: FastAPI):
             await _ars.shutdown()
         except Exception:  # noqa: BLE001
             logging.exception("auto reply scheduler shutdown failed")
-        try:
-            await _tq.shutdown()
-        except Exception:  # noqa: BLE001
-            logging.exception("task queue shutdown failed")
         # Close MCP sessions on shutdown so subprocesses don't linger.
         try:
             from app.ai.tools import mcp_adapter
@@ -201,6 +197,7 @@ app.include_router(kb.router)
 app.include_router(memory.router)
 app.include_router(settings_router.router)
 app.include_router(ui_analysis.router)
+app.include_router(internal_tasks.router)
 app.include_router(ws_web.router)
 app.include_router(ws_android.router)
 

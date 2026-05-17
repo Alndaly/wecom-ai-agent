@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     # Master kill-switch for device-driving tasks. Keep this off while testing
     # raw message callback coverage so inbound messages only log + persist.
     task_queue_enabled: bool = True
+    task_queue_backend: str = "celery"  # celery
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/1"
+    task_executor_base_url: str = "http://localhost:8000"
+    task_executor_secret: str = ""
+    task_executor_timeout_sec: float = 1800.0
     auto_reply_enabled: bool = True
     inbound_content_dedupe_enabled: bool = False
     # When a deterministic UI task fails, escalate to the ReAct fallback agent
