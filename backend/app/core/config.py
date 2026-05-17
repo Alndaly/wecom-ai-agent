@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     react_fallback_enabled: bool = True
     react_max_steps: int = 6
     react_step_timeout_sec: float = 12.0
+    # Skill-refinement background task fires an LLM call too. On single-slot
+    # local backends (Ollama) we wait for full idleness (0 concurrent agents)
+    # so refine doesn't starve the active ReAct step. On remote providers
+    # that accept concurrent requests, allow refine to fire alongside up to
+    # this many in-flight agent sessions. 0 = strict idle, N = "fire when
+    # active agents ≤ N". Default is permissive enough for most remote
+    # endpoints but still leaves headroom under heavy load.
+    react_refine_max_concurrent_agents: int = 2
     # Media send is a separate ReAct phase after the chat opens (compose_plus
     # → media_picker_entry → gallery_first_item → preview/send). Each step is
     # one tap, plus a few exploratory steps the first time before the

@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.app_skills import skill_for_package
+from app.ai.app_skills_refine import begin_agent_session, end_agent_session
 from app.ai.providers import ChatMessage, get_fallback_provider, get_provider
 from app.ai.react_locators import (
     LocatorStore,
@@ -166,6 +167,33 @@ async def run_react(
     judgment on a tricky flow. AI still picks **node ids**, not coordinates;
     the backend resolves bounds → tap_xy / input_text.
     """
+    # Bump the global ReAct-session counter so background tasks (e.g. app-
+    # skill refinement) can defer their own LLM calls and avoid contending
+    # for a single-slot inference backend. `finally` covers every exit path
+    # including cancellation, timeout, and crash.
+    begin_agent_session()
+    try:
+        return await _run_react_inner(
+            db, robot, goal,
+            max_steps=max_steps,
+            step_timeout=step_timeout,
+            log_sink=log_sink,
+            force_llm=force_llm,
+        )
+    finally:
+        end_agent_session()
+
+
+async def _run_react_inner(
+    db: AsyncSession,
+    robot: Robot,
+    goal: str,
+    *,
+    max_steps: int,
+    step_timeout: float,
+    log_sink: LogSink,
+    force_llm: bool,
+) -> AgentResult:
     started = time.monotonic()
     steps: list[AgentStep] = []
 

@@ -329,15 +329,27 @@ def role_for_decision(action: str, args: dict[str, Any], node: UiNode | None, go
     return None
 
 
+# Fields that, when they change, genuinely imply the device's UI surface
+# has been re-built (different phone hardware OR a fresh WeCom install with
+# its own layout pass). These are the *only* triggers for invalidating the
+# locator cache — anything else (status bar visibility, gesture nav vs.
+# button nav, sdk_int parsed differently) is normal runtime noise and
+# should NOT erase what we learned.
+_HARD_FP_FIELDS = ("device_type", "manufacturer", "model", "app_version")
+
+
 def _device_fingerprint(
     robot: Robot, *, screen_size: tuple[int, int] | None = None
 ) -> dict[str, Any]:
     """Return the hardware/runtime fingerprint a locator cache is valid for.
 
-    Node ids and even structural classes can vary across phones, Android
-    versions, app builds, and resolutions. The cache is already scoped by
-    robot_id; this fingerprint additionally protects the "same robot id but
-    different physical/runtime surface" case.
+    Splits into two groups (see `_HARD_FP_FIELDS`):
+      - **hard**: identity-defining; a change here means the layout itself
+        could have shifted (new phone, app upgrade) → cache invalidates.
+      - **soft**: recorded for diagnostics but ignored by the equality
+        check. Includes screen size — locators store `bounds_ratio`
+        already, so a slightly different reported resolution still scores
+        correctly without resetting the entire cache.
     """
     width, height = screen_size or (None, None)
     if width is None:
@@ -345,20 +357,28 @@ def _device_fingerprint(
     if height is None:
         height = robot.screen_height
     return {
-        "schema": 1,
+        "schema": 2,
+        # hard
         "device_type": _norm_str(robot.device_type),
         "manufacturer": _norm_str(robot.manufacturer),
         "model": _norm_str(robot.model),
+        "app_version": _norm_str(robot.app_version),
+        # soft (recorded but not part of match)
         "android_version": _norm_str(robot.android_version),
         "sdk_int": int(robot.sdk_int) if robot.sdk_int is not None else None,
-        "app_version": _norm_str(robot.app_version),
         "screen_width": int(width) if width else None,
         "screen_height": int(height) if height else None,
     }
 
 
 def _fingerprint_matches(cached: Any, current: dict[str, Any]) -> bool:
-    return isinstance(cached, dict) and cached == current
+    """Compare on the *hard* subset only — soft fluctuations are tolerated."""
+    if not isinstance(cached, dict):
+        return False
+    for field in _HARD_FP_FIELDS:
+        if cached.get(field) != current.get(field):
+            return False
+    return True
 
 
 def _norm_str(value: Any) -> str | None:

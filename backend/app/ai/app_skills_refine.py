@@ -53,7 +53,40 @@ SUCCESS_LOG_FOR_REFINEMENT = 30  # how many recent successes to feed the LLM
 SUCCESS_LOG_KEEP = 200  # cap log file so it doesn't grow unbounded
 MAX_HANDBOOK_CHARS = 6_000  # rough ceiling we ask the model to respect
 
+# Refinement runs an LLM call against the same provider the ReAct agent
+# uses. Behaviour scales with what the provider can do concurrently:
+#   - Single-slot backends (Ollama, llama.cpp single-instance) need
+#     `react_refine_max_concurrent_agents = 0` so refine waits for full
+#     idleness — otherwise the agent's step queues behind us and times out.
+#   - Remote providers (OpenAI, Anthropic, multi-slot self-hosted) accept
+#     concurrent requests, so refine can ride alongside a handful of
+#     in-flight agents. Default `= 2` keeps a couple of slots free for any
+#     burst while still letting refinement fire promptly.
+REFINE_WAIT_TOTAL_SEC = 600  # give up after this; counter stays high and retries on next success
+REFINE_POLL_SEC = 3
+
 _PACKAGE_LOCKS: dict[str, asyncio.Lock] = {}
+_ACTIVE_AGENT_SESSIONS = 0
+# Module-scoped task registry: keeps fire-and-forget refinement tasks from
+# being GC'd before they finish (which would silently drop the work and
+# trigger 'Task was destroyed but it is pending' warnings on Python 3.11+).
+_PENDING_REFINE_TASKS: set[asyncio.Task] = set()
+
+
+def begin_agent_session() -> None:
+    """Bump the in-flight ReAct counter; call from `run_react` entry."""
+    global _ACTIVE_AGENT_SESSIONS
+    _ACTIVE_AGENT_SESSIONS += 1
+
+
+def end_agent_session() -> None:
+    """Decrement on `run_react` exit (success or failure, via finally)."""
+    global _ACTIVE_AGENT_SESSIONS
+    _ACTIVE_AGENT_SESSIONS = max(0, _ACTIVE_AGENT_SESSIONS - 1)
+
+
+def active_agent_sessions() -> int:
+    return _ACTIVE_AGENT_SESSIONS
 
 
 @dataclass
@@ -118,15 +151,56 @@ async def record_success(
         return
 
     # Threshold hit — fire refinement in the background. Don't await; the
-    # triggering caller (a ReAct turn) is done with this work.
-    asyncio.create_task(_refine_safely(package=package, team_id=team_id))
+    # triggering caller (a ReAct turn) is done with this work. Hold a
+    # reference in a module-scoped set so the task isn't GC'd mid-run.
+    task = asyncio.create_task(_refine_safely(package=package, team_id=team_id))
+    _PENDING_REFINE_TASKS.add(task)
+    task.add_done_callback(_PENDING_REFINE_TASKS.discard)
 
 
 async def _refine_safely(*, package: str, team_id: int) -> None:
     try:
+        # Hold off the LLM call while the provider is already busy enough.
+        # Threshold is `settings.react_refine_max_concurrent_agents`:
+        #   - 0 means strict idle (single-slot providers like Ollama)
+        #   - N means refine may run alongside up to N agent sessions
+        if not await _wait_for_capacity(package=package):
+            log.info(
+                "app skill refine deferred package=%s: provider stayed busy for %ds; "
+                "next successful run will retry",
+                package, REFINE_WAIT_TOTAL_SEC,
+            )
+            return
         await _refine_locked(package=package, team_id=team_id)
     except Exception as e:  # noqa: BLE001
         log.exception("app skill refine failed package=%s error=%s", package, e)
+
+
+async def _wait_for_capacity(*, package: str) -> bool:
+    """Wait until the in-flight ReAct count drops to the configured threshold.
+
+    Returns False after `REFINE_WAIT_TOTAL_SEC` of continuous busyness —
+    caller treats that as "try again on the next successful run".
+    """
+    # Late import: `settings` reads config from env at module load; tests can
+    # override via monkeypatching and we want to pick that up at call time.
+    from app.core.config import settings
+
+    max_allowed = max(0, int(settings.react_refine_max_concurrent_agents))
+    deadline = asyncio.get_event_loop().time() + REFINE_WAIT_TOTAL_SEC
+    waited = False
+    while asyncio.get_event_loop().time() < deadline:
+        active = active_agent_sessions()
+        if active <= max_allowed:
+            if waited:
+                log.info(
+                    "app skill refine resumed package=%s: active_sessions=%d ≤ %d",
+                    package, active, max_allowed,
+                )
+            return True
+        waited = True
+        await asyncio.sleep(REFINE_POLL_SEC)
+    return False
 
 
 async def _refine_locked(*, package: str, team_id: int) -> None:
