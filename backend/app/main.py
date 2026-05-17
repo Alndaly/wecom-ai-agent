@@ -10,16 +10,17 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.db import SessionLocal, init_db
+from app.core.logging_config import setup_logging
 from app.core.security import hash_password
 from app.models import Team, User
 from app.routers import ai as ai_router
-from app.routers import auth, conversations, kb, memory, robots
+from app.routers import auth, conversations, kb, media, memory, robots
 from app.routers import settings as settings_router
 from app.routers import ui_analysis
 from app.ws import android as ws_android
 from app.ws import web as ws_web
 
-logging.basicConfig(level=settings.log_level)
+setup_logging(settings.log_level)
 
 
 async def _ensure_seed() -> None:
@@ -140,6 +141,7 @@ async def _bootstrap_task_queue() -> None:
         from app.routers.robots import run_agent_goal_task
 
         task_queue.register_runner("send_text", run_send_task)
+        task_queue.register_runner("send_media", run_send_task)
         task_queue.register_runner("agent_goal", run_agent_goal_task)
         n = await task_queue.recover_pending_tasks()
         if n:
@@ -192,6 +194,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(robots.router)
+app.include_router(media.router)
 app.include_router(conversations.router)
 app.include_router(ai_router.router)
 app.include_router(kb.router)

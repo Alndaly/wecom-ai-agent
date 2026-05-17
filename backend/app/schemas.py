@@ -125,6 +125,7 @@ class MessageOut(ORM):
     sender_id: int | None = None
     type: str
     content: str
+    media_json: dict | None = None
     status: str | None = None
     feedback_status: str | None = None
     feedback_trace_id: str | None = None
@@ -136,7 +137,7 @@ class MessageOut(ORM):
 
 
 class MessageSendIn(BaseModel):
-    type: Literal["text"] = "text"  # MVP1: text only
+    type: Literal["text"] = "text"
     content: str = Field(min_length=1, max_length=4000)
 
 
@@ -164,7 +165,7 @@ class AndroidContact(BaseModel):
 class AndroidMessageReceived(BaseModel):
     contact: AndroidContact
     external_msg_id: str | None = None
-    type: Literal["text"] = "text"
+    type: Literal["text", "image", "video"] = "text"
     content: str
     sender_type: Literal["customer", "human"] = "customer"
     sent_at: datetime | None = None

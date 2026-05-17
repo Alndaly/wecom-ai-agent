@@ -207,6 +207,31 @@ class DeviceClient:
             payload.update(_expected_payload(expected))
         return await self.command("input_text", payload, timeout=timeout)
 
+    async def stage_media(
+        self,
+        *,
+        download_url: str,
+        mime: str,
+        filename: str,
+        timeout: float = 45.0,
+    ) -> DeviceCommandResult:
+        """Drop a media file into the device's gallery (Pictures/WeComAgent/).
+
+        The subsequent ReAct phase walks "+ → 图片 → 选最新一张 → 发送" to
+        actually deliver the message. The result `data` carries `uri`,
+        `display_name`, `taken_at_ms`, and `relative_path` so the agent can
+        identify the staged file.
+        """
+        return await self.command(
+            "stage_media",
+            {
+                "download_url": download_url,
+                "mime": mime,
+                "filename": filename,
+            },
+            timeout=timeout,
+        )
+
     async def back(self, *, timeout: float) -> DeviceCommandResult:
         return await self.command("back", timeout=timeout)
 

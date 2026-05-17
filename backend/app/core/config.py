@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     react_fallback_enabled: bool = True
     react_max_steps: int = 6
     react_step_timeout_sec: float = 12.0
+    # Media send is a separate ReAct phase after the chat opens (compose_plus
+    # → media_picker_entry → gallery_first_item → preview/send). Each step is
+    # one tap, plus a few exploratory steps the first time before the
+    # locator cache primes. 14 leaves headroom; the loop exits early on done().
+    react_media_max_steps: int = 14
     # When False (default): deterministic locators try first, LLM is fallback
     # (cheaper and faster for routine flows). When True: every step goes to
     # the LLM with UI tree + screenshot, no rule shortcut. AI always picks a

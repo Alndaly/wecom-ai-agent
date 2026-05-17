@@ -99,6 +99,83 @@ async def create_and_dispatch_send_text(
     return msg, task
 
 
+async def create_and_dispatch_send_media(
+    db: AsyncSession,
+    *,
+    robot: Robot,
+    conv: Conversation,
+    contact_external_id: str,
+    kind: str,
+    media: dict,
+    caption: str,
+    sender_type: str,
+    sender_id: int | None,
+    feedback_message_ids: list[int] | None = None,
+) -> tuple[Message, RobotTask]:
+    if not settings.task_queue_enabled:
+        raise RuntimeError("task queue disabled")
+    label = caption or str(media.get("filename") or ("图片" if kind == "image" else "视频"))
+    msg = Message(
+        conversation_id=conv.id,
+        direction="out",
+        sender_type=sender_type,
+        sender_id=sender_id,
+        type=kind,
+        content=label,
+        media_json=media,
+        status="pending",
+    )
+    db.add(msg)
+    await db.flush()
+
+    task = RobotTask(
+        robot_id=robot.id,
+        type="send_media",
+        payload_json={
+            "conversation_external_id": contact_external_id,
+            "kind": kind,
+            "caption": caption,
+            "media": {
+                "url": media.get("url"),
+                "mime": media.get("mime"),
+                "filename": media.get("filename"),
+                "bytes": media.get("bytes"),
+            },
+            "feedback_message_ids": feedback_message_ids or [],
+        },
+        status="dispatched",
+        max_attempts=1,
+        conversation_id=conv.id,
+        message_id=msg.id,
+    )
+    db.add(task)
+    await db.flush()
+    db.add(
+        RobotTaskLog(
+            robot_id=robot.id,
+            task_id=task.id,
+            level="info",
+            message=f"send_media scheduled via ReAct contact={contact_external_id} kind={kind}",
+        )
+    )
+
+    msg.task_id = task.id
+    conv.last_message_at = msg.created_at
+    conv.last_message_preview = f"[{('图片' if kind == 'image' else '视频')}] {label}".strip()
+
+    await db.commit()
+    await db.refresh(msg)
+    await db.refresh(task)
+
+    from app.services import task_queue
+
+    await task_queue.enqueue(
+        robot.robot_id, "send_media", task.id, priority=task_queue.PRIORITY_AUTO_REPLY
+    )
+    await _broadcast_message_new(robot.team_id, conv.id, msg)
+    return msg, task
+
+
 async def append_task_log(
     db: AsyncSession,
     *,
@@ -210,6 +287,7 @@ async def run_send_task(task_id: int) -> None:
             )
             max_attempts = min(int(task.max_attempts or 1), _MAX_AUTO_REPLY_SEND_ATTEMPTS)
             result = None
+            media_error: str | None = None
             try:
                 while True:
                     result = await run_react(
@@ -246,6 +324,70 @@ async def run_send_task(task_id: int) -> None:
                         await asyncio.sleep(0.6)
                     except Exception:  # noqa: BLE001
                         log.debug("open_wecom retry pre-flight failed; continuing")
+                if result.ok and task.type == "send_media":
+                    # Three-phase media send:
+                    #   A) ReAct opened the target chat (above).
+                    #   B) `stage_media` drops the file into Pictures/WeComAgent/
+                    #      so WeCom's gallery picker can see it.
+                    #   C) A second ReAct loop walks the "+ → 图片 → 选最新 → 发送"
+                    #      flow inside the open chat. LLM + UI tree + screenshot
+                    #      drive it; LocatorStore caches successful nodes by role
+                    #      (compose_plus / media_picker_entry / gallery_first_item
+                    #      / gallery_send_button) so subsequent runs short-circuit.
+                    payload = task.payload_json or {}
+                    media_payload = payload.get("media") or {}
+                    stage = await device.stage_media(
+                        download_url=str(media_payload.get("url") or ""),
+                        mime=str(media_payload.get("mime") or ""),
+                        filename=str(media_payload.get("filename") or "media"),
+                        timeout=45.0,
+                    )
+                    if not stage.ok:
+                        media_error = stage.message or "媒体落盘失败"
+                    else:
+                        stage_data = stage.data or {}
+                        staged_name = str(
+                            stage_data.get("display_name")
+                            or media_payload.get("filename")
+                            or "media"
+                        )
+                        media_goal = (
+                            f"在当前聊天页面通过附件面板，发送刚刚落入相册的 "
+                            f"{staged_name}（位于 Pictures/WeComAgent/）。\n"
+                            f"路径示意（具体节点请按当前 UI tree 顺序与截图判断，不要写死文字）：\n"
+                            f"  1) 在聊天输入栏中找到展开附件面板的入口（常是输入框右侧"
+                            f"或左侧的小图标，UI 树里通常是一组并排的 ImageView；"
+                            f"如点错弹出表情/语音面板，下一步换同一行里其它图标）；\n"
+                            f"  2) 在弹出的面板中找到进入相册的入口（通常是一组并排"
+                            f"图标 + 文字的格子，按 UI 树顺序里其中一个 label 对应"
+                            f"相册/图片）；\n"
+                            f"  3) 进入相册网格后：网格里的格子按 UI 树顺序排列，"
+                            f"靠前的可能是相机/扫描等带文字标签的快捷入口，要跳过；"
+                            f"选 UI 树里第一个**没有文字 label、只是纯 ImageView** 的"
+                            f"缩略图（那就是最新存入的真实照片）；\n"
+                            f"  4) 选中后必须再点确认发送按钮（通常在屏幕右下角，"
+                            f"未选图前为禁用态）；若先进入预览/编辑页，则按相同顺序"
+                            f"在该页右下角点发送；\n"
+                            f"  5) 当 UI tree 的 page 字段从 picker/UNKNOWN 切回 CHAT，"
+                            f"即表示已发出，立即 done(success=true)。\n"
+                            f"对每次有效点击，请在 args 里写明 `_locator_role`，"
+                            f"取值参考系统提示中的媒体角色，便于后续缓存。"
+                            f"文件名 {staged_name}。"
+                        )
+                        media_result = await run_react(
+                            db,
+                            robot,
+                            media_goal,
+                            max_steps=settings.react_media_max_steps,
+                            step_timeout=settings.react_step_timeout_sec,
+                            log_sink=_sink,
+                            force_llm=force_llm,
+                        )
+                        if not media_result.ok:
+                            media_error = media_result.summary or "媒体发送失败"
+                        # Keep the original open-chat result around for the
+                        # success branch (its steps go into the audit log);
+                        # the media phase logs are captured via _sink.
             finally:
                 if session_started:
                     try:
@@ -260,7 +402,8 @@ async def run_send_task(task_id: int) -> None:
                 return
             retry_task_id: int | None = None
 
-            if result.ok:
+            task_ok = bool(result.ok and media_error is None)
+            if task_ok:
                 task.status = "completed"
                 task.last_error = None
                 await _mark_feedback_messages(db, task, "replied")
@@ -269,13 +412,14 @@ async def run_send_task(task_id: int) -> None:
                     if msg:
                         msg.status = "sent"
             else:
-                retry_task_id = await _handle_send_failure(db, robot, task, _REACT_PREFIX + result.summary)
+                error = _REACT_PREFIX + (media_error or result.summary)
+                retry_task_id = await _handle_send_failure(db, robot, task, error)
             db.add(
                 RobotTaskLog(
                     robot_id=robot.id,
                     task_id=task.id,
-                    level="info" if result.ok else "warn",
-                    message=f"[react] result ok={result.ok} steps={len(result.steps)} summary={result.summary}",
+                    level="info" if task_ok else "warn",
+                    message=f"[react] result ok={task_ok} steps={len(result.steps)} summary={media_error or result.summary}",
                 )
             )
             await db.commit()
@@ -285,7 +429,7 @@ async def run_send_task(task_id: int) -> None:
                 await asyncio.sleep(_AUTO_REPLY_RETRY_DELAY_SEC)
                 await task_queue.enqueue(
                     robot.robot_id,
-                    "send_text",
+                    task.type,
                     retry_task_id,
                     priority=task_queue.PRIORITY_BACKGROUND,
                 )
@@ -331,13 +475,53 @@ async def run_send_task(task_id: int) -> None:
             raise
         except Exception as e:  # noqa: BLE001
             log.exception("react send crashed: %s", e)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            task = await db.get(RobotTask, task_id)
+            if task is None:
+                return
+            error = _REACT_PREFIX + (str(e) or e.__class__.__name__)
+            retry_task_id = await _handle_send_failure(db, robot, task, error)
+            db.add(
+                RobotTaskLog(
+                    robot_id=robot.id,
+                    task_id=task.id,
+                    level="error",
+                    message=f"[react] crashed: {error}",
+                )
+            )
+            await db.commit()
+            if retry_task_id is not None:
+                from app.services import task_queue
+
+                await asyncio.sleep(_AUTO_REPLY_RETRY_DELAY_SEC)
+                await task_queue.enqueue(
+                    robot.robot_id,
+                    task.type,
+                    retry_task_id,
+                    priority=task_queue.PRIORITY_BACKGROUND,
+                )
+            await hub.broadcast_web(
+                robot.team_id,
+                "task.updated",
+                {"task_id": task.id, "status": task.status, "error": task.last_error},
+            )
+            if task.message_id:
+                m = await db.get(Message, task.message_id)
+                if m:
+                    await _broadcast_message_update(robot.team_id, m)
+            await _wake_auto_reply_if_pending(db, robot.id, task.conversation_id)
 
 
 def _goal_for_task(task: RobotTask) -> str | None:
-    if task.type != "send_text":
-        return None
     payload = task.payload_json or {}
     contact = payload.get("conversation_external_id") or "目标联系人"
+    if task.type == "send_media":
+        return f"打开与「{contact}」的聊天"
+    if task.type != "send_text":
+        return None
     text = (payload.get("text") or "").strip()
     if not text:
         return None

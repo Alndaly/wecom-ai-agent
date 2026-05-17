@@ -270,6 +270,12 @@ async def _task_labels(kind: str, task_id: int) -> tuple[str, str | None]:
         contact = str(payload.get("conversation_external_id") or "目标联系人").strip()
         text = str(payload.get("text") or "").strip()
         return f"发送给「{contact}」", text if text else None
+    if kind == "send_media":
+        contact = str(payload.get("conversation_external_id") or "目标联系人").strip()
+        media = payload.get("media") or {}
+        filename = str(media.get("filename") or "").strip()
+        label = "图片" if payload.get("kind") == "image" else "视频"
+        return f"发送{label}给「{contact}」", filename or None
     return f"{kind} #{task_id}", None
 
 
@@ -308,8 +314,8 @@ async def recover_pending_tasks() -> int:
             .where(RobotTask.status == "dispatched")
         )).all()
         for task, rid in rows:
-            kind = "send_text" if task.type == "send_text" else "agent_goal"
-            priority = PRIORITY_AUTO_REPLY if kind == "send_text" else PRIORITY_OPERATOR
+            kind = task.type if task.type in {"send_text", "send_media"} else "agent_goal"
+            priority = PRIORITY_AUTO_REPLY if kind in {"send_text", "send_media"} else PRIORITY_OPERATOR
             await enqueue(rid, kind, task.id, priority=priority)
             enqueued += 1
     if enqueued:

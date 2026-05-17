@@ -20,12 +20,66 @@ _SEND_GOAL_RE = re.compile(
     r"打开与[「\"](?P<target>.+?)[」\"]的聊天，并发送下面这段文本[:：](?P<text>.*)",
     re.DOTALL,
 )
+_OPEN_CHAT_GOAL_RE = re.compile(
+    r"打开与[「\"](?P<target>.+?)[」\"]的聊天(?:$|[，,].*)",
+    re.DOTALL,
+)
+_SEND_MEDIA_GOAL_RE = re.compile(
+    # Anchored on the "文件名 X" suffix the orchestrator appends — robust
+    # against the descriptive sentence in the goal body that also contains
+    # path-like tokens (Pictures/WeComAgent etc.).
+    r"文件名[:：]?\s*(?P<filename>[A-Za-z0-9._-]+)",
+    re.DOTALL,
+)
+
+
+# Locator roles that the second-phase (media send) ReAct loop emits via
+# `_locator_role`. Listed here so callers can validate without importing the
+# module's internals.
+MEDIA_LOCATOR_ROLES = frozenset(
+    {"compose_plus", "media_picker_entry", "gallery_first_item", "gallery_send_button"}
+)
+_ALL_LOCATOR_ROLES = frozenset(
+    {
+        "chat_target",
+        "message_input",
+        "send_button",
+        "search_entry",
+        "search_input",
+    }
+) | MEDIA_LOCATOR_ROLES
+# Roles whose target node carries identifying text/desc (so we capture it
+# verbatim into the cache for stricter future matching). Thumbnails and
+# generic + icons usually have no useful text.
+_TEXTUAL_ROLES = frozenset(
+    {"send_button", "chat_target", "search_entry", "media_picker_entry", "gallery_send_button"}
+)
+
+
+@dataclass(frozen=True)
+class ParsedSendMediaGoal:
+    filename: str
+
+
+def parse_send_media_goal(goal: str) -> ParsedSendMediaGoal | None:
+    m = _SEND_MEDIA_GOAL_RE.search(goal or "")
+    if not m:
+        return None
+    filename = (m.group("filename") or "").strip()
+    if not filename:
+        return None
+    return ParsedSendMediaGoal(filename=filename)
 
 
 @dataclass(frozen=True)
 class ParsedSendGoal:
     target: str
     text: str
+
+
+@dataclass(frozen=True)
+class ParsedOpenChatGoal:
+    target: str
 
 
 def parse_send_goal(goal: str) -> ParsedSendGoal | None:
@@ -37,6 +91,19 @@ def parse_send_goal(goal: str) -> ParsedSendGoal | None:
     if not target or not text:
         return None
     return ParsedSendGoal(target=target, text=text)
+
+
+def parse_open_chat_goal(goal: str) -> ParsedOpenChatGoal | None:
+    parsed_send = parse_send_goal(goal)
+    if parsed_send is not None:
+        return ParsedOpenChatGoal(target=parsed_send.target)
+    m = _OPEN_CHAT_GOAL_RE.search(goal or "")
+    if not m:
+        return None
+    target = m.group("target").strip()
+    if not target:
+        return None
+    return ParsedOpenChatGoal(target=target)
 
 
 class LocatorStore:
@@ -209,22 +276,29 @@ class LocatorStore:
 
 
 def role_for_decision(action: str, args: dict[str, Any], node: UiNode | None, goal: str) -> str | None:
-    parsed = parse_send_goal(goal)
-    if parsed is None:
-        return None
     explicit = str(args.get("_locator_role") or "").strip()
-    if explicit in {"chat_target", "message_input", "send_button", "search_entry", "search_input"}:
+    parsed_send = parse_send_goal(goal)
+    parsed_media = parse_send_media_goal(goal)
+    # For media-send goals we trust the LLM's `_locator_role` annotation —
+    # there's no reliable text heuristic for "+" icons or thumbnails.
+    if parsed_media is not None:
+        if explicit in MEDIA_LOCATOR_ROLES:
+            return explicit
+        return None
+    if parsed_send is None:
+        return None
+    if explicit in _ALL_LOCATOR_ROLES:
         return explicit
     if action == "input_text":
         text = str(args.get("text") or "")
-        if text == parsed.target:
+        if text == parsed_send.target:
             return "search_input"
         return "message_input"
     if action == "tap_node" and node is not None:
         label = _label(node)
         if label in {"发送", "Send"}:
             return "send_button"
-        if label == parsed.target:
+        if label == parsed_send.target:
             return "chat_target"
         if _looks_like_search_label(label) or _looks_like_search_node(node):
             return "search_entry"
@@ -251,7 +325,7 @@ def _locator_from_node(
         "match": {
             "cls": node.cls,
             "view_id": node.view_id,
-            "text": label if role in {"send_button", "chat_target", "search_entry"} else "",
+            "text": label if role in _TEXTUAL_ROLES else "",
             "text_mode": "goal_target" if role == "chat_target" else "exact",
             "editable": node.editable,
             "clickable": node.clickable,

@@ -1,7 +1,7 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Send, Trash2, User2 } from "lucide-react";
-import { api, type Conversation, type Message } from "@/lib/api";
+import { Bot, Image as ImageIcon, Paperclip, Send, Trash2, User2 } from "lucide-react";
+import { API_BASE, api, apiForm, type Conversation, type Message } from "@/lib/api";
 import { formatClockTime, formatRelative } from "@/lib/datetime";
 import { useWebWs } from "@/lib/ws";
 import { toast } from "@/components/ui/sonner";
@@ -39,6 +39,7 @@ export default function WorkbenchPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [suggestions, setSuggestions] = useState<Record<number, Suggestion[]>>({});
   const [kbHits, setKbHits] = useState<Record<number, KBChunk[]>>({});
   const [memorySummary, setMemorySummary] = useState<string | null>(null);
@@ -68,28 +69,46 @@ export default function WorkbenchPage() {
     reloadConvs().catch(console.error);
   }, [reloadConvs]);
 
+  // Only refetch messages when switching conversations. Inbound message.new /
+  // message.updated events patch the list in place via setMessages, and the
+  // conv-list refresh that runs on every broadcast should NOT cascade into
+  // re-pulling the open thread's history.
   useEffect(() => {
     if (activeId == null) return;
     reloadMessages(activeId).catch(console.error);
-    // pull profile summary
-    const conv = convs.find((c) => c.id === activeId);
-    if (conv) {
-      api<{ summary?: string } | null>(`/memory/${conv.contact_id}`)
-        .then((p) => setMemorySummary(p?.summary || null))
-        .catch(() => setMemorySummary(null));
-      // mark as read on the server (only if there are unread messages)
-      if (conv.unread_count > 0) {
+  }, [activeId, reloadMessages]);
+
+  // Profile summary + initial read-mark fire when the *contact* behind the
+  // active conv changes, not on every conv-list refresh.
+  const activeContactId = useMemo(
+    () => convs.find((c) => c.id === activeId)?.contact_id ?? null,
+    [convs, activeId]
+  );
+  const seenUnreadConvId = useRef<number | null>(null);
+  useEffect(() => {
+    if (activeContactId == null || activeId == null) return;
+    api<{ summary?: string } | null>(`/memory/${activeContactId}`)
+      .then((p) => setMemorySummary(p?.summary || null))
+      .catch(() => setMemorySummary(null));
+    if (seenUnreadConvId.current !== activeId) {
+      seenUnreadConvId.current = activeId;
+      const conv = convs.find((c) => c.id === activeId);
+      if (conv && conv.unread_count > 0) {
         api(`/conversations/${activeId}/read`, { method: "POST" }).catch(() => {});
       }
     }
-  }, [activeId, convs, reloadMessages]);
+  }, [activeContactId, activeId]);
 
-  useEffect(() => {
+  const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => {
       const el = scrollRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     });
-  }, [messages]);
+  }, []);
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, scrollToBottom]);
 
   useEffect(() => {
     const el = inputRef.current;
@@ -168,6 +187,37 @@ export default function WorkbenchPage() {
       toast.error("发送失败", { description: e?.message ?? String(e) });
     } finally {
       setSending(false);
+    }
+  }
+
+  async function sendMedia(file: File | null) {
+    if (!active || !file) return;
+    const kind = file.type.startsWith("video/") ? "video" : file.type.startsWith("image/") ? "image" : null;
+    if (!kind) {
+      toast.error("仅支持图片或视频");
+      return;
+    }
+    const caption = draft.trim();
+    const form = new FormData();
+    form.append("type", kind);
+    form.append("file", file);
+    form.append("caption", caption);
+    setSending(true);
+    try {
+      const res = await apiForm<{ message: Message }>(
+        `/conversations/${active.id}/messages/media`,
+        form
+      );
+      setMessages((prev) =>
+        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+      );
+      reloadConvs().catch(() => {});
+      if (caption) setDraft("");
+    } catch (e: any) {
+      toast.error("发送媒体失败", { description: e?.message ?? String(e) });
+    } finally {
+      setSending(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
@@ -327,7 +377,12 @@ export default function WorkbenchPage() {
             <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col justify-end gap-3 px-5 py-4">
                 {messages.map((m) => (
-                  <MessageBubble key={m.id} m={m} onDelete={() => setMsgToDelete(m)} />
+                  <MessageBubble
+                    key={m.id}
+                    m={m}
+                    onDelete={() => setMsgToDelete(m)}
+                    onMediaLoad={scrollToBottom}
+                  />
                 ))}
               </div>
             </div>
@@ -349,6 +404,25 @@ export default function WorkbenchPage() {
                   className="max-h-44 min-h-[52px] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 text-sm leading-6 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 />
                 <div className="flex justify-end px-1 pb-1">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*,video/*"
+                    className="hidden"
+                    onChange={(e) => sendMedia(e.target.files?.[0] ?? null)}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={sending}
+                    className="mr-1 h-8 w-8 rounded-full"
+                    aria-label="发送图片或视频"
+                    title="发送图片或视频"
+                  >
+                    <Paperclip className="h-4 w-4" />
+                  </Button>
                   <Button
                     size="icon"
                     onClick={() => send()}
@@ -515,7 +589,18 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
   );
 }
 
-function MessageBubble({ m, onDelete }: { m: Message; onDelete?: () => void }) {
+function MessageBubble({
+  m,
+  onDelete,
+  onMediaLoad,
+}: {
+  m: Message;
+  onDelete?: () => void;
+  // Called after the image/video element finishes loading so the parent can
+  // re-pin the scroll container to the bottom — without this the initial
+  // scroll fires before the media has reported its height.
+  onMediaLoad?: () => void;
+}) {
   const isOut = m.direction === "out";
   const isAI = m.sender_type === "ai";
   const statusLabel =
@@ -525,6 +610,10 @@ function MessageBubble({ m, onDelete }: { m: Message; onDelete?: () => void }) {
         : m.status === "failed"
         ? "发送失败"
         : "发送中…"
+      : null;
+  const mediaUrl =
+    m.media_json && typeof m.media_json.url === "string"
+      ? `${API_BASE}${m.media_json.url}`
       : null;
 
   return (
@@ -559,7 +648,30 @@ function MessageBubble({ m, onDelete }: { m: Message; onDelete?: () => void }) {
                 : "bg-card border"
             )}
           >
-            <p className="whitespace-pre-wrap break-words leading-6">{m.content}</p>
+            {m.type === "image" && mediaUrl && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={mediaUrl}
+                alt={m.content || "图片"}
+                className="mb-2 max-h-80 max-w-full rounded-md object-contain"
+                onLoad={onMediaLoad}
+              />
+            )}
+            {m.type === "video" && mediaUrl && (
+              <video
+                src={mediaUrl}
+                controls
+                className="mb-2 max-h-80 max-w-full rounded-md bg-black"
+                onLoadedMetadata={onMediaLoad}
+              />
+            )}
+            {m.type !== "text" && !mediaUrl && (
+              <div className="mb-2 flex items-center gap-2 text-xs opacity-80">
+                <ImageIcon className="h-4 w-4" />
+                <span>{m.type === "video" ? "视频" : "图片"}</span>
+              </div>
+            )}
+            {m.content && <p className="whitespace-pre-wrap break-words leading-6">{m.content}</p>}
           </div>
           {onDelete && (
             <button

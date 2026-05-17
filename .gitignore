@@ -21,9 +21,9 @@ android/.idea/
 .DS_Store
 *.log
 /tmp/
-ui_dumps/
-react_fallbacks/
-react_locator_cache/
 .claude/
 .playwright-cli/
 output/
+var/
+
+.archive/

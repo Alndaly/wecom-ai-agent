@@ -110,6 +110,7 @@ class Message(Base):
     sender_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     type: Mapped[str] = mapped_column(String(16), default="text")
     content: Mapped[str] = mapped_column(Text)
+    media_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str | None] = mapped_column(String(16), nullable=True)  # for out only
     feedback_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     feedback_trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

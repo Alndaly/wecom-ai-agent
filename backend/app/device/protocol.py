@@ -68,6 +68,7 @@ DeviceCommandName = Literal[
     "drag_xy",
     "swipe",
     "input_text",
+    "stage_media",
     "back",
     "home",
     "open_wecom",

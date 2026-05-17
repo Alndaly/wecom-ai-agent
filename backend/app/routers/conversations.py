@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import delete as sa_delete, desc, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,7 +21,8 @@ from app.schemas import (
     MessageSendOut,
     TaskOut,
 )
-from app.services.send_orchestrator import create_and_dispatch_send_text
+from app.services.media_store import persist_upload
+from app.services.send_orchestrator import create_and_dispatch_send_media, create_and_dispatch_send_text
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -191,6 +193,44 @@ async def send_message(
         conv=conv,
         contact_external_id=contact.external_id,
         text=body.content,
+        sender_type="human",
+        sender_id=user.id,
+        feedback_message_ids=await _pending_feedback_ids(db, conv.id),
+    )
+    return MessageSendOut(
+        message=MessageOut.model_validate(msg),
+        task=TaskOut.model_validate(task),
+    )
+
+
+@router.post("/{cid}/messages/media", response_model=MessageSendOut)
+async def send_media_message(
+    cid: int,
+    type: Literal["image", "video"] = Form(...),
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MessageSendOut:
+    conv = await _get_conv(db, cid, user.team_id)
+    robot = await db.get(Robot, conv.robot_id)
+    contact = await db.get(Contact, conv.contact_id)
+    if not robot or not contact:
+        raise HTTPException(status.HTTP_409_CONFLICT, "robot or contact missing")
+    if not settings.task_queue_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "task queue disabled")
+    clean_caption = caption.strip()
+    if len(clean_caption) > 1000:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "caption too long")
+    media = await persist_upload(file, team_id=user.team_id, kind=type)
+    msg, task = await create_and_dispatch_send_media(
+        db,
+        robot=robot,
+        conv=conv,
+        contact_external_id=contact.external_id,
+        kind=type,
+        media=media,
+        caption=clean_caption,
         sender_type="human",
         sender_id=user.id,
         feedback_message_ids=await _pending_feedback_ids(db, conv.id),

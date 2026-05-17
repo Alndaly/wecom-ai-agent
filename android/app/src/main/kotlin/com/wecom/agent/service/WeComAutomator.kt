@@ -2,14 +2,26 @@ package com.wecom.agent.service
 
 import android.accessibilityservice.AccessibilityService
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Rect
+import android.media.MediaScannerConnection
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.util.UUID
 
 data class NodeExpectation(
     val cls: String = "",
@@ -35,6 +47,7 @@ class WeComAutomator(
 ) {
     private val tag = "WeComAuto"
     private val wecomPkg = "com.tencent.wework"
+    private val http = OkHttpClient()
 
     /** UI operations have to happen on the main looper; we just poll. */
     private suspend fun a11y(): AccessibilityService? {
@@ -280,6 +293,146 @@ class WeComAutomator(
         val svc = a11y() ?: return false to "无障碍未启用"
         val ok = svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
         return ok to if (ok) "已回主屏" else "Home 手势失败"
+    }
+
+    /**
+     * Download the media file and publish it to MediaStore under
+     * `Pictures/WeComAgent/` so WeCom's gallery picker can see it. The
+     * subsequent ReAct phase taps "+" → 图片 → 选最新一张 → 发送 to actually
+     * deliver the message. We don't auto-delete — operators clean the
+     * dedicated album when needed.
+     *
+     * Returns (ok, message, dataMap). On success dataMap carries:
+     *   - uri: content:// URI of the inserted entry
+     *   - display_name: filename as it appears in MediaStore
+     *   - taken_at_ms: System.currentTimeMillis() at insert (used by the
+     *     agent to identify "the latest picture" in the gallery)
+     *   - relative_path: Pictures/WeComAgent/
+     */
+    suspend fun stageMedia(
+        downloadUrl: String,
+        mime: String,
+        filename: String,
+    ): Triple<Boolean, String, Map<String, String>?> = withContext(Dispatchers.IO) {
+        if (!mime.startsWith("image/") && !mime.startsWith("video/")) {
+            return@withContext Triple(false, "不支持的媒体类型：$mime", null)
+        }
+        try {
+            val bytes = downloadMediaBytes(downloadUrl)
+            val safeName = safeMediaName(filename).let { base ->
+                // Disambiguate so MediaStore doesn't dedup against an earlier
+                // stage with the same source filename.
+                val dot = base.lastIndexOf('.')
+                val stem = if (dot > 0) base.substring(0, dot) else base
+                val ext = if (dot > 0) base.substring(dot) else ""
+                val suffix = UUID.randomUUID().toString().replace("-", "").take(8)
+                "${stem}_$suffix$ext"
+            }
+            val isVideo = mime.startsWith("video/")
+            val takenAt = System.currentTimeMillis()
+            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                insertMediaStoreQ(safeName, mime, bytes, isVideo)
+            } else {
+                insertMediaStoreLegacy(safeName, mime, bytes, isVideo)
+            }
+            val data = mapOf(
+                "uri" to uri.toString(),
+                "display_name" to safeName,
+                "taken_at_ms" to takenAt.toString(),
+                "relative_path" to "Pictures/WeComAgent/",
+                "mime" to mime,
+            )
+            Triple(true, "媒体已落入 Pictures/WeComAgent/ ($safeName)", data)
+        } catch (e: Exception) {
+            Log.w(tag, "stage media failed", e)
+            Triple(false, e.message ?: e::class.java.simpleName, null)
+        }
+    }
+
+    private suspend fun downloadMediaBytes(downloadUrl: String): ByteArray = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(downloadUrl).build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("下载媒体失败：HTTP ${response.code}")
+            val body = response.body ?: error("媒体响应为空")
+            body.bytes()
+        }
+    }
+
+    private fun insertMediaStoreQ(
+        displayName: String,
+        mime: String,
+        bytes: ByteArray,
+        isVideo: Boolean,
+    ): Uri {
+        // Use scoped storage: insert into Pictures/WeComAgent with IS_PENDING
+        // so partial writes aren't picked up by other apps mid-stream.
+        val collection = if (isVideo) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        }
+        val relativePath = (if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES) + "/WeComAgent"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(MediaStore.MediaColumns.DATE_ADDED, System.currentTimeMillis() / 1000)
+            put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val resolver = ctx.contentResolver
+        val uri = resolver.insert(collection, values) ?: error("MediaStore.insert 返回 null")
+        try {
+            resolver.openOutputStream(uri)?.use { out -> out.write(bytes) }
+                ?: error("无法打开 MediaStore 输出流")
+            val finalize = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            resolver.update(uri, finalize, null, null)
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            throw e
+        }
+        return uri
+    }
+
+    private suspend fun insertMediaStoreLegacy(
+        displayName: String,
+        mime: String,
+        bytes: ByteArray,
+        isVideo: Boolean,
+    ): Uri = withContext(Dispatchers.IO) {
+        // API ≤28: write to the public Pictures/Movies dir + MediaScanner so
+        // the system gallery picker indexes it. Needs WRITE_EXTERNAL_STORAGE
+        // declared with maxSdkVersion=28 in the manifest.
+        @Suppress("DEPRECATION")
+        val publicDir = Environment.getExternalStoragePublicDirectory(
+            if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
+        )
+        val targetDir = File(publicDir, "WeComAgent").apply {
+            if (!exists() && !mkdirs()) error("无法创建目录 $absolutePath")
+        }
+        val target = File(targetDir, displayName)
+        target.outputStream().use { out -> out.write(bytes) }
+        // MediaScannerConnection.scanFile is callback-based; wrap into a
+        // suspend point so we return only after the URI is known.
+        val scannedUri = withTimeoutOrNull(5_000L) {
+            kotlinx.coroutines.suspendCancellableCoroutine<Uri?> { cont ->
+                MediaScannerConnection.scanFile(
+                    ctx,
+                    arrayOf(target.absolutePath),
+                    arrayOf(mime),
+                ) { _, uri ->
+                    if (cont.isActive) cont.resumeWith(Result.success(uri))
+                }
+            }
+        }
+        scannedUri ?: Uri.fromFile(target)
+    }
+
+    private fun safeMediaName(filename: String): String {
+        val name = filename.replace('\\', '/').substringAfterLast('/').ifBlank { "media" }
+        return name.replace(Regex("[^A-Za-z0-9._-]+"), "_").take(120).ifBlank { "media" }
     }
 
     private fun gestureTap(svc: AccessibilityService, x: Float, y: Float): Boolean {

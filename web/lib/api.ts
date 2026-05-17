@@ -174,6 +174,7 @@ export type Message = {
   sender_id: number | null;
   type: string;
   content: string;
+  media_json: Record<string, unknown> | null;
   status: string | null;
   feedback_status: string | null;
   feedback_trace_id: string | null;

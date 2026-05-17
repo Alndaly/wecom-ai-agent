@@ -79,6 +79,7 @@ class AgentForegroundService : Service() {
     private val pendingCommandCount = AtomicInteger(0)
     private var commandWorkerJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile private var configuredBaseUrl: String = ""
     @Volatile private var connected = false
     @Volatile private var a11yInboundEnabled = false
     private data class PendingInbound(
@@ -131,6 +132,7 @@ class AgentForegroundService : Service() {
         val base = intent?.getStringExtra(EXTRA_BASE_URL) ?: return START_NOT_STICKY
         val rid = intent.getStringExtra(EXTRA_ROBOT_ID) ?: return START_NOT_STICKY
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: return START_NOT_STICKY
+        configuredBaseUrl = base
         a11yInboundEnabled = intent.getBooleanExtra(EXTRA_A11Y_INGEST, false)
         Log.i(tag, "service starting base=$base robot_id=$rid token_len=${token.length} a11yInbound=$a11yInboundEnabled")
         updateNotification("connecting $rid")
@@ -338,6 +340,7 @@ class AgentForegroundService : Service() {
                     "drag_xy",
                     "swipe",
                     "input_text",
+                    "stage_media",
                     "back",
                     "home",
                     "open_wecom" -> enqueueCommand(command, obj)
@@ -726,6 +729,31 @@ class AgentForegroundService : Service() {
                             r
                         }
                     }
+                    "stage_media" -> {
+                        val downloadUrl = obj["download_url"]?.jsonPrimitive?.contentOrNull
+                        val mime = obj["mime"]?.jsonPrimitive?.contentOrNull
+                        val filename = obj["filename"]?.jsonPrimitive?.contentOrNull ?: "media"
+                        if (downloadUrl.isNullOrBlank() || mime.isNullOrBlank()) {
+                            Pair(false, "缺少 download_url/mime")
+                        } else {
+                            val staged = automator.stageMedia(
+                                absoluteHttpUrl(downloadUrl),
+                                mime,
+                                filename,
+                            )
+                            if (staged.first && staged.third != null) {
+                                data = json.encodeToJsonElement(
+                                    kotlinx.serialization.json.JsonObject.serializer(),
+                                    kotlinx.serialization.json.JsonObject(
+                                        staged.third!!.mapValues { (_, v) ->
+                                            kotlinx.serialization.json.JsonPrimitive(v)
+                                        }
+                                    ),
+                                )
+                            }
+                            Pair(staged.first, staged.second)
+                        }
+                    }
                     "back" -> automator.reactBack()
                     "home" -> automator.reactHome()
                     "open_wecom" -> automator.openWeCom()
@@ -763,8 +791,21 @@ class AgentForegroundService : Service() {
         return when (command) {
             "open_wecom" -> 12_000L
             "screenshot_once" -> 10_000L
+            "stage_media" -> 45_000L
             else -> 8_000L
         }
+    }
+
+    private fun absoluteHttpUrl(url: String): String {
+        if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
+            return url
+        }
+        val base = configuredBaseUrl
+            .replaceFirst("ws://", "http://", ignoreCase = true)
+            .replaceFirst("wss://", "https://", ignoreCase = true)
+            .trimEnd('/')
+        val path = if (url.startsWith('/')) url else "/$url"
+        return "$base$path"
     }
 
     private fun sendCommandAck(command: String, ok: Boolean, message: String? = null) {
