@@ -33,6 +33,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.time.Instant
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Foreground service that owns the WebSocket lifecycle and device primitives.
@@ -77,8 +78,11 @@ class AgentForegroundService : Service() {
     @Volatile private var reactSessionStartedAt: Long = 0L
     // Until this timestamp the periodic scanner stays out of the device's
     // way. Set when a ReAct session ends so post-send upload spinners aren't
-    // interrupted by a "go back to messages tab" pass.
-    @Volatile private var scannerCooldownUntil: Long = 0L
+    // interrupted by a "go back to messages tab" pass. AtomicLong because
+    // `scannerInCooldown()` needs a CAS to safely clear an expired deadline
+    // — a plain volatile read-check-write race could clobber a fresh
+    // deadline that another session just wrote.
+    private val scannerCooldownUntil = AtomicLong(0L)
 
     // All backend-originated device commands funnel through a single serial
     // queue, so input/tap/send tasks can't be cut into by traversal scans, and
@@ -614,10 +618,13 @@ class AgentForegroundService : Service() {
             || scannerInCooldown()
 
     private fun scannerInCooldown(): Boolean {
-        val until = scannerCooldownUntil
+        val until = scannerCooldownUntil.get()
         if (until == 0L) return false
         if (System.currentTimeMillis() < until) return true
-        scannerCooldownUntil = 0L
+        // CAS the expired value to 0 — only succeed if no one wrote a fresh
+        // deadline in the meantime. Plain assignment would have stomped a
+        // newer cooldown set by a concurrent session_end.
+        scannerCooldownUntil.compareAndSet(until, 0L)
         return false
     }
 
@@ -719,7 +726,7 @@ class AgentForegroundService : Service() {
                         // still be uploading (WeCom shows a progress spinner
                         // in-chat with no page change) and the scanner's
                         // back-to-tab navigation would yank the user away.
-                        scannerCooldownUntil = System.currentTimeMillis() + SCANNER_COOLDOWN_AFTER_SESSION_MS
+                        scannerCooldownUntil.set(System.currentTimeMillis() + SCANNER_COOLDOWN_AFTER_SESSION_MS)
                         Pair(true, "ReAct 会话锁已释放")
                     }
                     "screenshot_once" -> {

@@ -174,14 +174,15 @@ class LocatorStore:
         )
         locator["device_fingerprint"] = current_fingerprint
         locator["last_observation"] = obs_meta
-        locators = [e for e in self.data.get("locators", []) if e.get("role") != role]
-        old = next((e for e in self.data.get("locators", []) if e.get("role") == role), None)
-        if old:
+        existing = list(self.data.get("locators", []))
+        old = next((e for e in existing if e.get("role") == role), None)
+        if old is not None:
             locator["success_count"] = int(old.get("success_count") or 0) + 1
             locator["failure_count"] = int(old.get("failure_count") or 0)
             locator["created_at"] = old.get("created_at") or locator["created_at"]
-        locators.append(locator)
-        self.data["locators"] = locators
+        self.data["locators"] = [
+            e for e in existing if e.get("role") != role
+        ] + [locator]
         self.data["device_fingerprint"] = current_fingerprint
         self.data["updated_at"] = _now()
         self._save()

@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 # per-robot).
 _contact_locks: dict[int, asyncio.Lock] = {}
 
+# Hold task references so they aren't GC'd before completing — asyncio only
+# weak-refs tasks created via `create_task` (Python 3.11+ behaviour change).
+_PENDING_REFRESH_TASKS: set[asyncio.Task] = set()
+
 
 def _lock_for(contact_id: int) -> asyncio.Lock:
     lk = _contact_locks.get(contact_id)
@@ -49,9 +53,11 @@ def schedule_refresh(contact_id: int, conv_id: int) -> None:
     """
     if not settings.memory_refresh_enabled:
         return
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_refresh(contact_id, conv_id), name=f"memory-refresh-{contact_id}"
     )
+    _PENDING_REFRESH_TASKS.add(task)
+    task.add_done_callback(_PENDING_REFRESH_TASKS.discard)
 
 
 async def _run_refresh(contact_id: int, conv_id: int) -> None:

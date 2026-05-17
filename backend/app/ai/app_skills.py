@@ -28,6 +28,7 @@ Adding a new app skill: drop a `.md` in `app_skills/`. No code changes.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -36,6 +37,10 @@ log = logging.getLogger(__name__)
 
 _SKILL_DIR = Path(__file__).with_name("app_skills")
 _FRONTMATTER_SEP = "\n---\n"
+# A line that looks like `key: value` — required at the top of the file
+# for us to treat anything as frontmatter. Without this guard a markdown
+# horizontal rule (`---`) anywhere in the body would split the file in two.
+_FRONTMATTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*:")
 
 
 @dataclass(frozen=True)
@@ -77,7 +82,7 @@ def _index() -> dict[str, AppSkill]:
 
 def _parse(path: Path) -> AppSkill:
     text = path.read_text(encoding="utf-8")
-    if _FRONTMATTER_SEP in text:
+    if _has_frontmatter(text):
         head, _, body = text.partition(_FRONTMATTER_SEP)
         meta = _parse_kv(head)
     else:
@@ -91,6 +96,17 @@ def _parse(path: Path) -> AppSkill:
         description=meta.get("description", ""),
         body=body.strip(),
     )
+
+
+def _has_frontmatter(text: str) -> bool:
+    """True iff the file *opens* with a `key: value` line AND contains
+    a `\\n---\\n` separator. Any other mid-document `---` is a markdown
+    horizontal rule and must NOT be mistaken for a frontmatter terminator."""
+    if _FRONTMATTER_SEP not in text:
+        return False
+    stripped = text.lstrip()
+    first_line = stripped.split("\n", 1)[0] if stripped else ""
+    return bool(_FRONTMATTER_KEY_RE.match(first_line))
 
 
 def _parse_kv(block: str) -> dict[str, str]:

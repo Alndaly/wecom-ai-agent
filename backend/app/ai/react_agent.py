@@ -55,6 +55,12 @@ from app.services import settings_service
 log = logging.getLogger(__name__)
 
 
+# Hold references to background tasks spawned by `_persist_playbook` so
+# Python 3.11+ doesn't GC them mid-run (asyncio docs: "the event loop only
+# keeps weak references to tasks").
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
 # ---- tool catalogue --------------------------------------------------------
 # Action names + descriptions exposed to the LLM. The LLM picks nodes by id
 # from the numbered tree; coordinates are never the LLM's concern.
@@ -1531,7 +1537,22 @@ async def _decide(
     use_vision: bool,
     playbook_hint: str = "",
 ) -> dict[str, Any]:
-    sys = _SYSTEM_PROMPT.format(tools=_tools_block())
+    # System prompt = tool catalogue + app handbook. Both are stable across
+    # every step of the run, so they go into the `system` slot where remote
+    # providers can cache the prefix and we avoid re-billing thousands of
+    # tokens per ReAct iteration. The dynamic per-step content (goal,
+    # history, current UI tree) stays in `user` where it has to.
+    skill = skill_for_package(_root_package(obs.tree))
+    sys_parts = [_SYSTEM_PROMPT.format(tools=_tools_block())]
+    if skill:
+        sys_parts.append(
+            "\n\n"
+            + skill.as_prompt_block(
+                "操作手册（描述结构与位置；具体节点请按当前 UI tree 判断）"
+            )
+        )
+    sys = "".join(sys_parts)
+
     hist_lines = []
     for s in history[-5:]:
         hist_lines.append(
@@ -1544,19 +1565,8 @@ async def _decide(
         if playbook_hint
         else ""
     )
-    # Pick the app-operation skill (markdown handbook) for whatever app is in
-    # the foreground right now. The skill catalogue is in app/ai/app_skills/
-    # and indexed by Android package — drop a new .md to teach the agent a
-    # new app without touching code.
-    skill = skill_for_package(_root_package(obs.tree))
-    handbook_block = (
-        f"{skill.as_prompt_block('操作手册（描述结构与位置；具体节点请按当前 UI tree 判断）')}\n\n"
-        if skill
-        else ""
-    )
     user_text = (
         f"【目标】{goal}\n\n"
-        f"{handbook_block}"
         f"{playbook_block}"
         f"【最近的执行历史】\n{hist}\n\n"
         f"【当前状态】\n{state}\n\n"
@@ -2020,13 +2030,16 @@ def _persist_playbook(
         try:
             from app.ai.app_skills_refine import record_success
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 record_success(
                     package=package,
                     team_id=team_id,
                     goal_kind=kind,
                     steps=[s.to_dict() for s in distilled],
-                )
+                ),
+                name=f"skill-record-{package}",
             )
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
         except Exception:  # noqa: BLE001
             log.debug("app skill record_success dispatch failed", exc_info=True)

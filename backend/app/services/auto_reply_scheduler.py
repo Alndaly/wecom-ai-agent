@@ -99,8 +99,17 @@ async def shutdown() -> None:
             state.task.cancel()
             try:
                 await state.task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                # Expected — we asked for it to stop.
                 pass
+            except Exception:  # noqa: BLE001
+                # Genuine error during teardown. Log so it's not lost,
+                # but don't propagate — shutdown must keep going for the
+                # other robots.
+                log.exception(
+                    "auto-reply: robot loop raised during shutdown robot_pk=%s",
+                    next((k for k, v in _STATES.items() if v is state), "?"),
+                )
         # Drain any in-flight workers too.
         for w in list(state.workers):
             if not w.done():

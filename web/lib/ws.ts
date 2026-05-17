@@ -22,11 +22,22 @@ export function useWebWs(onEvent: Handler) {
       const ws = new WebSocket(`${WS_BASE}/ws/web?token=${encodeURIComponent(token)}`);
       ref.current = ws;
       ws.onmessage = (e) => {
+        let data: any;
         try {
-          const data = JSON.parse(e.data);
-          if (data.event) handlerRef.current(data.event, data.payload);
-        } catch {
-          /* ignore */
+          data = JSON.parse(e.data);
+        } catch (err) {
+          // Silent failure here used to mask real bugs (server-side
+          // serialization errors, accidental binary frames). Log so the
+          // problem surfaces in devtools instead of vanishing.
+          console.warn("ws: failed to parse frame", err, e.data);
+          return;
+        }
+        if (data?.event) {
+          try {
+            handlerRef.current(data.event, data.payload);
+          } catch (err) {
+            console.error("ws: handler threw for event", data.event, err);
+          }
         }
       };
       ws.onopen = () => {

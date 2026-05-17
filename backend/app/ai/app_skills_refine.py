@@ -245,10 +245,12 @@ async def _do_refine(
         _save_state(pkg_archive, state)
         return
 
-    # Archive current → write new active.
+    # Archive current → write new active. Both go through `_atomic_write`
+    # (tmp + rename) so a crash mid-write never leaves a half-finished
+    # archive file that future rollbacks would pick up as garbage.
     state.version_count += 1
     archive_path = pkg_archive / f"{_archive_stamp()}-v{state.version_count}.md"
-    archive_path.write_text(current_text, encoding="utf-8")
+    _atomic_write(archive_path, current_text)
     new_text = _join_frontmatter(front, new_body.strip())
     _atomic_write(active_path, new_text)
 
@@ -399,11 +401,26 @@ def _atomic_write(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
+# Frontmatter is only recognised when the file *opens* with at least one
+# `key: value` line — any other appearance of `---` mid-document is a
+# regular markdown horizontal rule and must not be treated as a separator.
+# Without this, a refined handbook body containing `## section\n---\n## next`
+# would, on the next refinement pass, get its first section silently
+# absorbed into the "frontmatter" half.
+_FRONTMATTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*:")
+
+
 def _split_frontmatter(text: str) -> tuple[str, str]:
-    if _FRONTMATTER_SEP in text:
-        head, _, body = text.partition(_FRONTMATTER_SEP)
-        return head + _FRONTMATTER_SEP.rstrip("\n"), body
-    return "", text
+    # The first non-empty line must look like a `key: value` declaration
+    # for the file to be considered as having frontmatter at all.
+    stripped = text.lstrip()
+    first_line = stripped.split("\n", 1)[0] if stripped else ""
+    if not _FRONTMATTER_KEY_RE.match(first_line):
+        return "", text
+    if _FRONTMATTER_SEP not in text:
+        return "", text
+    head, _, body = text.partition(_FRONTMATTER_SEP)
+    return head + _FRONTMATTER_SEP.rstrip("\n"), body
 
 
 def _join_frontmatter(front: str, body: str) -> str:
