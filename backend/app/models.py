@@ -60,6 +60,10 @@ class Robot(Base):
     screen_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     screen_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Per-device persona override; falls through to team `ai.persona_id`,
+    # then to "default" if both are unset. Slug of a directory under
+    # backend/app/ai/personas/.
+    persona_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

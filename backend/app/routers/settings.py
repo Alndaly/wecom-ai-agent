@@ -104,6 +104,9 @@ class AIBehaviorIn(BaseModel):
     # 决策模式：False = 规则快路径优先、LLM 兜底（默认）；True = 每一步都走 LLM。
     # AI 都只能选节点 ID，由后端解析坐标（不会让 AI 猜 x/y）。
     react_force_llm: bool = False
+    # 选用哪一份人格（对应 backend/app/ai/personas/<id>/）。
+    # 空 / 无效值会自动 fallback 到 "default"。
+    persona_id: str = ""
 
 
 class ParserIn(BaseModel):

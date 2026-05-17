@@ -54,7 +54,17 @@ class RobotOut(ORM):
     screen_width: int | None = None
     screen_height: int | None = None
     last_seen_at: datetime | None = None
+    persona_id: str | None = None
     created_at: datetime
+
+
+class RobotUpdateIn(BaseModel):
+    # PATCH-style: every field is optional. The robots PATCH endpoint
+    # treats `None` as "leave alone" and only applies fields actually
+    # present in the body.
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    # Empty string means "clear the override and fall back to team default".
+    persona_id: str | None = Field(default=None, max_length=64)
 
 
 class RobotCreateOut(BaseModel):

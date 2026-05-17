@@ -14,7 +14,7 @@ from app.core.logging_config import setup_logging
 from app.core.security import hash_password
 from app.models import Team, User
 from app.routers import ai as ai_router
-from app.routers import auth, conversations, internal_tasks, kb, media, memory, robots
+from app.routers import auth, conversations, internal_tasks, kb, media, memory, personas, robots
 from app.routers import settings as settings_router
 from app.routers import ui_analysis
 from app.ws import android as ws_android
@@ -196,6 +196,7 @@ app.include_router(ai_router.router)
 app.include_router(kb.router)
 app.include_router(memory.router)
 app.include_router(settings_router.router)
+app.include_router(personas.router)
 app.include_router(ui_analysis.router)
 app.include_router(internal_tasks.router)
 app.include_router(ws_web.router)

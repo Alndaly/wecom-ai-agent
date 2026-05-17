@@ -266,5 +266,7 @@ export type Robot = {
   screen_width: number | null;
   screen_height: number | null;
   last_seen_at: string | null;
+  // null means "no per-device override; fall through to team default"
+  persona_id: string | null;
   created_at: string;
 };

@@ -43,6 +43,9 @@ _ALLOWED: dict[str, set[str]] = {
         "agent_mode",
         "agent_max_steps",
         "react_force_llm",
+        # Which persona (app/ai/personas/<id>/) shapes the conv_agent's
+        # voice. Empty/unknown falls back to "default".
+        "persona_id",
     },
     "parser": {
         "backend",
@@ -84,6 +87,7 @@ def _env_defaults(scope: str) -> dict[str, Any]:
             "agent_mode": settings.agent_mode_enabled,
             "agent_max_steps": settings.conv_max_steps,
             "react_force_llm": settings.react_force_llm,
+            "persona_id": "default",
         }
     if scope == "parser":
         return {

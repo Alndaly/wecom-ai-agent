@@ -343,8 +343,22 @@ async def _generate_via_agent(
     state: AIState, db: AsyncSession, provider, fallback_provider, llm_cfg: dict, ai_cfg: dict
 ) -> Decision:
     from .conv_agent import run_conv_agent
+    from .personas import get_persona
 
-    system_parts = [state.prompt]
+    system_parts: list[str] = []
+    # Persona goes FIRST so it sets the voice before anything else; the
+    # operator's `default_prompt` can override / extend specific business
+    # rules below. Resolution order:
+    #   1. Robot-level override (`Robot.persona_id`) — set on a per-device basis
+    #   2. Team default (`ai.persona_id`) — set in the settings UI
+    #   3. The literal "default" persona on disk
+    # Each fallback only kicks in when the prior layer is empty/unknown.
+    persona_id = (state.robot.persona_id or "").strip() or ai_cfg.get("persona_id")
+    persona = get_persona(persona_id)
+    if persona is not None:
+        system_parts.append(persona.system_block)
+    if state.prompt:
+        system_parts.append(state.prompt)
     if state.memory_summary:
         system_parts.append(f"【客户画像】{state.memory_summary}")
     # Pre-retrieval context is still nice as a *hint*, but the agent is free
@@ -352,7 +366,7 @@ async def _generate_via_agent(
     kb_block = state.retrieval.to_context()
     if kb_block:
         system_parts.append(kb_block)
-    system_prompt = "\n\n".join(system_parts)
+    system_prompt = "\n\n".join(p for p in system_parts if p)
 
     # Pass the full unreplied chain. The agent decides whether to answer
     # them all in one message or split into several.

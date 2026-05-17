@@ -13,12 +13,20 @@ import {
   Radio,
   Send,
   ShieldAlert,
+  Sparkles,
   Square,
   Smartphone,
   Trash2,
   Wand2,
   XCircle,
 } from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { api, type Robot, type RobotTaskLog } from "@/lib/api";
 import { formatFull } from "@/lib/datetime";
@@ -88,6 +96,12 @@ export default function DeviceDetailPage() {
   const [agentGoal, setAgentGoal] = useState("");
   const [agentMaxSteps, setAgentMaxSteps] = useState(8);
   const [agentSubmitting, setAgentSubmitting] = useState(false);
+  // Per-device persona override. The list is loaded lazily and the
+  // dropdown saves on change via PATCH /robots/{id}.
+  const [personas, setPersonas] = useState<
+    { id: string; name: string; description: string }[]
+  >([]);
+  const [personaSaving, setPersonaSaving] = useState(false);
 
   useEffect(() => {
     if (!Number.isFinite(id)) return;
@@ -97,6 +111,35 @@ export default function DeviceDetailPage() {
       .catch((e: any) => toast.error("加载设备失败", { description: e?.message ?? String(e) }))
       .finally(() => setLoading(false));
   }, [id]);
+
+  // Personas list — only needed for the picker on this page. Lazy-fetched
+  // once, no auto-refresh. If a new persona was created elsewhere, the
+  // operator can re-open this page to pick it up.
+  useEffect(() => {
+    api<{ id: string; name: string; description: string }[]>("/personas")
+      .then(setPersonas)
+      .catch(() => {
+        /* picker just won't show extra options — non-fatal */
+      });
+  }, []);
+
+  async function savePersona(value: string) {
+    // Empty string ("") = clear the per-device override and fall back to
+    // team-level. The PATCH endpoint distinguishes that from `undefined`.
+    setPersonaSaving(true);
+    try {
+      const updated = await api<Robot>(`/robots/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ persona_id: value }),
+      });
+      setRobot(updated);
+      toast.success(value ? `已切换到「${value}」人格` : "已清除独立人格设置");
+    } catch (e: any) {
+      toast.error("保存失败", { description: e?.message ?? String(e) });
+    } finally {
+      setPersonaSaving(false);
+    }
+  }
 
   useEffect(() => {
     if (!Number.isFinite(id)) return;
@@ -391,6 +434,47 @@ export default function DeviceDetailPage() {
                 <InfoRow label="Agent" value={robot.app_version ?? "未知"} />
                 <InfoRow label="最近上线" value={robot.last_seen_at ? formatFull(robot.last_seen_at) : "-"} />
               </div>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-lg shadow-sm">
+            <CardHeader className="border-b p-4">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Sparkles className="h-4 w-4 text-muted-foreground" />
+                人格 (per-device)
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 p-4 text-sm">
+              <Select
+                // Sentinel `__team_default__` represents the cleared state —
+                // the underlying field is nullable but shadcn's Select can't
+                // bind to "" as a real value. We translate on save.
+                value={robot.persona_id ?? "__team_default__"}
+                onValueChange={(v) => savePersona(v === "__team_default__" ? "" : v)}
+                disabled={personaSaving}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__team_default__">
+                    跟随团队设置(默认)
+                  </SelectItem>
+                  {personas.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name} · {p.id}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                空 = 用团队默认。设置后,这台设备上的对话客服会用指定人格;
+                在
+                <Link href="/personas" className="ml-1 underline">
+                  人格管理
+                </Link>
+                里编辑。
+              </p>
             </CardContent>
           </Card>
 

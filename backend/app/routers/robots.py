@@ -37,6 +37,7 @@ from app.schemas import (
     RobotOut,
     RobotTaskLogOut,
     RobotUiDumpRequestOut,
+    RobotUpdateIn,
 )
 
 log = logging.getLogger(__name__)
@@ -108,6 +109,46 @@ async def get_robot(
     robot = await db.get(Robot, rid)
     if not robot or robot.team_id != user.team_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    return robot
+
+
+@router.patch("/{rid}", response_model=RobotOut)
+async def update_robot(
+    rid: int,
+    body: RobotUpdateIn,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Robot:
+    """Patch a robot's editable fields. Currently supports `name` and
+    `persona_id`. Pass `persona_id=""` to clear an override and fall back
+    to the team-level persona."""
+    robot = await db.get(Robot, rid)
+    if not robot or robot.team_id != user.team_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "robot not found")
+    if body.name is not None:
+        robot.name = body.name
+    if body.persona_id is not None:
+        # Validate against the actual persona index so we never accept a
+        # value that won't resolve at decision time. Empty string is
+        # special-cased as "clear".
+        from app.ai.personas import _index, _validated_id, PersonaError
+
+        clean = (body.persona_id or "").strip()
+        if clean == "":
+            robot.persona_id = None
+        else:
+            try:
+                safe = _validated_id(clean)
+            except PersonaError as e:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+            if safe not in _index():
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"persona_id '{safe}' does not exist",
+                )
+            robot.persona_id = safe
+    await db.commit()
+    await db.refresh(robot)
     return robot
 
 
