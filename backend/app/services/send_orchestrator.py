@@ -24,7 +24,6 @@ from app.services import settings_service
 log = logging.getLogger(__name__)
 
 _REACT_PREFIX = "[react] "
-_MAX_AUTO_REPLY_SEND_ATTEMPTS = 2
 _AUTO_REPLY_RETRY_DELAY_SEC = 5.0
 
 
@@ -287,7 +286,7 @@ async def run_send_task(task_id: int) -> None:
                 if ai_cfg.get("react_force_llm") is not None
                 else settings.react_force_llm
             )
-            max_attempts = min(int(task.max_attempts or 1), _MAX_AUTO_REPLY_SEND_ATTEMPTS)
+            max_attempts = min(int(task.max_attempts or 1), settings.react_send_max_attempts)
             result = None
             media_error: str | None = None
             try:
@@ -296,7 +295,7 @@ async def run_send_task(task_id: int) -> None:
                         db,
                         robot,
                         goal,
-                        max_steps=settings.react_max_steps,
+                        max_steps=settings.react_text_max_steps,
                         step_timeout=settings.react_step_timeout_sec,
                         log_sink=_sink,
                         force_llm=force_llm,
@@ -594,7 +593,7 @@ async def _handle_send_failure(
 ) -> int | None:
     task.attempts = int(task.attempts or 0) + 1
     task.last_error = error
-    if task.attempts < min(int(task.max_attempts or 1), _MAX_AUTO_REPLY_SEND_ATTEMPTS):
+    if task.attempts < min(int(task.max_attempts or 1), settings.react_send_max_attempts):
         task.status = "dispatched"
         await _mark_feedback_messages(db, task, "pending")
         if task.message_id:

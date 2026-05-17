@@ -37,33 +37,40 @@ class Settings(BaseSettings):
     task_executor_timeout_sec: float = 1800.0
     auto_reply_enabled: bool = True
     inbound_content_dedupe_enabled: bool = False
-    # When a deterministic UI task fails, escalate to the ReAct fallback agent
-    # (observes UI tree, asks LLM, executes primitives). Off by default — it
-    # costs extra LLM calls per failure.
+    # ---- ReAct device-automation agent (observes UI tree, taps/inputs) ----
+    # When a deterministic UI task fails, escalate to the ReAct fallback
+    # agent. Off costs an extra LLM call per failure.
     react_fallback_enabled: bool = True
-    react_max_steps: int = 6
+    # Per-step wallclock budget — one dump_ui / tap / input must finish in
+    # this many seconds or it counts as failed.
     react_step_timeout_sec: float = 12.0
-    # Skill-refinement background task fires an LLM call too. On single-slot
-    # local backends (Ollama) we wait for full idleness (0 concurrent agents)
-    # so refine doesn't starve the active ReAct step. On remote providers
-    # that accept concurrent requests, allow refine to fire alongside up to
-    # this many in-flight agent sessions. 0 = strict idle, N = "fire when
-    # active agents ≤ N". Default is permissive enough for most remote
-    # endpoints but still leaves headroom under heavy load.
-    react_refine_max_concurrent_agents: int = 2
-    # Media send is a separate ReAct phase after the chat opens (compose_plus
-    # → media_picker_entry → gallery_first_item → preview/send). Each step is
-    # one tap, plus a few exploratory steps the first time before the
-    # locator cache primes. 14 leaves headroom; the loop exits early on done().
+    # ReAct loop budgets per phase. Different ceilings because the work is
+    # genuinely different in length:
+    #   - text_max_steps: text send + chat open (one tap, one input, one send)
+    #   - media_max_steps: media phase B (compose_plus → picker_entry →
+    #     gallery_first_item → preview/send, plus exploration buffer)
+    react_text_max_steps: int = 6
     react_media_max_steps: int = 14
+    # Number of times an end-to-end send task retries from scratch if its
+    # ReAct loop returns failure. Independent of the per-loop step budget.
+    react_send_max_attempts: int = 2
     # When False (default): deterministic locators try first, LLM is fallback
     # (cheaper and faster for routine flows). When True: every step goes to
     # the LLM with UI tree + screenshot, no rule shortcut. AI always picks a
     # node id (never raw x/y) — backend resolves to coordinates.
     react_force_llm: bool = False
-    # ---- Conversational agent (ReAct + Tools / Skills / MCP) ----
+    # Skill-refinement background task fires an LLM call too. On single-slot
+    # local backends (Ollama) we wait for full idleness (0 concurrent agents)
+    # so refine doesn't starve the active ReAct step. On remote providers
+    # that accept concurrent requests, allow refine to fire alongside up to
+    # this many in-flight agent sessions. 0 = strict idle, N = "fire when
+    # active agents ≤ N".
+    react_refine_max_concurrent_agents: int = 2
+    # ---- Conversational agent (handles inbound customer messages) ----
     agent_mode_enabled: bool = True
-    agent_max_steps: int = 5
+    # ReAct-style tool-use loop ceiling. The team may override this from
+    # `ai.agent_max_steps` settings; this is the global fallback.
+    conv_max_steps: int = 5
     # Where to look for user-authored skill modules. Each *.py exports `tool`
     # (or `tools: list[Tool]`); see app/ai/tools/skills.py for an example.
     skills_dir: str = "skills"

@@ -82,7 +82,7 @@ def _env_defaults(scope: str) -> dict[str, Any]:
             "default_prompt": settings.ai_default_prompt,
             "max_tokens": settings.ai_max_tokens,
             "agent_mode": settings.agent_mode_enabled,
-            "agent_max_steps": settings.agent_max_steps,
+            "agent_max_steps": settings.conv_max_steps,
             "react_force_llm": settings.react_force_llm,
         }
     if scope == "parser":

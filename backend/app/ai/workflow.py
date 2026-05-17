@@ -372,7 +372,7 @@ async def _generate_via_agent(
         fallback_provider=fallback_provider,
         temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),
         max_tokens=int(ai_cfg.get("max_tokens") or settings.ai_max_tokens),
-        max_steps=int(ai_cfg.get("agent_max_steps") or settings.agent_max_steps),
+        max_steps=int(ai_cfg.get("agent_max_steps") or settings.conv_max_steps),
     )
 
     # Merge agent-discovered KB hits with the pre-retrieval set so the Web
