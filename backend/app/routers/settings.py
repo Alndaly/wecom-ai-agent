@@ -4,7 +4,7 @@ Scopes:
   - llm        provider / model / api_key / base_url / temperature
   - embedding  provider / model / api_key / base_url / dim
   - retrieval  top_k / min_score
-  - ai         confidence_threshold / context_window / default_prompt
+  - ai         confidence_threshold / context_window / persona_id
 
 `api_key` is write-only: GET returns a masked placeholder so we never leak
 secrets back to the browser; PUT only updates the key if a non-empty value
@@ -97,7 +97,6 @@ class RetrievalIn(BaseModel):
 class AIBehaviorIn(BaseModel):
     confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     context_window: int = Field(default=10, ge=1, le=50)
-    default_prompt: str = ""
     max_tokens: int = Field(default=8192, ge=64, le=32768)
     agent_mode: bool = True
     agent_max_steps: int = Field(default=5, ge=1, le=20)

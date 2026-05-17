@@ -286,7 +286,7 @@ class TeamSetting(Base):
       - "llm"        → provider, model, api_key, base_url, temperature
       - "embedding"  → provider, model, api_key, base_url, dim
       - "retrieval"  → top_k, min_score
-      - "ai"         → confidence_threshold, context_window, default_prompt
+      - "ai"         → confidence_threshold, context_window, persona_id
     """
     __tablename__ = "team_settings"
     __table_args__ = (UniqueConstraint("team_id", "key", name="uq_team_setting"),)

@@ -36,11 +36,19 @@ import {
 	AlertDialogHeader,
 	AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import {
+	RobotPersonaSelect,
+	type PersonaSummary,
+} from './components/RobotPersonaSelect';
 
 export default function DevicesPage() {
 	const [robots, setRobots] = useState<Robot[]>([]);
+	const [personas, setPersonas] = useState<PersonaSummary[]>([]);
 	const [name, setName] = useState('');
 	const [creating, setCreating] = useState(false);
+	const [savingPersonaRobotId, setSavingPersonaRobotId] = useState<number | null>(
+		null,
+	);
 	const [justCreated, setJustCreated] = useState<{
 		robot: Robot;
 		token: string;
@@ -66,6 +74,14 @@ export default function DevicesPage() {
 	}
 	useEffect(() => {
 		reload();
+	}, []);
+
+	useEffect(() => {
+		api<PersonaSummary[]>('/personas')
+			.then(setPersonas)
+			.catch(() => {
+				/* The picker can still render team-default fallback. */
+			});
 	}, []);
 
 	useWebWs((event, payload) => {
@@ -152,6 +168,28 @@ export default function DevicesPage() {
 		}
 	}
 
+	async function saveRobotPersona(robot: Robot, value: string) {
+		setSavingPersonaRobotId(robot.id);
+		try {
+			const updated = await api<Robot>(`/robots/${robot.id}`, {
+				method: 'PATCH',
+				body: JSON.stringify({
+					persona_id: value === '__team_default__' ? '' : value,
+				}),
+			});
+			setRobots((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+			toast.success(
+				value === '__team_default__'
+					? `已让 ${robot.name} 跟随团队人格`
+					: `已设置 ${robot.name} 的人格`,
+			);
+		} catch (e: any) {
+			toast.error('保存人格失败', { description: e?.message ?? String(e) });
+		} finally {
+			setSavingPersonaRobotId(null);
+		}
+	}
+
 	return (
 		<div className='space-y-6'>
 			<div className='flex items-center justify-between'>
@@ -190,6 +228,7 @@ export default function DevicesPage() {
 								<TableHead>名称</TableHead>
 								<TableHead>robot_id</TableHead>
 								<TableHead>状态</TableHead>
+								<TableHead>客服人格</TableHead>
 								<TableHead>最近上线</TableHead>
 								<TableHead className='w-28'></TableHead>
 							</TableRow>
@@ -198,7 +237,7 @@ export default function DevicesPage() {
 							{robots.length === 0 && (
 								<TableRow>
 									<TableCell
-										colSpan={6}
+										colSpan={7}
 										className='py-10 text-center text-sm text-muted-foreground'>
 										暂无设备
 									</TableCell>
@@ -222,6 +261,14 @@ export default function DevicesPage() {
 											variant={r.status === 'online' ? 'success' : 'secondary'}>
 											{r.status}
 										</Badge>
+									</TableCell>
+									<TableCell>
+										<RobotPersonaSelect
+											value={r.persona_id ?? '__team_default__'}
+											personas={personas}
+											onChange={(value) => saveRobotPersona(r, value)}
+											disabled={savingPersonaRobotId === r.id}
+										/>
 									</TableCell>
 									<TableCell className='text-xs text-muted-foreground'>
 										{r.last_seen_at ? formatFull(r.last_seen_at) : '—'}

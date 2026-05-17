@@ -149,6 +149,16 @@ async def update_robot(
             robot.persona_id = safe
     await db.commit()
     await db.refresh(robot)
+    await hub.broadcast_web(
+        user.team_id,
+        "robot.updated",
+        {
+            "id": robot.id,
+            "robot_id": robot.robot_id,
+            "name": robot.name,
+            "persona_id": robot.persona_id,
+        },
+    )
     return robot
 
 

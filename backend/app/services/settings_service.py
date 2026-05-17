@@ -38,7 +38,6 @@ _ALLOWED: dict[str, set[str]] = {
     "ai": {
         "confidence_threshold",
         "context_window",
-        "default_prompt",
         "max_tokens",
         "agent_mode",
         "agent_max_steps",
@@ -82,7 +81,6 @@ def _env_defaults(scope: str) -> dict[str, Any]:
         return {
             "confidence_threshold": settings.ai_confidence_threshold,
             "context_window": settings.ai_context_window,
-            "default_prompt": settings.ai_default_prompt,
             "max_tokens": settings.ai_max_tokens,
             "agent_mode": settings.agent_mode_enabled,
             "agent_max_steps": settings.conv_max_steps,

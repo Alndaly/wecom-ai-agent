@@ -27,7 +27,6 @@ from app.core.config import settings
 from app.core.ws_manager import hub
 from app.kb.retriever import RetrievalResult, retrieve
 from app.models import (
-    AIPrompt,
     AIReplyLog,
     Conversation,
     Message,
@@ -80,7 +79,6 @@ class AIState:
     robot: Robot
     inbound: Message
     history: list[Message] = field(default_factory=list)
-    prompt: str = ""
     memory_summary: str = ""
     retrieval: RetrievalResult = field(default_factory=RetrievalResult)
     trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -118,7 +116,6 @@ async def handle_inbound(
     )
 
     # 2. context
-    state.prompt = await _load_prompt(db, conv.team_id, ai_cfg)
     state.memory_summary = await _load_memory(db, conv.contact_id)
     state.unreplied_chain = await _load_unreplied_chain(db, conv.id)
     state.history = await _load_history(db, conv.id, state.context_window)
@@ -194,19 +191,6 @@ async def _load_history(db: AsyncSession, conversation_id: int, limit: int) -> l
     return list(reversed(rows))
 
 
-async def _load_prompt(db: AsyncSession, team_id: int, ai_cfg: dict) -> str:
-    """Prefer team-saved prompt in ai_prompts, then settings UI default, then env."""
-    row = (
-        await db.execute(
-            select(AIPrompt).where(AIPrompt.team_id == team_id, AIPrompt.key == "default")
-        )
-    ).scalar_one_or_none()
-    if row and row.content:
-        return row.content
-    cfg_prompt = (ai_cfg.get("default_prompt") or "").strip()
-    return cfg_prompt or settings.ai_default_prompt
-
-
 async def _load_memory(db: AsyncSession, contact_id: int) -> str:
     prof = await db.get(UserProfile, contact_id)
     return (prof.summary or "") if prof else ""
@@ -232,7 +216,7 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
     if _agent_enabled(ai_cfg):
         return await _generate_via_agent(state, db, provider, fallback_provider, llm_cfg, ai_cfg)
 
-    system_parts = [state.prompt]
+    system_parts = _persona_system_parts(state, ai_cfg)
     if state.memory_summary:
         system_parts.append(f"【客户画像】{state.memory_summary}")
     kb_block = state.retrieval.to_context()
@@ -343,22 +327,8 @@ async def _generate_via_agent(
     state: AIState, db: AsyncSession, provider, fallback_provider, llm_cfg: dict, ai_cfg: dict
 ) -> Decision:
     from .conv_agent import run_conv_agent
-    from .personas import get_persona
 
-    system_parts: list[str] = []
-    # Persona goes FIRST so it sets the voice before anything else; the
-    # operator's `default_prompt` can override / extend specific business
-    # rules below. Resolution order:
-    #   1. Robot-level override (`Robot.persona_id`) — set on a per-device basis
-    #   2. Team default (`ai.persona_id`) — set in the settings UI
-    #   3. The literal "default" persona on disk
-    # Each fallback only kicks in when the prior layer is empty/unknown.
-    persona_id = (state.robot.persona_id or "").strip() or ai_cfg.get("persona_id")
-    persona = get_persona(persona_id)
-    if persona is not None:
-        system_parts.append(persona.system_block)
-    if state.prompt:
-        system_parts.append(state.prompt)
+    system_parts = _persona_system_parts(state, ai_cfg)
     if state.memory_summary:
         system_parts.append(f"【客户画像】{state.memory_summary}")
     # Pre-retrieval context is still nice as a *hint*, but the agent is free
@@ -420,6 +390,21 @@ async def _generate_via_agent(
         kb_context=res.kb_context or state.retrieval.to_context(),
         reason=f"agent_steps={res.steps}",
     )
+
+
+def _persona_system_parts(state: AIState, ai_cfg: dict) -> list[str]:
+    """Return persona prompt blocks for both direct and ReAct reply paths.
+
+    Resolution order:
+      1. Robot-level override (`Robot.persona_id`) — per-device voice
+      2. Team default (`ai.persona_id`) — settings UI
+      3. The literal "default" persona on disk
+    """
+    from .personas import get_persona
+
+    persona_id = (state.robot.persona_id or "").strip() or ai_cfg.get("persona_id")
+    persona = get_persona(persona_id)
+    return [persona.system_block] if persona is not None else []
 
 
 async def _finalize(db: AsyncSession, state: AIState, decision: Decision) -> None:

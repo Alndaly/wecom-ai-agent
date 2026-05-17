@@ -16,8 +16,7 @@ Layout:
         └── style.md          ← speaking style + anti-AI tells
 
 The loader concatenates the three injected files in a fixed order
-(`soul → memory → style`) into a single system-prompt block that gets
-appended to whatever the team already configured under `ai.default_prompt`.
+(`soul → memory → style`) into a single system-prompt block.
 
 The active persona is picked by the team's `ai.persona_id` setting; if a
 team hasn't chosen one or the chosen one doesn't exist, we fall back to

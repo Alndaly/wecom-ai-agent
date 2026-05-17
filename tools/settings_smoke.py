@@ -88,7 +88,7 @@ async def main() -> int:
             json={
                 "confidence_threshold": 0.7,
                 "context_window": 6,
-                "default_prompt": "测试用提示词",
+                "persona_id": "default",
             },
         )
         r.raise_for_status()
@@ -99,7 +99,7 @@ async def main() -> int:
         assert abs(cur["retrieval"]["min_score"] - 0.1) < 1e-9
         assert cur["ai"]["confidence_threshold"] == 0.7
         assert cur["ai"]["context_window"] == 6
-        assert cur["ai"]["default_prompt"] == "测试用提示词"
+        assert cur["ai"]["persona_id"] == "default"
         assert cur["llm"]["api_key"] in ("", "********")  # masked
         print("[settings-smoke] read-back fields persisted OK")
 

@@ -114,5 +114,4 @@ async def info(user: User = Depends(current_user)) -> dict:
         "provider": settings.llm_provider,
         "model": settings.llm_model,
         "confidence_threshold": settings.ai_confidence_threshold,
-        "default_prompt_fallback": settings.ai_default_prompt,
     }
