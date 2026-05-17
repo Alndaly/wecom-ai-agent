@@ -61,6 +61,11 @@ class Decision:
     # Multi-reply: the agent may emit several short messages instead of one
     # paragraph. When empty, callers should fall back to [text] for compat.
     replies: list[str] = field(default_factory=list)
+    # Customer inbound message ids that this decision actually considered.
+    # The scheduler uses this to bind one outbound task to the whole current
+    # unreplied turn, including messages that arrived while the worker was
+    # already generating.
+    feedback_message_ids: list[int] = field(default_factory=list)
 
     @property
     def all_texts(self) -> list[str]:
@@ -135,6 +140,8 @@ async def handle_inbound(
     decision.memory_summary = state.memory_summary
     decision.kb_hit_ids = [h.chunk_id for h in state.retrieval.hits]
     decision.kb_context = state.retrieval.to_context()
+    if not decision.feedback_message_ids:
+        decision.feedback_message_ids = [m.id for m in state.unreplied_chain] or [message.id]
 
     # 4. confidence gate → escalate to human if mixed mode + low confidence
     if (

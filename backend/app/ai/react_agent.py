@@ -121,6 +121,7 @@ class AgentStep:
     ok: bool
     message: str
     elapsed_ms: int
+    obs_meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -223,6 +224,13 @@ async def run_react(
                 steps=steps,
             )
 
+        if _degraded_wecom_observation(obs):
+            return AgentResult(
+                ok=False,
+                summary="企业微信 UI 树不完整（UNKNOWN/节点过少），停止盲操作并等待重试",
+                steps=steps,
+            )
+
         # ---- decide ----
         if force_llm:
             decision, decision_source = None, "llm"
@@ -307,6 +315,7 @@ async def run_react(
             return AgentResult(ok=False, summary=f"未知动作 {action}", steps=steps)
 
         # ---- act (resolve node_id → device primitive) ----
+        obs_meta = _action_observation_meta(action, args, obs, goal)
         t0 = time.monotonic()
         used_node = _lookup_node(obs, args.get("node_id"))
         try:
@@ -360,7 +369,7 @@ async def run_react(
         elif decision_source == "cache" and not ok:
             locator_store.remember_failure(role=role)
             await _log("warn", f"[react] cached locator failed role={role or 'unknown'}; will fallback if needed")
-        steps.append(AgentStep(i, thought, action, args, ok, msg, elapsed))
+        steps.append(AgentStep(i, thought, action, args, ok, msg, elapsed, obs_meta=obs_meta))
         await asyncio.sleep(0.4)
 
     total = int((time.monotonic() - started) * 1000)
@@ -426,8 +435,14 @@ async def _final_send_verdict(
         # trigger retry.
         target = parsed.target if parsed else "目标联系人"
         return True, f"已点击发送按钮，但最终确认失败：{e}；按已发送处理，避免重复发送给 {target}。"
-    verdict = _verify_send_cleared(obs, parsed.text if parsed else "")
+    verdict = _verify_send_cleared(
+        obs,
+        parsed.text if parsed else "",
+        baseline=(last.obs_meta or {}).get("sent_echo_before"),
+    )
     target = parsed.target if parsed else "目标联系人"
+    if verdict == "sent_echo":
+        return True, f"已向 {target} 发送消息。"
     if verdict == "still_filled":
         return False, "已点击发送按钮，但输入框仍含待发送文本，发送未确认。"
     return True, f"已向 {target} 发送消息。"
@@ -541,10 +556,16 @@ def _fast_decide(
         # ground truth is whether the input box is now clear. If the input
         # still contains the goal text, the send did NOT actually happen
         # and we must NOT report success.
-        verdict = _verify_send_cleared(obs, text)
-        if verdict == "cleared":
+        send_step = _last_success_step(history, "tap_node", locator_role="send_button")
+        verdict = _verify_send_cleared(
+            obs,
+            text,
+            baseline=((send_step.obs_meta or {}).get("sent_echo_before") if send_step else None),
+        )
+        if verdict in {"sent_echo", "cleared"}:
+            reason = "已看到自己发送的消息气泡" if verdict == "sent_echo" else "输入框已清空"
             return {
-                "thought": "点击发送按钮后输入框已清空，确认发送成功。",
+                "thought": f"点击发送按钮后{reason}，确认发送成功。",
                 "action": "done",
                 "args": {"success": True, "summary": f"已向 {target} 发送消息。"},
             }, "rule"
@@ -699,6 +720,19 @@ def _is_wecom_tree(tree: str) -> bool:
     return "pkg=com.tencent.wework" in header
 
 
+def _degraded_wecom_observation(obs: _Observation) -> bool:
+    if not _is_wecom_tree(obs.tree):
+        return False
+    if _root_page(obs.tree) != "UNKNOWN":
+        return False
+    if len(obs.nodes) > 12:
+        return False
+    if any(n.editable or n.scrollable for n in obs.nodes.values()):
+        return False
+    labeled = [n for n in obs.nodes.values() if _node_label(n)]
+    return len(labeled) <= 2
+
+
 def _in_target_chat(obs: _Observation, target: str) -> bool:
     """True iff the current chat page's title bar shows `target`.
 
@@ -791,13 +825,16 @@ def _post_tap_verdict(prev_step: AgentStep, obs: _Observation, goal: str) -> str
     )
     if not looks_like_send:
         return None
+    parsed = parse_send_goal(goal)
+    baseline = (prev_step.obs_meta or {}).get("sent_echo_before")
+    if parsed and _find_new_sent_message_echo(obs, parsed.text, baseline) is not None:
+        return "已看到自己发送的消息气泡，发送已生效"
     input_node = _find_message_input(obs)
     if input_node is None:
         return "未找到输入框，无法验证"
     cur = (input_node.text or "").strip()
     if not cur:
         return "输入框已清空，发送已生效"
-    parsed = parse_send_goal(goal)
     if parsed and parsed.text.strip() in cur:
         return f"输入框仍含待发送文本「{cur}」—— 此次点击未触发发送，请换一个节点尝试或确认按钮是否可用"
     if parsed and parsed.text.strip() not in cur:
@@ -852,10 +889,16 @@ def _stuck_repeating(steps: list[AgentStep], *, n: int = 3) -> bool:
     )
 
 
-def _verify_send_cleared(obs: _Observation, sent_text: str) -> str:
-    """Return 'cleared' if the message input no longer holds `sent_text`,
-    'still_filled' if it does (tap missed), 'unknown' if we couldn't even
-    find the input box (e.g. layout changed)."""
+def _verify_send_cleared(
+    obs: _Observation,
+    sent_text: str,
+    baseline: dict[str, int] | None = None,
+) -> str:
+    """Return 'sent_echo' if the sent bubble is visible, 'cleared' if the
+    message input no longer holds `sent_text`, 'still_filled' if it does
+    (tap missed), 'unknown' if we couldn't even find the input box."""
+    if _find_new_sent_message_echo(obs, sent_text, baseline) is not None:
+        return "sent_echo"
     node = _find_message_input(obs)
     if node is None:
         return "unknown"
@@ -868,6 +911,62 @@ def _verify_send_cleared(obs: _Observation, sent_text: str) -> str:
     # Different text entirely (rare — would mean someone else is typing).
     # Treat as cleared so we don't loop on a phantom mismatch.
     return "cleared"
+
+
+def _find_sent_message_echo(obs: _Observation, sent_text: str) -> UiNode | None:
+    candidates = _sent_message_echo_candidates(obs, sent_text)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda n: n.bounds[1])
+
+
+def _sent_message_echo_stats(obs: _Observation, sent_text: str) -> dict[str, int]:
+    candidates = _sent_message_echo_candidates(obs, sent_text)
+    if not candidates:
+        return {"count": 0, "max_bottom": 0}
+    return {"count": len(candidates), "max_bottom": max(n.bounds[3] for n in candidates)}
+
+
+def _find_new_sent_message_echo(
+    obs: _Observation,
+    sent_text: str,
+    baseline: dict[str, int] | None,
+) -> UiNode | None:
+    if baseline is None:
+        return None
+    candidates = _sent_message_echo_candidates(obs, sent_text)
+    if not candidates:
+        return None
+    before_count = int(baseline.get("count") or 0)
+    before_bottom = int(baseline.get("max_bottom") or 0)
+    newest = max(candidates, key=lambda n: n.bounds[3])
+    if len(candidates) > before_count:
+        return newest
+    if before_count > 0 and newest.bounds[3] > before_bottom + 16:
+        return newest
+    return None
+
+
+def _sent_message_echo_candidates(obs: _Observation, sent_text: str) -> list[UiNode]:
+    needle = (sent_text or "").strip()
+    if not needle:
+        return []
+    screen_w, screen_h = obs.screen_size if obs.screen_size else (0, 0)
+    candidates: list[UiNode] = []
+    for node in obs.nodes.values():
+        if len(node.bounds) != 4:
+            continue
+        if (node.text or "").strip() != needle:
+            continue
+        if screen_w > 0 and screen_h > 0:
+            l, t, r, b = node.bounds
+            center_x = (l + r) / 2
+            if center_x < screen_w * 0.42:
+                continue
+            if t < screen_h * 0.10 or b > screen_h * 0.94:
+                continue
+        candidates.append(node)
+    return candidates
 
 
 def _find_message_input(obs: _Observation) -> UiNode | None:
@@ -993,6 +1092,23 @@ def _last_success(
     return False
 
 
+def _last_success_step(
+    history: list[AgentStep],
+    action: str,
+    *,
+    locator_role: str | None = None,
+) -> AgentStep | None:
+    for step in reversed(history):
+        if step.action != action:
+            continue
+        if not step.ok:
+            return None
+        if locator_role and step.args.get("_locator_role") != locator_role:
+            continue
+        return step
+    return None
+
+
 # ---- decide --------------------------------------------------------------
 def _vision_enabled(llm_cfg: dict) -> bool:
     """Vision is on when either env default or per-team override says so."""
@@ -1104,7 +1220,7 @@ async def _execute(
         if node is None:
             return False, f"node_id={args.get('node_id')} 不在 UI tree 中"
         cx, cy = node.center
-        ack = await device.tap_node(node.id, cx, cy, timeout=step_timeout)
+        ack = await device.tap_node(node.id, cx, cy, expected=_node_expectation(node), timeout=step_timeout)
         label = _node_label(node)
         label_part = f" label={label!r}" if label else ""
         return ack.ok, f"tap_node({node.id}{label_part}) node_action_or_xy=({cx},{cy}) -> {ack.message or ''}"
@@ -1115,7 +1231,14 @@ async def _execute(
             return False, f"node_id={args.get('node_id')} 不在 UI tree 中"
         cx, cy = node.center
         duration_ms = _coerce_duration_ms(args.get("duration_ms"), default=650, min_ms=350, max_ms=3000)
-        ack = await device.long_press_node(node.id, cx, cy, duration_ms=duration_ms, timeout=step_timeout)
+        ack = await device.long_press_node(
+            node.id,
+            cx,
+            cy,
+            expected=_node_expectation(node),
+            duration_ms=duration_ms,
+            timeout=step_timeout,
+        )
         label = _node_label(node)
         label_part = f" label={label!r}" if label else ""
         return ack.ok, (
@@ -1128,7 +1251,7 @@ async def _execute(
         if node is None:
             return False, f"node_id={args.get('node_id')} 不在 UI tree 中"
         cx, cy = node.center
-        ack = await device.double_tap_node(node.id, cx, cy, timeout=step_timeout)
+        ack = await device.double_tap_node(node.id, cx, cy, expected=_node_expectation(node), timeout=step_timeout)
         label = _node_label(node)
         label_part = f" label={label!r}" if label else ""
         return ack.ok, f"double_tap_node({node.id}{label_part}) node_action_or_xy=({cx},{cy}) -> {ack.message or ''}"
@@ -1153,17 +1276,23 @@ async def _execute(
         node_id = args.get("node_id")
         text = args.get("text") or ""
         mode = _coerce_input_mode(args.get("mode"))
+        expected: dict[str, Any] | None = None
+        resolved_node_id: int | None = None
         if node_id is not None:
             node = _lookup_node(obs, node_id)
             if node is None:
                 return False, f"node_id={node_id} 不在 UI tree 中"
             if not node.editable:
                 return False, f"node {node_id} 不可编辑（cls={node.cls}）"
-            # Focus the input first (tap), then write text.
-            cx, cy = node.center
-            await device.tap_node(node.id, cx, cy, timeout=step_timeout)
-            await asyncio.sleep(0.25)
-        ack = await device.input_text(text, mode=mode, timeout=step_timeout)
+            resolved_node_id = node.id
+            expected = _node_expectation(node)
+        ack = await device.input_text(
+            text,
+            node_id=resolved_node_id,
+            expected=expected,
+            mode=mode,
+            timeout=step_timeout,
+        )
         return ack.ok, f"input_text(mode={mode}) -> {ack.message or ''}"
 
     if action == "swipe":
@@ -1201,6 +1330,32 @@ def _lookup_node(obs: _Observation, node_id: Any) -> UiNode | None:
     except (TypeError, ValueError):
         return None
     return obs.nodes.get(nid)
+
+
+def _action_observation_meta(
+    action: str,
+    args: dict[str, Any],
+    obs: _Observation,
+    goal: str,
+) -> dict[str, Any]:
+    role = str(args.get("_locator_role") or "")
+    if action == "tap_node" and role == "send_button":
+        parsed = parse_send_goal(goal)
+        if parsed is not None:
+            return {"sent_echo_before": _sent_message_echo_stats(obs, parsed.text)}
+    return {}
+
+
+def _node_expectation(node: UiNode) -> dict[str, Any]:
+    return {
+        "cls": node.cls,
+        "view_id": node.view_id,
+        "text": node.text,
+        "desc": node.desc,
+        "bounds": node.bounds,
+        "editable": node.editable,
+        "clickable": node.clickable,
+    }
 
 
 def _coerce_duration_ms(value: Any, *, default: int, min_ms: int, max_ms: int) -> int:

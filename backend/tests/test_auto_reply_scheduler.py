@@ -55,3 +55,21 @@ async def test_wake_robot_rechecks_pending_work_while_idle(monkeypatch):
 
     await auto_reply_scheduler.shutdown()
     assert processed == [42]
+
+
+def test_decision_feedback_ids_prefers_messages_seen_by_workflow():
+    decision = type("Decision", (), {"feedback_message_ids": [10, 11, 11]})()
+
+    assert auto_reply_scheduler._decision_feedback_ids(decision, [10]) == [10, 11]
+
+
+def test_decision_feedback_ids_falls_back_to_initial_batch():
+    decision = type("Decision", (), {"feedback_message_ids": []})()
+
+    assert auto_reply_scheduler._decision_feedback_ids(decision, [10]) == [10]
+
+
+def test_decision_feedback_ids_handles_legacy_decision_without_field():
+    decision = type("Decision", (), {})()
+
+    assert auto_reply_scheduler._decision_feedback_ids(decision, [12]) == [12]

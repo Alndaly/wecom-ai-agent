@@ -11,6 +11,16 @@ import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
+data class NodeExpectation(
+    val cls: String = "",
+    val viewId: String = "",
+    val text: String = "",
+    val desc: String = "",
+    val bounds: List<Int>? = null,
+    val editable: Boolean? = null,
+    val clickable: Boolean? = null,
+)
+
 /**
  * Generic device-level primitives the backend ReAct agent calls through
  * `device.command`. There is **no** WeCom-specific heuristic in here anymore
@@ -115,20 +125,26 @@ class WeComAutomator(
         return ok to if (ok) "已点击「$text」" else "节点不可点击"
     }
 
-    suspend fun reactTapNode(nodeId: Int, fallbackX: Int?, fallbackY: Int?): Pair<Boolean, String> {
+    suspend fun reactTapNode(
+        nodeId: Int,
+        fallbackX: Int?,
+        fallbackY: Int?,
+        expected: NodeExpectation = NodeExpectation(),
+    ): Pair<Boolean, String> {
         val svc = a11y() ?: return false to "无障碍未启用"
         val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
         val node = root.findByDumpId(nodeId)
         if (node != null) {
+            node.expectationMismatch(expected)?.let { return false to "节点 [$nodeId] 快照不匹配：$it" }
             val target = node.clickTarget()
             if (target != null && target.tap()) {
                 val label = target.label().ifBlank { target.className?.toString()?.substringAfterLast('.') ?: "node" }
                 return true to "已通过节点 ACTION_CLICK 点击 [$nodeId] $label"
             }
         }
-        if (fallbackX != null && fallbackY != null) {
+        if (node != null && fallbackX != null && fallbackY != null) {
             val ok = gestureTap(svc, fallbackX.toFloat(), fallbackY.toFloat())
-            val reason = if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_CLICK 失败"
+            val reason = "节点 ACTION_CLICK 失败"
             return ok to if (ok) "$reason，已坐标兜底 ($fallbackX, $fallbackY)" else "$reason，坐标兜底也失败"
         }
         return false to if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_CLICK 失败且缺少坐标兜底"
@@ -140,11 +156,17 @@ class WeComAutomator(
         return ok to if (ok) "已在 ($x, $y) 点击" else "手势失败"
     }
 
-    suspend fun reactDoubleTapNode(nodeId: Int, fallbackX: Int?, fallbackY: Int?): Pair<Boolean, String> {
+    suspend fun reactDoubleTapNode(
+        nodeId: Int,
+        fallbackX: Int?,
+        fallbackY: Int?,
+        expected: NodeExpectation = NodeExpectation(),
+    ): Pair<Boolean, String> {
         val svc = a11y() ?: return false to "无障碍未启用"
         val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
         val node = root.findByDumpId(nodeId)
         if (node != null) {
+            node.expectationMismatch(expected)?.let { return false to "节点 [$nodeId] 快照不匹配：$it" }
             val target = node.clickTarget()
             if (target != null && target.tap()) {
                 delay(120)
@@ -153,9 +175,9 @@ class WeComAutomator(
                 if (ok) return true to "已通过节点 ACTION_CLICK 双击 [$nodeId] $label"
             }
         }
-        if (fallbackX != null && fallbackY != null) {
+        if (node != null && fallbackX != null && fallbackY != null) {
             val ok = gestureDoubleTap(svc, fallbackX.toFloat(), fallbackY.toFloat())
-            val reason = if (node == null) "未找到节点 [$nodeId]" else "节点双击 ACTION_CLICK 失败"
+            val reason = "节点双击 ACTION_CLICK 失败"
             return ok to if (ok) "$reason，已坐标双击兜底 ($fallbackX, $fallbackY)" else "$reason，坐标双击也失败"
         }
         return false to if (node == null) "未找到节点 [$nodeId]" else "节点双击失败且缺少坐标兜底"
@@ -171,22 +193,24 @@ class WeComAutomator(
         nodeId: Int,
         fallbackX: Int?,
         fallbackY: Int?,
+        expected: NodeExpectation = NodeExpectation(),
         durationMs: Long = 650,
     ): Pair<Boolean, String> {
         val svc = a11y() ?: return false to "无障碍未启用"
         val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
         val node = root.findByDumpId(nodeId)
         if (node != null) {
+            node.expectationMismatch(expected)?.let { return false to "节点 [$nodeId] 快照不匹配：$it" }
             val target = node.longClickTarget()
             if (target != null && target.longPress()) {
                 val label = target.label().ifBlank { target.className?.toString()?.substringAfterLast('.') ?: "node" }
                 return true to "已通过节点 ACTION_LONG_CLICK 长按 [$nodeId] $label"
             }
         }
-        if (fallbackX != null && fallbackY != null) {
+        if (node != null && fallbackX != null && fallbackY != null) {
             val dur = durationMs.coerceIn(350L, 3_000L)
             val ok = gestureLongPress(svc, fallbackX.toFloat(), fallbackY.toFloat(), dur)
-            val reason = if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_LONG_CLICK 失败"
+            val reason = "节点 ACTION_LONG_CLICK 失败"
             return ok to if (ok) "$reason，已长按坐标兜底 ($fallbackX, $fallbackY) ${dur}ms" else "$reason，坐标长按也失败"
         }
         return false to if (node == null) "未找到节点 [$nodeId]" else "节点 ACTION_LONG_CLICK 失败且缺少坐标兜底"
@@ -212,13 +236,25 @@ class WeComAutomator(
         return ok to if (ok) "已滑动 ($x1,$y1)→($x2,$y2)" else "手势失败"
     }
 
-    suspend fun reactInputText(text: String, mode: String = "replace"): Pair<Boolean, String> {
+    suspend fun reactInputText(
+        text: String,
+        mode: String = "replace",
+        nodeId: Int? = null,
+        expected: NodeExpectation = NodeExpectation(),
+    ): Pair<Boolean, String> {
         val svc = a11y() ?: return false to "无障碍未启用"
         val root = svc.rootInActiveWindow ?: return false to "无活动窗口"
-        // Prefer the currently focused editable; fall back to any editable.
-        val edit = root.findFirst { it.isEditable && it.isFocused }
-            ?: root.findFirst { it.isEditable }
-            ?: return false to "未找到可编辑输入框"
+        val edit = if (nodeId != null) {
+            val node = root.findByDumpId(nodeId) ?: return false to "未找到节点 [$nodeId]"
+            node.expectationMismatch(expected)?.let { return false to "节点 [$nodeId] 快照不匹配：$it" }
+            if (!node.isEditable) return false to "节点 [$nodeId] 不是可编辑输入框"
+            node
+        } else {
+            // Prefer the currently focused editable; fall back to any editable.
+            root.findFirst { it.isEditable && it.isFocused }
+                ?: root.findFirst { it.isEditable }
+                ?: return false to "未找到可编辑输入框"
+        }
         val normalizedMode = mode.lowercase()
         val nextText = when (normalizedMode) {
             "append" -> edit.text?.toString().orEmpty() + text
@@ -346,6 +382,34 @@ private fun AccessibilityNodeInfo.findByDumpId(targetId: Int): AccessibilityNode
         return null
     }
     return walk(this)
+}
+
+private fun AccessibilityNodeInfo.expectationMismatch(expected: NodeExpectation): String? {
+    val cls = className?.toString()?.substringAfterLast('.') ?: ""
+    if (expected.cls.isNotBlank() && cls != expected.cls) return "cls $cls != ${expected.cls}"
+    val viewId = viewIdResourceName?.substringAfterLast('/').orEmpty()
+    if (expected.viewId.isNotBlank() && viewId != expected.viewId) return "view_id $viewId != ${expected.viewId}"
+    val textValue = text?.toString().orEmpty()
+    if (expected.text.isNotBlank() && textValue != expected.text) return "text $textValue != ${expected.text}"
+    val descValue = contentDescription?.toString().orEmpty()
+    if (expected.desc.isNotBlank() && descValue != expected.desc) return "desc $descValue != ${expected.desc}"
+    expected.editable?.let { if (isEditable != it) return "editable $isEditable != $it" }
+    expected.clickable?.let { if (isClickable != it) return "clickable $isClickable != $it" }
+    val expectedBounds = expected.bounds
+    if (expectedBounds != null && expectedBounds.size == 4) {
+        val actual = Rect()
+        getBoundsInScreen(actual)
+        val maxDelta = listOf(
+            kotlin.math.abs(actual.left - expectedBounds[0]),
+            kotlin.math.abs(actual.top - expectedBounds[1]),
+            kotlin.math.abs(actual.right - expectedBounds[2]),
+            kotlin.math.abs(actual.bottom - expectedBounds[3]),
+        ).maxOrNull() ?: 0
+        if (maxDelta > 32) {
+            return "bounds [${actual.left},${actual.top},${actual.right},${actual.bottom}] != $expectedBounds"
+        }
+    }
+    return null
 }
 
 private fun matchesText(n: AccessibilityNodeInfo, s: String): Boolean {

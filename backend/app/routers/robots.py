@@ -14,6 +14,7 @@ from app.core.db import SessionLocal, get_db
 from app.core.security import new_robot_token
 from app.core.ws_manager import hub
 from app.deps import current_user
+from app.device import DeviceClient
 from app.models import (
     AIReplyLog,
     Contact,
@@ -355,13 +356,29 @@ async def run_agent_goal_task(task_id: int) -> None:
         )
         try:
             log.info("agent_goal start task=%s goal=%r max_steps=%d", task.id, goal, max_steps)
-            result = await run_react(
-                db, robot, goal,
-                max_steps=max_steps,
-                step_timeout=settings.react_step_timeout_sec,
-                log_sink=_sink,
-                force_llm=force_llm,
-            )
+            device = DeviceClient(robot)
+            session_started = False
+            try:
+                session_started = True
+                ack = await device.react_session_start(timeout=4.0)
+                if not ack.ok:
+                    log.debug("react session start not acknowledged: %s", ack.message)
+            except Exception:  # noqa: BLE001
+                log.debug("react session start failed; continuing")
+            try:
+                result = await run_react(
+                    db, robot, goal,
+                    max_steps=max_steps,
+                    step_timeout=settings.react_step_timeout_sec,
+                    log_sink=_sink,
+                    force_llm=force_llm,
+                )
+            finally:
+                if session_started:
+                    try:
+                        await asyncio.shield(device.react_session_end(timeout=4.0))
+                    except Exception:  # noqa: BLE001
+                        log.debug("react session end failed")
             if asyncio.current_task() is not None and asyncio.current_task().cancelling():
                 raise asyncio.CancelledError
         except asyncio.CancelledError:

@@ -1,6 +1,6 @@
 from app.ai.react_agent import AgentResult, _guard_decision
 from app.ai.react_agent import AgentStep, _Observation, _post_back_verdict, _post_tap_verdict, _stuck_repeating
-from app.ai.react_agent import _swipe_coords
+from app.ai.react_agent import _degraded_wecom_observation, _find_sent_message_echo, _node_expectation, _swipe_coords
 from app.device import UiNode
 
 
@@ -45,6 +45,16 @@ def _button_node(node_id: int, text: str = "", screen: tuple[int, int] = (1000, 
         clickable=True,
         bounds=_bounds(screen, 0.82, 0.9, 0.98, 0.98),
     )
+
+
+def _text_node(
+    node_id: int,
+    text: str,
+    bounds: list[int],
+    *,
+    cls: str = "android.widget.TextView",
+) -> UiNode:
+    return UiNode(id=node_id, cls=cls, text=text, bounds=bounds)
 
 
 def test_post_back_verdict_detects_input_panel_dismissed_without_goal_match() -> None:
@@ -155,6 +165,67 @@ def test_post_tap_verdict_detects_send_from_executed_message_without_locator_rol
     assert "仍有文本" in verdict
 
 
+def test_post_tap_verdict_prefers_visible_sent_bubble_over_input_placeholder() -> None:
+    screen = (1000, 2000)
+    sent_text = "您好，请问有什么需要帮助？"
+    step = AgentStep(
+        index=1,
+        thought="",
+        action="tap_node",
+        args={"node_id": 2, "_locator_role": "send_button"},
+        ok=True,
+        message="tap_node(2 label='发送') -> clicked",
+        elapsed_ms=87,
+        obs_meta={"sent_echo_before": {"count": 0, "max_bottom": 0}},
+    )
+
+    verdict = _post_tap_verdict(
+        step,
+        _observation(
+            screen=screen,
+            nodes=[
+                _text_node(3, sent_text, _bounds(screen, 0.48, 0.60, 0.94, 0.70)),
+                _editable_node(1, "发消息或按住...", screen),
+            ],
+        ),
+        f"打开与「七月」的聊天，并发送下面这段文本：{sent_text}",
+    )
+
+    assert verdict is not None
+    assert "消息气泡" in verdict
+
+
+def test_post_tap_verdict_does_not_treat_existing_same_text_bubble_as_new_send() -> None:
+    screen = (1000, 2000)
+    sent_text = "重复话术"
+    step = AgentStep(
+        index=1,
+        thought="",
+        action="tap_node",
+        args={"node_id": 2, "_locator_role": "send_button"},
+        ok=True,
+        message="tap_node(2 label='发送') -> clicked",
+        elapsed_ms=87,
+        obs_meta={"sent_echo_before": {"count": 1, "max_bottom": _bounds(screen, 0.48, 0.60, 0.94, 0.70)[3]}},
+    )
+
+    verdict = _post_tap_verdict(
+        step,
+        _observation(
+            screen=screen,
+            nodes=[
+                _text_node(3, sent_text, _bounds(screen, 0.48, 0.60, 0.94, 0.70)),
+                _editable_node(1, "发消息或按住...", screen),
+            ],
+        ),
+        f"打开与「七月」的聊天，并发送下面这段文本：{sent_text}",
+    )
+
+    assert verdict is not None
+    assert "输入框" in verdict
+    assert "消息气泡" not in verdict
+
+
 def test_stuck_repeating_ignores_locator_role_when_same_node_keeps_failing() -> None:
     node_id = 2
     steps = [
@@ -225,3 +296,74 @@ def test_swipe_coords_fall_back_to_observed_node_bounds_when_screen_size_missing
     center_y = (region_top + region_bottom) // 2
     delta_y = (region_bottom - region_top) // 3
     assert _swipe_coords("down", obs, None) == (center_x, center_y - delta_y, center_x, center_y + delta_y)
+
+
+def test_degraded_wecom_observation_detects_unknown_tiny_tree() -> None:
+    obs = _observation(
+        package="com.tencent.wework",
+        page="UNKNOWN",
+        nodes=[
+            UiNode(id=i, cls="android.widget.FrameLayout", bounds=[0, 0, 100, 100])
+            for i in range(1, 10)
+        ],
+    )
+
+    assert _degraded_wecom_observation(obs) is True
+
+
+def test_degraded_wecom_observation_allows_actionable_unknown_tree() -> None:
+    obs = _observation(
+        package="com.tencent.wework",
+        page="UNKNOWN",
+        nodes=[_editable_node(1, "")],
+    )
+
+    assert _degraded_wecom_observation(obs) is False
+
+
+def test_node_expectation_captures_identity_fields_for_device_validation() -> None:
+    node = UiNode(
+        id=7,
+        cls="android.widget.EditText",
+        view_id="msg_input",
+        text="发消息",
+        desc="",
+        editable=True,
+        clickable=False,
+        bounds=[1, 2, 3, 4],
+    )
+
+    assert _node_expectation(node) == {
+        "cls": "android.widget.EditText",
+        "view_id": "msg_input",
+        "text": "发消息",
+        "desc": "",
+        "bounds": [1, 2, 3, 4],
+        "editable": True,
+        "clickable": False,
+    }
+
+
+def test_find_sent_message_echo_requires_matching_text_in_message_area() -> None:
+    screen = (1000, 2000)
+    sent_text = "hello"
+    obs = _observation(
+        screen=screen,
+        nodes=[
+            _text_node(1, sent_text, _bounds(screen, 0.48, 0.45, 0.95, 0.55)),
+            _text_node(2, "other", _bounds(screen, 0.48, 0.60, 0.95, 0.70)),
+        ],
+    )
+
+    assert _find_sent_message_echo(obs, sent_text).id == 1
+
+
+def test_find_sent_message_echo_rejects_left_side_customer_text() -> None:
+    screen = (1000, 2000)
+    sent_text = "hello"
+    obs = _observation(
+        screen=screen,
+        nodes=[_text_node(1, sent_text, _bounds(screen, 0.05, 0.45, 0.35, 0.55))],
+    )
+
+    assert _find_sent_message_echo(obs, sent_text) is None

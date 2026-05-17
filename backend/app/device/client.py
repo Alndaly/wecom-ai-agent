@@ -83,17 +83,45 @@ class DeviceClient:
     async def screenshot_once(self, *, timeout: float = 10.0) -> DeviceCommandResult:
         return await self.command("screenshot_once", timeout=timeout)
 
+    async def react_session_start(self, *, timeout: float = 4.0) -> DeviceCommandResult:
+        return await self.command("react_session_start", timeout=timeout)
+
+    async def react_session_end(self, *, timeout: float = 4.0) -> DeviceCommandResult:
+        return await self.command("react_session_end", timeout=timeout)
+
     async def tap_text(self, text: str, *, timeout: float) -> DeviceCommandResult:
         return await self.command("tap_text", {"text": text}, timeout=timeout)
 
-    async def tap_node(self, node_id: int, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
-        return await self.command("tap_node", {"node_id": node_id, "x": x, "y": y}, timeout=timeout)
+    async def tap_node(
+        self,
+        node_id: int,
+        x: int,
+        y: int,
+        *,
+        expected: dict[str, Any] | None = None,
+        timeout: float,
+    ) -> DeviceCommandResult:
+        payload = {"node_id": node_id, "x": x, "y": y}
+        if expected:
+            payload.update(_expected_payload(expected))
+        return await self.command("tap_node", payload, timeout=timeout)
 
     async def tap_xy(self, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
         return await self.command("tap_xy", {"x": x, "y": y}, timeout=timeout)
 
-    async def double_tap_node(self, node_id: int, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
-        return await self.command("double_tap_node", {"node_id": node_id, "x": x, "y": y}, timeout=timeout)
+    async def double_tap_node(
+        self,
+        node_id: int,
+        x: int,
+        y: int,
+        *,
+        expected: dict[str, Any] | None = None,
+        timeout: float,
+    ) -> DeviceCommandResult:
+        payload = {"node_id": node_id, "x": x, "y": y}
+        if expected:
+            payload.update(_expected_payload(expected))
+        return await self.command("double_tap_node", payload, timeout=timeout)
 
     async def double_tap_xy(self, x: int, y: int, *, timeout: float) -> DeviceCommandResult:
         return await self.command("double_tap_xy", {"x": x, "y": y}, timeout=timeout)
@@ -104,12 +132,16 @@ class DeviceClient:
         x: int,
         y: int,
         *,
+        expected: dict[str, Any] | None = None,
         duration_ms: int = 650,
         timeout: float,
     ) -> DeviceCommandResult:
+        payload = {"node_id": node_id, "x": x, "y": y, "duration_ms": duration_ms}
+        if expected:
+            payload.update(_expected_payload(expected))
         return await self.command(
             "long_press_node",
-            {"node_id": node_id, "x": x, "y": y, "duration_ms": duration_ms},
+            payload,
             timeout=timeout,
         )
 
@@ -159,8 +191,21 @@ class DeviceClient:
             timeout=timeout,
         )
 
-    async def input_text(self, text: str, *, mode: str = "replace", timeout: float) -> DeviceCommandResult:
-        return await self.command("input_text", {"text": text, "mode": mode}, timeout=timeout)
+    async def input_text(
+        self,
+        text: str,
+        *,
+        node_id: int | None = None,
+        expected: dict[str, Any] | None = None,
+        mode: str = "replace",
+        timeout: float,
+    ) -> DeviceCommandResult:
+        payload: dict[str, Any] = {"text": text, "mode": mode}
+        if node_id is not None:
+            payload["node_id"] = node_id
+        if expected:
+            payload.update(_expected_payload(expected))
+        return await self.command("input_text", payload, timeout=timeout)
 
     async def back(self, *, timeout: float) -> DeviceCommandResult:
         return await self.command("back", timeout=timeout)
@@ -171,3 +216,7 @@ class DeviceClient:
 
 def _safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return dict(payload)
+
+
+def _expected_payload(expected: dict[str, Any]) -> dict[str, Any]:
+    return {f"expected_{k}": v for k, v in expected.items()}

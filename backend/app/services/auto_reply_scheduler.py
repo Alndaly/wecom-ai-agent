@@ -38,6 +38,7 @@ from app.services.send_orchestrator import create_and_dispatch_send_text
 log = logging.getLogger(__name__)
 
 MAX_REPLY_TASKS_PER_CONVERSATION_TURN = 2
+AUTO_REPLY_SETTLE_SEC = 0.8
 
 
 @dataclass
@@ -252,6 +253,11 @@ async def _process_conversation(db, conv: Conversation) -> None:
     contact = await db.get(Contact, conv.contact_id)
     if robot is None or contact is None:
         return
+    # Give bursty customer input a tiny window to settle. The conversation is
+    # already marked active by the dispatcher, so this does not permit another
+    # worker for the same conv; it just lets rapid consecutive messages land
+    # in the same unreplied turn instead of producing one reply per fragment.
+    await asyncio.sleep(AUTO_REPLY_SETTLE_SEC)
     pending_messages = await _pending_messages(db, conv.id)
     if not pending_messages:
         return
@@ -269,11 +275,12 @@ async def _process_conversation(db, conv: Conversation) -> None:
         await _mark_feedback(db, batch_ids, "failed")
         return
 
+    feedback_ids = _decision_feedback_ids(decision, batch_ids)
     await ai_workflow.broadcast_kb_hits(robot.team_id, conv.id, decision)
     if decision.action == "reply":
         reply_texts = decision.all_texts[:MAX_REPLY_TASKS_PER_CONVERSATION_TURN]
         if not reply_texts:
-            await _mark_feedback(db, batch_ids, "failed")
+            await _mark_feedback(db, feedback_ids, "failed")
             return
         task_ids: list[int] = []
         for text in reply_texts:
@@ -285,17 +292,17 @@ async def _process_conversation(db, conv: Conversation) -> None:
                 text=text,
                 sender_type="ai",
                 sender_id=None,
-                feedback_message_ids=batch_ids,
+                feedback_message_ids=feedback_ids,
             )
             task_ids.append(task.id)
             if len(reply_texts) > 1:
                 await asyncio.sleep(0.2)
-        await _mark_feedback(db, batch_ids, "queued", decision.trace_id, task_ids)
+        await _mark_feedback(db, feedback_ids, "queued", decision.trace_id, task_ids)
     elif decision.action == "suggest":
         await ai_workflow.broadcast_suggestion(robot.team_id, conv.id, decision)
-        await _mark_feedback(db, batch_ids, "suggested", decision.trace_id, [])
+        await _mark_feedback(db, feedback_ids, "suggested", decision.trace_id, [])
     else:
-        await _mark_feedback(db, batch_ids, "skipped", decision.trace_id, [])
+        await _mark_feedback(db, feedback_ids, "skipped", decision.trace_id, [])
     if settings.memory_refresh_enabled:
         summarizer.schedule_refresh(contact.id, conv.id)
     else:
@@ -317,6 +324,17 @@ async def _pending_messages(db, conv_id: int) -> list[Message]:
         )
     ).scalars().all()
     return list(rows)
+
+
+def _decision_feedback_ids(decision, fallback_ids: list[int]) -> list[int]:
+    ids = [
+        int(mid)
+        for mid in (getattr(decision, "feedback_message_ids", None) or [])
+        if mid is not None
+    ]
+    if not ids:
+        ids = list(fallback_ids)
+    return list(dict.fromkeys(ids))
 
 
 async def _mark_feedback(

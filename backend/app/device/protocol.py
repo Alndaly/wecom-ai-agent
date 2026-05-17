@@ -56,6 +56,8 @@ class DeviceCommandResult(BaseModel):
 DeviceCommandName = Literal[
     "dump_ui",
     "screenshot_once",
+    "react_session_start",
+    "react_session_end",
     "tap_text",
     "tap_node",
     "tap_xy",

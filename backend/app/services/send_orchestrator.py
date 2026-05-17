@@ -187,8 +187,17 @@ async def run_send_task(task_id: int) -> None:
                     )
 
             log.info("react send start task=%s goal=%r", task.id, goal)
+            device = DeviceClient(robot)
+            session_started = False
             try:
-                await DeviceClient(robot).open_wecom(timeout=6.0)
+                session_started = True
+                ack = await device.react_session_start(timeout=4.0)
+                if not ack.ok:
+                    log.debug("react session start not acknowledged: %s", ack.message)
+            except Exception:  # noqa: BLE001
+                log.debug("react session start failed; continuing")
+            try:
+                await device.open_wecom(timeout=6.0)
                 await asyncio.sleep(0.6)
             except Exception:  # noqa: BLE001
                 log.debug("open_wecom pre-flight failed; continuing")
@@ -199,15 +208,51 @@ async def run_send_task(task_id: int) -> None:
                 if ai_cfg.get("react_force_llm") is not None
                 else settings.react_force_llm
             )
-            result = await run_react(
-                db,
-                robot,
-                goal,
-                max_steps=settings.react_max_steps,
-                step_timeout=settings.react_step_timeout_sec,
-                log_sink=_sink,
-                force_llm=force_llm,
-            )
+            max_attempts = min(int(task.max_attempts or 1), _MAX_AUTO_REPLY_SEND_ATTEMPTS)
+            result = None
+            try:
+                while True:
+                    result = await run_react(
+                        db,
+                        robot,
+                        goal,
+                        max_steps=settings.react_max_steps,
+                        step_timeout=settings.react_step_timeout_sec,
+                        log_sink=_sink,
+                        force_llm=force_llm,
+                    )
+                    if result.ok:
+                        break
+                    task = await db.get(RobotTask, task_id)
+                    if task is None:
+                        return
+                    next_attempts = int(task.attempts or 0) + 1
+                    if next_attempts >= max_attempts:
+                        break
+                    task.attempts = next_attempts
+                    task.last_error = _REACT_PREFIX + result.summary
+                    db.add(
+                        RobotTaskLog(
+                            robot_id=robot.id,
+                            task_id=task.id,
+                            level="warn",
+                            message=f"{task.last_error}; 保持设备槽位并立即重试 {task.attempts}/{task.max_attempts}",
+                        )
+                    )
+                    await db.commit()
+                    await asyncio.sleep(_AUTO_REPLY_RETRY_DELAY_SEC)
+                    try:
+                        await device.open_wecom(timeout=6.0)
+                        await asyncio.sleep(0.6)
+                    except Exception:  # noqa: BLE001
+                        log.debug("open_wecom retry pre-flight failed; continuing")
+            finally:
+                if session_started:
+                    try:
+                        await asyncio.shield(device.react_session_end(timeout=4.0))
+                    except Exception:  # noqa: BLE001
+                        log.debug("react session end failed")
+            assert result is not None
             if asyncio.current_task() is not None and asyncio.current_task().cancelling():
                 raise asyncio.CancelledError
             task = await db.get(RobotTask, task_id)

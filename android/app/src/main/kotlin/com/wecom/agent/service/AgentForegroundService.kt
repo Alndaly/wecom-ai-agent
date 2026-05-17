@@ -27,6 +27,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.time.Instant
@@ -66,6 +67,8 @@ class AgentForegroundService : Service() {
     private var scanCoordinatorJob: Job? = null
     private val uiAutomationMutex = Mutex()
     @Volatile private var reactCommandActive = false
+    @Volatile private var reactSessionActive = false
+    @Volatile private var reactSessionStartedAt = 0L
 
     // All backend-originated device commands funnel through a single serial
     // queue, so input/tap/send tasks can't be cut into by traversal scans, and
@@ -323,6 +326,8 @@ class AgentForegroundService : Service() {
                     "screen_start",
                     "screen_stop",
                     "screenshot_once",
+                    "react_session_start",
+                    "react_session_end",
                     "tap_text",
                     "tap_node",
                     "tap_xy",
@@ -374,7 +379,7 @@ class AgentForegroundService : Service() {
             // Cooperative cancellation: between swipes, if any device command
             // is pending/running, abort scrolling and let the high-priority
             // task have the device.
-            shouldYield = { pendingCommandCount.get() > 0 },
+            shouldYield = { automationBusy() },
         )
 
         // Page gate semantics:
@@ -438,7 +443,7 @@ class AgentForegroundService : Service() {
                     continue
                 }
                 // P1 (queued/active commands) preempts all scans
-                if (pendingCommandCount.get() > 0) {
+                if (automationBusy()) {
                     delay(500L)
                     continue
                 }
@@ -473,12 +478,12 @@ class AgentForegroundService : Service() {
     }
 
     private suspend fun runScanner(label: String, block: suspend () -> ScanReport): ScanReport {
-        if (pendingCommandCount.get() > 0) return ScanReport.skipped("设备有待处理任务，跳过 $label")
+        if (automationBusy()) return ScanReport.skipped("设备有待处理任务，跳过 $label")
         if (!uiAutomationMutex.tryLock()) return ScanReport.skipped("设备正在执行任务，跳过 $label")
         return try {
             // Recheck after locking — a command may have been enqueued in the
             // narrow window between the first check and the lock. Yield to it.
-            if (pendingCommandCount.get() > 0) {
+            if (automationBusy()) {
                 ScanReport.skipped("设备任务在排队，跳过 $label")
             } else {
                 withTimeout(2_500L) { block() }
@@ -533,6 +538,34 @@ class AgentForegroundService : Service() {
             Log.w(tag, "command queue rejected $command")
             broadcastLog("命令队列已满，丢弃 $command")
         }
+    }
+
+    private fun automationBusy(): Boolean =
+        pendingCommandCount.get() > 0 || reactCommandActive || activeReactSession()
+
+    private fun activeReactSession(): Boolean {
+        if (!reactSessionActive) return false
+        val ageMs = System.currentTimeMillis() - reactSessionStartedAt
+        if (ageMs in 0..600_000L) return true
+        reactSessionActive = false
+        reactSessionStartedAt = 0L
+        broadcastLog("ReAct 会话锁超时，已自动释放")
+        return false
+    }
+
+    private fun nodeExpectation(obj: JsonObject): NodeExpectation {
+        val bounds = obj["expected_bounds"]?.jsonArray
+            ?.mapNotNull { it.jsonPrimitive.contentOrNull?.toIntOrNull() }
+            ?.takeIf { it.size == 4 }
+        return NodeExpectation(
+            cls = obj["expected_cls"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            viewId = obj["expected_view_id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            text = obj["expected_text"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            desc = obj["expected_desc"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            bounds = bounds,
+            editable = obj["expected_editable"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull(),
+            clickable = obj["expected_clickable"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull(),
+        )
     }
 
     private fun startScreenStream(intervalMs: Long) {
@@ -595,6 +628,16 @@ class AgentForegroundService : Service() {
             withTimeout(commandTimeoutMs(command)) {
                 uiAutomationMutex.withLock {
                 when (command) {
+                    "react_session_start" -> {
+                        reactSessionActive = true
+                        reactSessionStartedAt = System.currentTimeMillis()
+                        Pair(true, "ReAct 会话锁已开启")
+                    }
+                    "react_session_end" -> {
+                        reactSessionActive = false
+                        reactSessionStartedAt = 0L
+                        Pair(true, "ReAct 会话锁已释放")
+                    }
                     "screenshot_once" -> {
                         val svc = WeComAccessibilityService.instance
                         if (svc == null) {
@@ -615,7 +658,7 @@ class AgentForegroundService : Service() {
                         val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                         val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                         if (nodeId == null) Pair(false, "缺少 node_id")
-                        else automator.reactTapNode(nodeId, x, y)
+                        else automator.reactTapNode(nodeId, x, y, nodeExpectation(obj))
                     }
                     "tap_xy" -> {
                         val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
@@ -628,7 +671,7 @@ class AgentForegroundService : Service() {
                         val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                         val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                         if (nodeId == null) Pair(false, "缺少 node_id")
-                        else automator.reactDoubleTapNode(nodeId, x, y)
+                        else automator.reactDoubleTapNode(nodeId, x, y, nodeExpectation(obj))
                     }
                     "double_tap_xy" -> {
                         val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
@@ -642,7 +685,7 @@ class AgentForegroundService : Service() {
                         val y = obj["y"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                         val dur = obj["duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 650L
                         if (nodeId == null) Pair(false, "缺少 node_id")
-                        else automator.reactLongPressNode(nodeId, x, y, dur)
+                        else automator.reactLongPressNode(nodeId, x, y, nodeExpectation(obj), dur)
                     }
                     "long_press_xy" -> {
                         val x = obj["x"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
@@ -677,7 +720,8 @@ class AgentForegroundService : Service() {
                         if (text == null) {
                             Pair(false, "缺少 text")
                         } else {
-                            val r = automator.reactInputText(text, mode)
+                            val nodeId = obj["node_id"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                            val r = automator.reactInputText(text, mode, nodeId, nodeExpectation(obj))
                             if (r.first) rememberAutomatedOutput(text)
                             r
                         }

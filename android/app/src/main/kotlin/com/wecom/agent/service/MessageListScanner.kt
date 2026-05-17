@@ -33,6 +33,7 @@ class MessageListScanner(
     suspend fun scanVisible(): ScanReport {
         val svc = WeComAccessibilityService.instance ?: return ScanReport.skipped("无障碍服务未运行")
         if (!svc.isWeComForeground()) return ScanReport.skipped("WeCom 不在前台")
+        if (shouldYield()) return ScanReport.skipped("检测到高优任务，跳过扫描")
         ensureMessagesTab(svc).takeIf { !it.ok }?.let { return it }
         svc.forceHarvestHomeList()
         return ScanReport.ok("已扫描可见区域")
@@ -49,6 +50,7 @@ class MessageListScanner(
     private suspend fun scanWithSwipes(maxSwipes: Int, stopOnStagnant: Boolean): ScanReport {
         val svc = WeComAccessibilityService.instance ?: return ScanReport.skipped("无障碍服务未运行")
         if (!svc.isWeComForeground()) return ScanReport.skipped("WeCom 不在前台")
+        if (shouldYield()) return ScanReport.skipped("检测到高优任务，跳过扫描")
         ensureMessagesTab(svc).takeIf { !it.ok }?.let { return it }
         val bounds = svc.getMessagesListBounds() ?: return ScanReport.skipped("未找到会话列表")
 
@@ -107,15 +109,18 @@ class MessageListScanner(
     }
 
     private suspend fun ensureMessagesTab(svc: WeComAccessibilityService): ScanReport {
+        if (shouldYield()) return ScanReport.skipped("检测到高优任务，跳过切页")
         if (svc.isOnMessagesTab()) return ScanReport.ok("已在「消息」Tab")
 
         if (svc.currentPage == WeComAccessibilityService.Page.CHAT) {
+            if (shouldYield()) return ScanReport.skipped("检测到高优任务，跳过返回消息列表")
             val backOk = svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             log(if (backOk) "从聊天页返回消息列表" else "从聊天页返回失败")
             delay(700)
             if (svc.isOnMessagesTab()) return ScanReport.ok("已返回「消息」Tab")
         }
 
+        if (shouldYield()) return ScanReport.skipped("检测到高优任务，跳过点击消息 Tab")
         val tapped = tapMessagesTab(svc)
         if (!tapped) return ScanReport.skipped("未找到可点击的「消息」Tab")
         delay(800)
