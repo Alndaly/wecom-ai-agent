@@ -335,18 +335,85 @@ class WeComAutomator(
             } else {
                 insertMediaStoreLegacy(safeName, mime, bytes, isVideo)
             }
+            // Confirm the file is queryable + matches the expected byte size
+            // before we let the ReAct agent open the picker. Without this,
+            // the agent can tap "first thumbnail" while the staged image
+            // hasn't shown up in WeCom's gallery yet, and end up sending
+            // some older photo. The wait is capped — if MediaStore never
+            // resolves the URI we fail the command so the backend retries
+            // rather than silently sending the wrong file.
+            val verified = verifyMediaVisible(uri, expectedBytes = bytes.size.toLong())
+            if (!verified) {
+                return@withContext Triple(
+                    false,
+                    "媒体已写入但 MediaStore 未在限定时间内确认可见，拒绝继续以避免发错文件",
+                    null,
+                )
+            }
             val data = mapOf(
                 "uri" to uri.toString(),
                 "display_name" to safeName,
                 "taken_at_ms" to takenAt.toString(),
                 "relative_path" to "Pictures/WeComAgent/",
                 "mime" to mime,
+                "size_bytes" to bytes.size.toString(),
             )
             Triple(true, "媒体已落入 Pictures/WeComAgent/ ($safeName)", data)
         } catch (e: Exception) {
             Log.w(tag, "stage media failed", e)
             Triple(false, e.message ?: e::class.java.simpleName, null)
         }
+    }
+
+    /**
+     * Wait until a freshly-inserted MediaStore URI is queryable AND its
+     * reported size matches what we wrote. Picker apps (WeCom included)
+     * read from MediaStore queries, so this is the moment when the file
+     * actually becomes "selectable from the gallery". On API 29+ this is
+     * usually instant once IS_PENDING=0, but the ContentResolver
+     * notification can lag a few hundred ms on some ROMs; on legacy we're
+     * waiting for the MediaScanner pass.
+     *
+     * @return true if visible within `maxWaitMs`, false otherwise (caller
+     *   should treat that as a failure rather than gamble on the gallery
+     *   selecting some unrelated older photo).
+     */
+    private suspend fun verifyMediaVisible(
+        uri: Uri,
+        expectedBytes: Long,
+        maxWaitMs: Long = 4_000L,
+        pollIntervalMs: Long = 150L,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        val resolver = ctx.contentResolver
+        val projection = arrayOf(MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.IS_PENDING)
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                resolver.query(uri, projection, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val size = cursor.getLong(0)
+                        val pendingIdx = cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
+                        val pending = if (pendingIdx >= 0) cursor.getInt(pendingIdx) else 0
+                        if (pending == 0 && size == expectedBytes) {
+                            return@withContext true
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Some legacy ROMs throw on IS_PENDING projection; fall
+                // back to a size-only check on the next loop.
+            }
+            try {
+                resolver.query(uri, arrayOf(MediaStore.MediaColumns.SIZE), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst() && cursor.getLong(0) == expectedBytes) {
+                        return@withContext true
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            delay(pollIntervalMs)
+        }
+        false
     }
 
     private suspend fun downloadMediaBytes(downloadUrl: String): ByteArray = withContext(Dispatchers.IO) {

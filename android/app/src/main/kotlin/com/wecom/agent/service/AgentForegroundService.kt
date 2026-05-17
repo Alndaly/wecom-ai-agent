@@ -53,6 +53,12 @@ class AgentForegroundService : Service() {
         const val ACTION_SET_A11Y_INGEST = "com.wecom.agent.ACTION_SET_A11Y_INGEST"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
+        // How long the periodic message-list scanner stays paused after a
+        // ReAct session ends. Covers the post-send upload-spinner window
+        // (WeCom keeps the page in a non-CHAT state while bytes upload).
+        // Worst case if too short: a stray "back to messages tab" lands
+        // mid-upload — caught by the wrong-chat verdict on the backend.
+        const val SCANNER_COOLDOWN_AFTER_SESSION_MS = 8_000L
     }
 
     private val tag = "AgentSvc"
@@ -68,7 +74,11 @@ class AgentForegroundService : Service() {
     private val uiAutomationMutex = Mutex()
     @Volatile private var reactCommandActive = false
     @Volatile private var reactSessionActive = false
-    @Volatile private var reactSessionStartedAt = 0L
+    @Volatile private var reactSessionStartedAt: Long = 0L
+    // Until this timestamp the periodic scanner stays out of the device's
+    // way. Set when a ReAct session ends so post-send upload spinners aren't
+    // interrupted by a "go back to messages tab" pass.
+    @Volatile private var scannerCooldownUntil: Long = 0L
 
     // All backend-originated device commands funnel through a single serial
     // queue, so input/tap/send tasks can't be cut into by traversal scans, and
@@ -346,6 +356,24 @@ class AgentForegroundService : Service() {
             "device.command" -> {
                 val obj = payload?.jsonObject ?: return
                 val command = obj["command"]?.jsonPrimitive?.contentOrNull
+                // Eagerly assert the ReAct session lock **before** the command
+                // hits the queue. Otherwise the periodic message-list scanner
+                // can sneak in between WS receive and worker execution and
+                // navigate the device (`ensureMessagesTab` will press back +
+                // tap 消息 tab) while we think we're locked. The command still
+                // runs through the queue normally and produces the expected
+                // ACK — we're just closing the assert/release race window.
+                if (command == "react_session_start") {
+                    reactSessionActive = true
+                    reactSessionStartedAt = System.currentTimeMillis()
+                } else if (command == "react_session_end") {
+                    // Keep a short grace window after end-of-session so the
+                    // scanner doesn't pounce while the media upload spinner
+                    // is still settling and a final dump may still be in
+                    // flight. The actual flag flip happens when the worker
+                    // processes the command (sets reactSessionActive=false)
+                    // — until then we leave it on.
+                }
                 when (command) {
                     "dump_ui",
                     "screen_start",
@@ -504,8 +532,21 @@ class AgentForegroundService : Service() {
     }
 
     private suspend fun runScanner(label: String, block: suspend () -> ScanReport): ScanReport {
-        if (automationBusy()) return ScanReport.skipped("设备有待处理任务，跳过 $label")
+        if (automationBusy()) {
+            val reason = when {
+                pendingCommandCount.get() > 0 -> "queued cmd"
+                reactCommandActive -> "react cmd active"
+                activeReactSession() -> "react session lock"
+                scannerInCooldown() -> "post-session cooldown"
+                else -> "busy"
+            }
+            // Surface the gate that blocked us so logs can answer "did the
+            // scanner ever fire during the media flow?" after the fact.
+            Log.i(tag, "scan $label yield ($reason)")
+            return ScanReport.skipped("$reason，跳过 $label")
+        }
         if (!uiAutomationMutex.tryLock()) return ScanReport.skipped("设备正在执行任务，跳过 $label")
+        Log.i(tag, "scan $label start")
         return try {
             // Recheck after locking — a command may have been enqueued in the
             // narrow window between the first check and the lock. Yield to it.
@@ -567,7 +608,18 @@ class AgentForegroundService : Service() {
     }
 
     private fun automationBusy(): Boolean =
-        pendingCommandCount.get() > 0 || reactCommandActive || activeReactSession()
+        pendingCommandCount.get() > 0
+            || reactCommandActive
+            || activeReactSession()
+            || scannerInCooldown()
+
+    private fun scannerInCooldown(): Boolean {
+        val until = scannerCooldownUntil
+        if (until == 0L) return false
+        if (System.currentTimeMillis() < until) return true
+        scannerCooldownUntil = 0L
+        return false
+    }
 
     private fun activeReactSession(): Boolean {
         if (!reactSessionActive) return false
@@ -662,6 +714,12 @@ class AgentForegroundService : Service() {
                     "react_session_end" -> {
                         reactSessionActive = false
                         reactSessionStartedAt = 0L
+                        // Defer the scanner for a few seconds even after the
+                        // session is officially released — a media send may
+                        // still be uploading (WeCom shows a progress spinner
+                        // in-chat with no page change) and the scanner's
+                        // back-to-tab navigation would yank the user away.
+                        scannerCooldownUntil = System.currentTimeMillis() + SCANNER_COOLDOWN_AFTER_SESSION_MS
                         Pair(true, "ReAct 会话锁已释放")
                     }
                     "screenshot_once" -> {

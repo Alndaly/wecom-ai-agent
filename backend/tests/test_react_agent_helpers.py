@@ -252,6 +252,72 @@ def test_post_tap_verdict_does_not_treat_existing_same_text_bubble_as_new_send()
     assert "消息气泡" not in verdict
 
 
+def test_media_post_tap_verdict_requires_gallery_send_button_role() -> None:
+    step = AgentStep(
+        index=1,
+        thought="",
+        action="tap_node",
+        args={"node_id": 20, "_locator_role": "chat_target"},
+        ok=True,
+        message="tap_node(20 label='Revornix交流群') -> clicked",
+        elapsed_ms=87,
+        obs_meta={"before_page": "HOME"},
+    )
+
+    verdict = _post_tap_verdict(
+        step,
+        _observation(package="com.tencent.wework", page="CHAT"),
+        "文件名 dog.gif",
+    )
+
+    assert verdict is None
+
+
+def test_media_post_tap_verdict_waits_when_gallery_send_still_unknown() -> None:
+    step = AgentStep(
+        index=1,
+        thought="",
+        action="tap_node",
+        args={"node_id": 10, "_locator_role": "gallery_send_button"},
+        ok=True,
+        message="tap_node(10 label='发送') -> clicked",
+        elapsed_ms=87,
+        obs_meta={"before_page": "UNKNOWN"},
+    )
+
+    verdict = _post_tap_verdict(
+        step,
+        _observation(package="com.tencent.wework", page="UNKNOWN"),
+        "文件名 dog.gif",
+    )
+
+    assert verdict is not None
+    assert "等待" in verdict
+    assert "不要按 back" in verdict
+
+
+def test_media_post_tap_verdict_accepts_gallery_send_returning_chat() -> None:
+    step = AgentStep(
+        index=1,
+        thought="",
+        action="tap_node",
+        args={"node_id": 10, "_locator_role": "gallery_send_button"},
+        ok=True,
+        message="tap_node(10 label='发送') -> clicked",
+        elapsed_ms=87,
+        obs_meta={"before_page": "UNKNOWN"},
+    )
+
+    verdict = _post_tap_verdict(
+        step,
+        _observation(package="com.tencent.wework", page="CHAT"),
+        "文件名 dog.gif",
+    )
+
+    assert verdict is not None
+    assert "发送已生效" in verdict
+
+
 def test_stuck_repeating_ignores_locator_role_when_same_node_keeps_failing() -> None:
     node_id = 2
     steps = [
@@ -419,6 +485,27 @@ def test_degraded_wecom_observation_allows_actionable_unknown_tree() -> None:
         package="com.tencent.wework",
         page="UNKNOWN",
         nodes=[_editable_node(1, "")],
+    )
+
+    assert _degraded_wecom_observation(obs) is False
+
+
+def test_degraded_wecom_observation_allows_media_preview_confirm_tree() -> None:
+    obs = _observation(
+        package="com.tencent.wework",
+        page="UNKNOWN",
+        nodes=[
+            UiNode(id=1, cls="FrameLayout", bounds=[0, 0, 1440, 2200]),
+            UiNode(id=2, cls="ViewGroup", view_id="ora", focusable=True, bounds=[0, 0, 1440, 1800]),
+            UiNode(id=3, cls="ImageView", view_id="jm0", clickable=True, focusable=True, bounds=[360, 150, 1080, 870]),
+            UiNode(id=4, cls="View", view_id="wq", clickable=True, focusable=True, bounds=[0, 0, 1440, 2200]),
+            UiNode(id=5, cls="RelativeLayout", view_id="ne1", clickable=True, focusable=True, bounds=[0, 0, 1440, 120]),
+            UiNode(id=6, cls="ImageView", view_id="h3d", clickable=True, focusable=True, bounds=[20, 20, 100, 100]),
+            UiNode(id=7, cls="CheckBox", view_id="c5y", clickable=True, focusable=True, bounds=[1240, 20, 1320, 100]),
+            UiNode(id=8, cls="RelativeLayout", view_id="b6c", clickable=True, focusable=True, bounds=[1120, 2040, 1420, 2180]),
+            UiNode(id=9, cls="ViewGroup", view_id="lkd", clickable=True, focusable=True, bounds=[1160, 2070, 1400, 2160]),
+            UiNode(id=10, cls="TextView", view_id="blz", text="发送", bounds=[1240, 2090, 1350, 2140]),
+        ],
     )
 
     assert _degraded_wecom_observation(obs) is False

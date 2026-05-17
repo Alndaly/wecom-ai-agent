@@ -202,6 +202,12 @@ async def run_react(
     # attributed to the right app-skill regardless of where the run ends
     # (we may drift through `unknown` pkg pages during the run).
     target_package: str | None = None
+    # For the media-send phase: snapshot the title of the chat we start in.
+    # Phase 2 begins with the target chat already open; if a later `tap_node`
+    # drops us back on a CHAT page, we require the title to match this
+    # anchor before declaring success — otherwise the agent may have
+    # navigated into the *wrong* chat (e.g. via HOME after a stray `back`).
+    media_chat_anchor: str | None = None
 
     for i in range(1, max_steps + 1):
         # ---- observe ----
@@ -223,6 +229,17 @@ async def run_react(
             pkg = _root_package(obs.tree)
             if pkg and pkg != "unknown":
                 target_package = pkg
+        if (
+            media_chat_anchor is None
+            and goal_kind == "send_media_phase2"
+            and _root_page(obs.tree) == "CHAT"
+        ):
+            media_chat_anchor = _chat_title(obs)
+            if media_chat_anchor:
+                await _log(
+                    "info",
+                    f"[react] media chat anchor captured: {media_chat_anchor!r}",
+                )
 
         # ---- post-action verification (annotate the previous step) ----
         # If the previous step was a send-button tap, re-check the input box
@@ -236,7 +253,9 @@ async def run_react(
             # cached node was misleading. Decay it so the next iteration
             # doesn't keep replaying the same no-op.
             _decay_no_op_locator(steps[-1], obs, locator_store)
-            verdict = _post_tap_verdict(steps[-1], obs, goal)
+            verdict = _post_tap_verdict(
+                steps[-1], obs, goal, media_chat_anchor=media_chat_anchor
+            )
             if verdict and "[验证]" not in steps[-1].message:
                 steps[-1].message = f"{steps[-1].message}  [验证] {verdict}"
                 await _log("info", f"[react] step {i-1} post-tap verdict: {verdict}")
@@ -921,8 +940,56 @@ def _degraded_wecom_observation(obs: _Observation) -> bool:
         return False
     if any(n.editable or n.scrollable for n in obs.nodes.values()):
         return False
+    if _recoverable_unknown_observation(obs):
+        return False
     labeled = [n for n in obs.nodes.values() if _node_label(n)]
     return len(labeled) <= 2
+
+
+def _recoverable_unknown_observation(obs: _Observation) -> bool:
+    """Return True when a tiny UNKNOWN tree still has an obvious next action.
+
+    WeCom media preview / confirmation pages often expose very small
+    accessibility trees: a preview image, maybe a checkbox, and a "发送"
+    label. That is not a degraded dump; it is a valid step in the media flow.
+    """
+    action_labels = {
+        "发送",
+        "完成",
+        "确定",
+        "确认",
+        "Send",
+        "Done",
+        "OK",
+    }
+    for node in obs.nodes.values():
+        if _node_label(node) in action_labels:
+            return True
+        if node.cls == "CheckBox" and (node.clickable or node.focusable):
+            return True
+    return False
+
+
+def _chat_title(obs: _Observation) -> str | None:
+    """Pick the title-bar label of the currently open chat (if any).
+
+    Looks at nodes sitting in the top ~15% of the screen and returns the
+    first non-empty text/desc. Used as a structural anchor — if the agent
+    later claims to be "back in chat", we can compare the new title to
+    this snapshot to make sure it's the **same** chat, not a different
+    one that happens to share the page=CHAT label.
+    """
+    screen_h = obs.screen_size[1] if obs.screen_size else 0
+    if screen_h <= 0:
+        return None
+    cutoff = int(screen_h * 0.15)
+    for n in obs.nodes.values():
+        if len(n.bounds) != 4 or n.bounds[1] >= cutoff:
+            continue
+        label = (n.text or n.desc or "").strip()
+        if label:
+            return label
+    return None
 
 
 def _in_target_chat(obs: _Observation, target: str) -> bool:
@@ -999,7 +1066,13 @@ def _find_text_node(obs: _Observation, text: str) -> UiNode | None:
     return min(pool, key=lambda n: (n.bounds[1], n.bounds[0]))
 
 
-def _post_tap_verdict(prev_step: AgentStep, obs: _Observation, goal: str) -> str | None:
+def _post_tap_verdict(
+    prev_step: AgentStep,
+    obs: _Observation,
+    goal: str,
+    *,
+    media_chat_anchor: str | None = None,
+) -> str | None:
     """After a `tap_node` step, decide whether the UI actually changed in
     the expected way. Returns a short Chinese verdict suitable for inlining
     into the step's `message`, or None when no specific check applies."""
@@ -1012,7 +1085,7 @@ def _post_tap_verdict(prev_step: AgentStep, obs: _Observation, goal: str) -> str
     # instead of looping for more steps after the image has already gone out.
     parsed_media = parse_send_media_goal(goal)
     if parsed_media is not None:
-        return _media_post_tap_verdict(prev_step, obs)
+        return _media_post_tap_verdict(prev_step, obs, anchor=media_chat_anchor)
     # The verdicts below reason about the chat input box (was it cleared by
     # the send?), which only makes sense for text-send goals.
     parsed = parse_send_goal(goal)
@@ -1045,26 +1118,57 @@ def _post_tap_verdict(prev_step: AgentStep, obs: _Observation, goal: str) -> str
     return "输入框内容已不再匹配待发送文本，发送可能已生效"
 
 
-def _media_post_tap_verdict(prev_step: AgentStep, obs: _Observation) -> str | None:
+def _media_post_tap_verdict(
+    prev_step: AgentStep,
+    obs: _Observation,
+    *,
+    anchor: str | None,
+) -> str | None:
     """Purely structural verdict for the media-send phase.
 
-    Trigger: previous step was a `tap_node` on a non-CHAT page, and the
-    current observation is back on CHAT. The only way that transition
-    happens inside the media flow is the picker / preview closing because
-    the image was actually dispatched (or the user `back`-ed out — gated
-    out below). No text-content matching against the UI tree, so this
-    survives across WeCom UI variants.
+    Three layered checks (all structural, no UI text matching):
+
+      a) Previous step was `tap_node` (we ignore `back`, swipes, etc. —
+         backing out of a picker also lands on CHAT but is not a send).
+      b) `before_page` was non-CHAT and current page is CHAT.
+      c) The current CHAT page's title bar matches the `anchor` captured
+         when phase 2 started. Without this, navigating into ANY other
+         chat (e.g. via HOME after a stray back) would falsely declare
+         success.
+
+    Returns one of three states:
+      - success: all three signals line up
+      - wrong-chat: returned to a CHAT, but a different one — explicit
+        recovery instruction so the LLM doesn't `done` prematurely
+      - waiting: tapped from non-CHAT but didn't transition (picker still
+        showing upload spinner). Hold position; don't `back`.
     """
     if prev_step.action != "tap_node":
         return None
     before_page = (prev_step.obs_meta or {}).get("before_page")
     cur_page = _root_page(obs.tree)
-    if before_page and before_page != "CHAT" and cur_page == "CHAT":
+    if not before_page or before_page == "CHAT":
+        return None
+    if cur_page == "CHAT":
+        cur_title = _chat_title(obs)
+        if anchor and cur_title and cur_title != anchor:
+            return (
+                f"已落到 CHAT 页但顶栏是「{cur_title}」而非起始的「{anchor}」"
+                "——这不是目标聊天，发送没有发生（或发到了错误对象）。"
+                f"请先 back 回到会话列表，重新打开「{anchor}」核实是否需要重发，"
+                "不要直接 done(success=true)。"
+            )
         return (
-            "页面已从 picker 回到聊天主页 → 图片已离开选择器，发送已生效，"
+            "页面已从 picker 回到原聊天主页 → 图片已离开选择器，发送已生效，"
             "请立刻调用 done(success=true)"
         )
-    return None
+    # Still in picker / preview / upload. The previous tap likely was the
+    # send confirm; UI just hasn't transitioned yet. Tell the agent to wait,
+    # not to back out — backing out aborts the send.
+    return (
+        "已点击媒体发送按钮，但页面仍在 picker/预览/上传状态。"
+        "请使用 wait_ui 等待 UI 切回原聊天，不要按 back，也不要再点其它入口。"
+    )
 
 
 def _post_back_verdict(prev_step: AgentStep, obs: _Observation) -> str | None:
