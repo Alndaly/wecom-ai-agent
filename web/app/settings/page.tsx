@@ -1283,7 +1283,7 @@ function ActionRow({
         {probe && (
           <div
             className={`flex items-start gap-2 rounded-md border p-2 text-xs ${
-              probe.ok ? "border-emerald-200 bg-emerald-50" : "border-red-200 bg-red-50"
+              probe.ok ? "border-emerald-200/50" : "border-red-200/50"
             }`}
           >
             {probe.ok ? (
