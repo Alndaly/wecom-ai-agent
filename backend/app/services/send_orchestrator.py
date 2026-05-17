@@ -248,6 +248,8 @@ async def run_send_task(task_id: int) -> None:
             robot = await db.get(Robot, task.robot_id)
             if robot is None:
                 return
+            if await _skip_if_message_already_sent(db, robot, task):
+                return
 
             goal = _goal_for_task(task)
             if goal is None:
@@ -526,6 +528,43 @@ def _goal_for_task(task: RobotTask) -> str | None:
     if not text:
         return None
     return f"打开与「{contact}」的聊天，并发送下面这段文本：{text}"
+
+
+async def _skip_if_message_already_sent(
+    db: AsyncSession, robot: Robot, task: RobotTask
+) -> bool:
+    """Treat recovered tasks as done when their outbound message already sent.
+
+    Startup recovery can re-queue a `dispatched` task after the device finished
+    the send but before the backend persisted the final task status. The message
+    status is the stronger idempotency signal because it is what the operator
+    and auto-reply feedback care about.
+    """
+    if not task.message_id:
+        return False
+    msg = await db.get(Message, task.message_id)
+    if msg is None or msg.status != "sent":
+        return False
+
+    task.status = "completed"
+    task.last_error = None
+    await _mark_feedback_messages(db, task, "replied")
+    db.add(
+        RobotTaskLog(
+            robot_id=robot.id,
+            task_id=task.id,
+            level="info",
+            message="[react] skipped: outbound message is already sent",
+        )
+    )
+    await db.commit()
+    await hub.broadcast_web(
+        robot.team_id,
+        "task.updated",
+        {"task_id": task.id, "status": task.status, "error": task.last_error},
+    )
+    await _broadcast_message_update(robot.team_id, msg)
+    return True
 
 
 async def _mark_feedback_messages(db: AsyncSession, task: RobotTask, status: str) -> None:
