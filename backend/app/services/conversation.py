@@ -131,6 +131,17 @@ def _source_from_external_msg_id(external_msg_id: str | None) -> str | None:
         return source
     return None
 
+
+def _external_msg_id_kind(external_msg_id: str | None) -> str:
+    if not external_msg_id:
+        return "none"
+    parts = external_msg_id.split(":", 2)
+    if len(parts) >= 2 and parts[1].startswith("stable"):
+        return "stable"
+    if len(parts) >= 2 and parts[1].isdigit():
+        return "post_time"
+    return "unknown"
+
 # WeCom aggregates >1 pending unread messages in a single chat into a single
 # notification whose body is prefixed with "[N条]". The Android listener strips
 # it, but we mirror that here as a defence-in-depth — other inbound channels
@@ -271,6 +282,9 @@ async def ingest_inbound_message(
         db.add(conv)
         await db.flush()
 
+    original_external_msg_id = evt.external_msg_id
+    external_msg_id_status = "stored" if original_external_msg_id else "none"
+
     # dedupe by external_msg_id (scoped to this conversation — the same hash on a
     # different robot/device is a legitimately distinct message).
     if evt.external_msg_id:
@@ -286,21 +300,31 @@ async def ingest_inbound_message(
             age = now - existing.created_at
             if age <= timedelta(minutes=5):
                 log.info(
-                    "[message-callback] duplicate external_msg_id skipped conv=%s msg=%s external_msg_id=%s content=%r",
+                    "[message-callback] event=ingest_dedupe outcome=skip reason=duplicate_external_msg_id "
+                    "conv=%s existing_msg=%s age=%s source=%s id_kind=%s external_msg_id=%s content=%r",
                     existing.conversation_id,
                     existing.id,
+                    age,
+                    _source_from_external_msg_id(evt.external_msg_id) or "unknown",
+                    _external_msg_id_kind(evt.external_msg_id),
                     evt.external_msg_id,
                     evt.content or "",
                 )
                 return None
             log.warning(
-                "[message-callback] stale external_msg_id collision accepted existing_msg=%s age=%s external_msg_id=%s content=%r",
+                "[message-callback] event=ingest_dedupe outcome=accept reason=stale_external_msg_id_collision "
+                "action=drop_external_msg_id conv=%s existing_msg=%s age=%s stale_after=5m "
+                "source=%s id_kind=%s original_external_msg_id=%s content=%r",
+                conv.id,
                 existing.id,
                 age,
+                _source_from_external_msg_id(evt.external_msg_id) or "unknown",
+                _external_msg_id_kind(evt.external_msg_id),
                 evt.external_msg_id,
                 evt.content or "",
             )
             evt.external_msg_id = None
+            external_msg_id_status = "dropped_stale_collision"
 
     # IMPORTANT: server time only.
     # We used to honour evt.sent_at (client clock) and that meant a phone
@@ -332,9 +356,15 @@ async def ingest_inbound_message(
         )
     if duplicate_inbound:
         log.info(
-            "[message-callback] duplicate conv=%s contact=%s external_msg_id=%s content=%r",
+            "[message-callback] event=ingest_dedupe outcome=skip reason=recent_same_content_or_cross_channel_replay "
+            "conv=%s contact=%s external_msg_id_status=%s source=%s id_kind=%s "
+            "original_external_msg_id=%s effective_external_msg_id=%s content=%r",
             conv.id,
             evt.contact.external_id,
+            external_msg_id_status,
+            _source_from_external_msg_id(evt.external_msg_id) or "unknown",
+            _external_msg_id_kind(evt.external_msg_id),
+            original_external_msg_id,
             evt.external_msg_id,
             cleaned,
         )
@@ -379,15 +409,23 @@ async def ingest_inbound_message(
     # eagerly load contact for serialization
     await db.refresh(conv, attribute_names=["contact"])
     log.info(
-        "[message-callback] persisted robot=%s conv=%s msg=%s contact=%s sender_type=%s "
-        "feedback_status=%s external_msg_id=%s content=%r",
+        "[message-callback] event=message_persisted outcome=stored robot=%s conv=%s msg=%s "
+        "contact=%s direction=%s sender_type=%s type=%s feedback_status=%s "
+        "external_msg_id_status=%s original_external_msg_id=%s stored_external_msg_id=%s "
+        "source=%s id_kind=%s content=%r",
         robot.robot_id,
         conv.id,
         msg.id,
         evt.contact.external_id,
+        msg.direction,
         evt.sender_type,
+        msg.type,
         msg.feedback_status,
+        external_msg_id_status,
+        original_external_msg_id,
         evt.external_msg_id,
+        _source_from_external_msg_id(original_external_msg_id) or "unknown",
+        _external_msg_id_kind(original_external_msg_id),
         cleaned,
     )
 
@@ -408,7 +446,7 @@ async def ingest_inbound_message(
 
     if not settings.auto_reply_enabled:
         log.info(
-            "[message-callback] auto-reply disabled conv=%s msg=%s mode=%s",
+            "[message-callback] event=auto_reply outcome=skip reason=global_disabled conv=%s msg=%s mode=%s",
             conv.id,
             msg.id,
             conv.mode,
@@ -417,7 +455,7 @@ async def ingest_inbound_message(
         from app.services import auto_reply_scheduler
 
         log.info(
-            "auto-reply wake robot=%s conv=%s msg=%s mode=%s source=message.received",
+            "[message-callback] event=auto_reply outcome=wake robot=%s conv=%s msg=%s mode=%s source=message.received",
             robot.robot_id,
             conv.id,
             msg.id,
@@ -426,7 +464,7 @@ async def ingest_inbound_message(
         auto_reply_scheduler.wake_robot(robot.id)
     elif from_customer:
         log.info(
-            "auto-reply skipped conv=%s msg=%s mode=%s",
+            "[message-callback] event=auto_reply outcome=skip reason=conversation_mode conv=%s msg=%s mode=%s",
             conv.id,
             msg.id,
             conv.mode,

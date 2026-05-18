@@ -127,11 +127,12 @@ async def _handle_event(robot: Robot, data: dict) -> None:
     if event == "message.received":
         evt = AndroidMessageReceived.model_validate(payload)
         log.info(
-            "[message-callback] ws received robot=%s contact=%s sender_type=%s "
-            "external_msg_id=%s content=%r",
+            "[message-callback] event=ws_received robot=%s contact=%s sender_type=%s "
+            "type=%s external_msg_id=%s content=%r",
             robot.robot_id,
             evt.contact.external_id,
             evt.sender_type,
+            evt.type,
             evt.external_msg_id,
             evt.content or "",
         )

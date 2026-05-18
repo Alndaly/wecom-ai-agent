@@ -119,6 +119,7 @@ class AgentForegroundService : Service() {
     )
     private val recentObservedInputs = ArrayDeque<RecentObservedInput>()
     private val observedInputTtlMs = 3 * 60_000L
+    private val stableExternalIdBucketMs = 10 * 60_000L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -970,7 +971,7 @@ class AgentForegroundService : Service() {
         }
         Log.i(
             tag,
-            "callback detected src=$src sender=$sender key=$messageKey type=$type content=$content",
+            "callback detected src=$src sender=$sender stable_key=$messageKey type=$type content=$content",
         )
         if (!fromSelf && type == "image") {
             scope.launch {
@@ -1125,8 +1126,10 @@ class AgentForegroundService : Service() {
         val normalizedSender = sender.trim().lowercase()
         val normalizedContent = normalizeMessageContent(content)
         val cleanStableKey = stableKey?.trim()?.takeIf { it.isNotEmpty() }
-        val identity = cleanStableKey?.let { "stable:${sha256Hex(it).take(20)}" } ?: postTimeMs.toString()
-        val raw = "$src|${cleanStableKey ?: postTimeMs.toString()}|$normalizedSender|$type|$normalizedContent"
+        val stableBucket = postTimeMs.floorDiv(stableExternalIdBucketMs)
+        val identitySeed = cleanStableKey?.let { "$it@$stableBucket" } ?: postTimeMs.toString()
+        val identity = cleanStableKey?.let { "stable:${sha256Hex(identitySeed).take(20)}" } ?: postTimeMs.toString()
+        val raw = "$src|$identitySeed|$normalizedSender|$type|$normalizedContent"
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(raw.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
@@ -1167,11 +1170,13 @@ class AgentForegroundService : Service() {
         if (!sent) {
             enqueuePendingInbound(PendingInbound(payload, src, senderType))
         }
+        val idKind = if (stableKey?.trim()?.isNotEmpty() == true) "stable_key_bucketed" else "post_time"
+        val stableBucket = if (stableKey?.trim()?.isNotEmpty() == true) postTimeMs.floorDiv(stableExternalIdBucketMs).toString() else ""
         broadcastLog(
             if (sent) "上报消息[$src/$senderType/$normalizedType] $sender :: $content"
             else "上报暂存(未连接)[$src/$senderType/$normalizedType] $sender :: $content"
         )
-        Log.i(tag, "callback sent src=$src senderType=$senderType type=$normalizedType sent=$sent queued=${!sent} external_msg_id=$externalId sender=$sender content=$content")
+        Log.i(tag, "callback sent src=$src senderType=$senderType type=$normalizedType sent=$sent queued=${!sent} id_kind=$idKind stable_bucket=$stableBucket stable_key=${stableKey ?: ""} external_msg_id=$externalId sender=$sender content=$content")
     }
 
     private fun sendInboundPayload(payload: MessageReceivedPayload): Boolean {
