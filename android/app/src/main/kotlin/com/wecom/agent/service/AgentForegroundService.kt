@@ -17,6 +17,7 @@ import com.wecom.agent.model.DeviceCommandAckPayload
 import com.wecom.agent.model.HeartbeatPayload
 import com.wecom.agent.model.MessageReceivedPayload
 import com.wecom.agent.model.ScreenFramePayload
+import com.wecom.agent.net.BackendApi
 import com.wecom.agent.net.BackendClient
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -112,6 +113,7 @@ class AgentForegroundService : Service() {
         val src: String,
         val sender: String,
         val senderType: String,
+        val type: String,
         val content: String,
         val at: Long,
     )
@@ -172,14 +174,17 @@ class AgentForegroundService : Service() {
         MessageNotificationListener.registerCallback { sender, content, postTime ->
             forwardInboundMessage(sender, content, postTime, viaNotification = true)
         }
-        WeComAccessibilityService.onChatMessage = { sender, content, fromSelf, messageKey ->
+        WeComAccessibilityService.onChatMessage = { sender, type, content, fromSelf, messageKey, bounds, relatedMediaBounds ->
             if (a11yInboundEnabled) {
                 forwardChatMessage(
                     sender,
+                    type,
                     content,
                     System.currentTimeMillis(),
                     fromSelf = fromSelf,
                     messageKey = messageKey,
+                    bounds = bounds,
+                    relatedMediaBounds = relatedMediaBounds,
                 )
             }
         }
@@ -939,39 +944,106 @@ class AgentForegroundService : Service() {
             tag,
             "callback detected src=${if (viaNotification) "notif" else "a11y"} sender=$sender content=$content",
         )
-        forwardMessage(sender, content, postTimeMs, senderType = "customer", src = if (viaNotification) "notif" else "a11y")
+        forwardMessage(sender, "text", content, postTimeMs, senderType = "customer", src = if (viaNotification) "notif" else "a11y")
     }
 
     private fun forwardChatMessage(
         sender: String,
+        type: String,
         content: String,
         postTimeMs: Long,
         fromSelf: Boolean,
         messageKey: String,
+        bounds: List<Int>,
+        relatedMediaBounds: List<Int>,
     ) {
-        if (fromSelf && isRecentAutomatedOutput(content)) {
+        if (type == "text" && fromSelf && isRecentAutomatedOutput(content)) {
             Log.i(tag, "skip automated self echo sender=$sender content=$content")
             broadcastLog("跳过自动发送回显[$sender] $content")
             return
         }
         val src = if (fromSelf) "a11y-self" else "a11y"
         val senderType = if (fromSelf) "human" else "customer"
-        if (isRecentObservedInput(src, sender, senderType, content)) {
-            Log.i(tag, "skip repeated a11y observation src=$src sender=$sender senderType=$senderType content=$content")
+        if (isRecentObservedInput(src, sender, senderType, type, content)) {
+            Log.i(tag, "skip repeated a11y observation src=$src sender=$sender senderType=$senderType type=$type content=$content")
             return
         }
         Log.i(
             tag,
-            "callback detected src=$src sender=$sender key=$messageKey content=$content",
+            "callback detected src=$src sender=$sender key=$messageKey type=$type content=$content",
         )
+        if (!fromSelf && type == "image") {
+            scope.launch {
+                val mediaJson = fetchInboundImageMedia(bounds)
+                forwardMessage(
+                    sender,
+                    type,
+                    content,
+                    postTimeMs,
+                    senderType = senderType,
+                    src = src,
+                    stableKey = messageKey,
+                    mediaJson = mediaJson,
+                )
+            }
+            return
+        }
+        if (!fromSelf && type == "text" && relatedMediaBounds.size == 4) {
+            scope.launch {
+                val mediaJson = fetchInboundImageMedia(relatedMediaBounds)
+                forwardMessage(
+                    sender,
+                    type,
+                    content,
+                    postTimeMs,
+                    senderType = senderType,
+                    src = src,
+                    stableKey = messageKey,
+                    mediaJson = mediaJson,
+                )
+            }
+            return
+        }
         forwardMessage(
             sender,
+            type,
             content,
             postTimeMs,
             senderType = senderType,
             src = src,
             stableKey = messageKey,
         )
+    }
+
+    private suspend fun fetchInboundImageMedia(bounds: List<Int>): JsonElement? {
+        val config = activeConnectionConfig
+        if (config == null) {
+            Log.w(tag, "skip inbound image upload: no active connection config")
+            return null
+        }
+        val automator = WeComAutomator(this) { msg -> broadcastLog("图片入站: $msg") }
+        val saved = automator.saveInboundImageFromBubble(bounds)
+        if (!saved.first || saved.third == null) {
+            Log.w(tag, "save inbound image failed: ${saved.second}")
+            broadcastLog("图片入站保存失败，将按占位消息上报：${saved.second}")
+            return null
+        }
+        val media = saved.third!!
+        val api = BackendApi(BackendApi.httpBaseFromWs(config.baseUrl), config.token)
+        val response = api.uploadInboundMedia(
+            robotId = config.robotId,
+            type = "image",
+            file = media.file,
+            mime = media.mime,
+            filename = media.filename,
+        )
+        val raw = response?.optJSONObject("media")?.toString()
+        if (raw.isNullOrBlank()) {
+            broadcastLog("图片入站上传失败，将按占位消息上报")
+            return null
+        }
+        broadcastLog("图片入站上传成功 ${media.filename} (${media.sizeBytes} bytes)")
+        return json.parseToJsonElement(raw)
     }
 
     @Synchronized
@@ -1009,6 +1081,7 @@ class AgentForegroundService : Service() {
         src: String,
         sender: String,
         senderType: String,
+        type: String,
         content: String,
     ): Boolean {
         val normalizedSender = sender.trim().lowercase()
@@ -1017,14 +1090,15 @@ class AgentForegroundService : Service() {
         val now = System.currentTimeMillis()
         gcObservedInputs(now)
         val seen = recentObservedInputs.any { item ->
-            item.src == src &&
+                item.src == src &&
                 item.sender == normalizedSender &&
                 item.senderType == senderType &&
+                item.type == type &&
                 item.content == normalizedContent
         }
         if (!seen) {
             recentObservedInputs.addLast(
-                RecentObservedInput(src, normalizedSender, senderType, normalizedContent, now)
+                RecentObservedInput(src, normalizedSender, senderType, type, normalizedContent, now)
             )
         }
         return seen
@@ -1043,6 +1117,7 @@ class AgentForegroundService : Service() {
     private fun stableInboundId(
         src: String,
         sender: String,
+        type: String,
         content: String,
         postTimeMs: Long,
         stableKey: String? = null,
@@ -1051,7 +1126,7 @@ class AgentForegroundService : Service() {
         val normalizedContent = normalizeMessageContent(content)
         val cleanStableKey = stableKey?.trim()?.takeIf { it.isNotEmpty() }
         val identity = cleanStableKey?.let { "stable:${sha256Hex(it).take(20)}" } ?: postTimeMs.toString()
-        val raw = "$src|${cleanStableKey ?: postTimeMs.toString()}|$normalizedSender|$normalizedContent"
+        val raw = "$src|${cleanStableKey ?: postTimeMs.toString()}|$normalizedSender|$type|$normalizedContent"
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(raw.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
@@ -1066,18 +1141,25 @@ class AgentForegroundService : Service() {
 
     private fun forwardMessage(
         sender: String,
+        type: String,
         content: String,
         postTimeMs: Long,
         senderType: String,
         src: String,
         stableKey: String? = null,
+        mediaJson: JsonElement? = null,
     ) {
-        val externalId = stableInboundId(src, sender, content, postTimeMs, stableKey)
+        val normalizedType = when (type) {
+            "image", "video" -> type
+            else -> "text"
+        }
+        val externalId = stableInboundId(src, sender, normalizedType, content, postTimeMs, stableKey)
         val payload = MessageReceivedPayload(
             contact = Contact(external_id = sender, nickname = sender),
             external_msg_id = externalId,
-            type = "text",
+            type = normalizedType,
             content = content,
+            media_json = mediaJson,
             sender_type = senderType,
             sent_at = Instant.ofEpochMilli(postTimeMs).toString(),
         )
@@ -1086,10 +1168,10 @@ class AgentForegroundService : Service() {
             enqueuePendingInbound(PendingInbound(payload, src, senderType))
         }
         broadcastLog(
-            if (sent) "上报消息[$src/$senderType] $sender :: $content"
-            else "上报暂存(未连接)[$src/$senderType] $sender :: $content"
+            if (sent) "上报消息[$src/$senderType/$normalizedType] $sender :: $content"
+            else "上报暂存(未连接)[$src/$senderType/$normalizedType] $sender :: $content"
         )
-        Log.i(tag, "callback sent src=$src senderType=$senderType sent=$sent queued=${!sent} external_msg_id=$externalId sender=$sender content=$content")
+        Log.i(tag, "callback sent src=$src senderType=$senderType type=$normalizedType sent=$sent queued=${!sent} external_msg_id=$externalId sender=$sender content=$content")
     }
 
     private fun sendInboundPayload(payload: MessageReceivedPayload): Boolean {

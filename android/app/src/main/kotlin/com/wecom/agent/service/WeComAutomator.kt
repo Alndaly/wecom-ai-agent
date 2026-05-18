@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.database.Cursor
 import android.graphics.Rect
 import android.media.MediaScannerConnection
 import android.net.Uri
@@ -21,6 +22,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.FileOutputStream
 import java.util.UUID
 
 data class NodeExpectation(
@@ -31,6 +33,13 @@ data class NodeExpectation(
     val bounds: List<Int>? = null,
     val editable: Boolean? = null,
     val clickable: Boolean? = null,
+)
+
+data class SavedInboundMedia(
+    val file: File,
+    val mime: String,
+    val filename: String,
+    val sizeBytes: Long,
 )
 
 /**
@@ -293,6 +302,112 @@ class WeComAutomator(
         val svc = a11y() ?: return false to "无障碍未启用"
         val ok = svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
         return ok to if (ok) "已回主屏" else "Home 手势失败"
+    }
+
+    suspend fun saveInboundImageFromBubble(bounds: List<Int>): Triple<Boolean, String, SavedInboundMedia?> =
+        withContext(Dispatchers.IO) {
+            if (bounds.size != 4) return@withContext Triple(false, "缺少图片气泡坐标", null)
+            val svc = a11y() ?: return@withContext Triple(false, "无障碍未启用", null)
+            val before = latestImageSnapshot()
+            val cx = ((bounds[0] + bounds[2]) / 2).toFloat()
+            val cy = ((bounds[1] + bounds[3]) / 2).toFloat()
+
+            val savedFromBubble = longPressAndTapSave(svc, cx, cy, before)
+            if (savedFromBubble != null) {
+                return@withContext Triple(true, "已从图片气泡保存原图", savedFromBubble)
+            }
+
+            // Some WeCom builds only expose save from the full-screen viewer.
+            if (!gestureTap(svc, cx, cy)) return@withContext Triple(false, "点击图片气泡失败", null)
+            delay(700)
+            val w = ctx.resources.displayMetrics.widthPixels / 2f
+            val h = ctx.resources.displayMetrics.heightPixels / 2f
+            val savedFromViewer = longPressAndTapSave(svc, w, h, before)
+            if (savedFromViewer != null) {
+                svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+                return@withContext Triple(true, "已打开图片并保存原图", savedFromViewer)
+            }
+            svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+            Triple(false, "未找到企微图片保存菜单或未检测到新保存图片", null)
+        }
+
+    private suspend fun longPressAndTapSave(
+        svc: AccessibilityService,
+        x: Float,
+        y: Float,
+        before: MediaSnapshot?,
+    ): SavedInboundMedia? {
+        if (!gestureLongPress(svc, x, y, 750L)) return null
+        delay(500)
+        val labels = listOf("保存图片", "保存到手机", "保存到相册", "保存")
+        val root = svc.rootInActiveWindow
+        val saveNode = labels.firstNotNullOfOrNull { label ->
+            root?.findFirst { matchesText(it, label) }
+        }
+        if (saveNode == null) {
+            svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+            return null
+        }
+        val target = saveNode.clickTarget() ?: saveNode
+        if (!target.tap()) return null
+        delay(1_000)
+        val saved = waitForNewImage(before)
+        return saved?.let { copyMediaToCache(it) }
+    }
+
+    private data class MediaSnapshot(val id: Long, val dateAdded: Long, val size: Long)
+    private data class MediaCandidate(val uri: Uri, val displayName: String, val mime: String, val size: Long)
+
+    private suspend fun latestImageSnapshot(): MediaSnapshot? = withContext(Dispatchers.IO) {
+        queryLatestImage()?.let { MediaSnapshot(it.uri.lastPathSegment?.toLongOrNull() ?: 0L, 0L, it.size) }
+    }
+
+    private suspend fun waitForNewImage(before: MediaSnapshot?, maxWaitMs: Long = 5_000L): MediaCandidate? =
+        withContext(Dispatchers.IO) {
+            val deadline = System.currentTimeMillis() + maxWaitMs
+            while (System.currentTimeMillis() < deadline) {
+                val latest = queryLatestImage()
+                if (latest != null && (before == null || latest.size != before.size || latest.uri.lastPathSegment?.toLongOrNull() != before.id)) {
+                    return@withContext latest
+                }
+                delay(250)
+            }
+            null
+        }
+
+    private fun queryLatestImage(): MediaCandidate? {
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.MIME_TYPE,
+            MediaStore.Images.Media.SIZE,
+        )
+        val sort = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        val cursor: Cursor = ctx.contentResolver.query(collection, projection, null, null, sort) ?: return null
+        cursor.use {
+            if (!it.moveToFirst()) return null
+            val id = it.getLong(0)
+            val name = it.getString(1) ?: "wecom-inbound.jpg"
+            val mime = it.getString(2) ?: "image/jpeg"
+            val size = it.getLong(3)
+            val uri = Uri.withAppendedPath(collection, id.toString())
+            return MediaCandidate(uri, name, mime, size)
+        }
+    }
+
+    private fun copyMediaToCache(media: MediaCandidate): SavedInboundMedia {
+        val safeName = safeMediaName(media.displayName).ifBlank { "wecom-inbound.jpg" }
+        val target = File(ctx.cacheDir, "inbound_${UUID.randomUUID().toString().replace("-", "").take(8)}_$safeName")
+        ctx.contentResolver.openInputStream(media.uri)?.use { input ->
+            FileOutputStream(target).use { output -> input.copyTo(output) }
+        } ?: error("无法读取保存后的图片")
+        return SavedInboundMedia(
+            file = target,
+            mime = media.mime,
+            filename = safeName,
+            sizeBytes = target.length().takeIf { it > 0 } ?: media.size,
+        )
     }
 
     /**

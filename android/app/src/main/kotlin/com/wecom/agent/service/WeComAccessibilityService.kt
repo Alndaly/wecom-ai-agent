@@ -34,7 +34,7 @@ class WeComAccessibilityService : AccessibilityService() {
             private set
 
         /** Set by AgentForegroundService; called for every fresh visible message bubble. */
-        @Volatile var onChatMessage: ((sender: String, content: String, fromSelf: Boolean, messageKey: String) -> Unit)? = null
+        @Volatile var onChatMessage: ((sender: String, type: String, content: String, fromSelf: Boolean, messageKey: String, bounds: List<Int>, relatedMediaBounds: List<Int>) -> Unit)? = null
     }
 
     private val tag = "WeComA11y"
@@ -50,13 +50,21 @@ class WeComAccessibilityService : AccessibilityService() {
     /** Dedupe per-session: we never re-fire the same visible bubble within a short window. */
     private data class RecentBubble(
         val chat: String,
+        val type: String,
         val content: String,
         val fromSelf: Boolean,
         val at: Long,
         val boundsKey: String = "",
     )
-    private data class ChatBubble(val content: String, val fromSelf: Boolean, val bounds: android.graphics.Rect)
+    private data class ChatBubble(
+        val type: String,
+        val content: String,
+        val fromSelf: Boolean,
+        val bounds: android.graphics.Rect,
+        val relatedMediaBounds: android.graphics.Rect? = null,
+    )
     private data class BubbleRole(val fromSelf: Boolean, val anchor: android.graphics.Rect)
+    private val recentLock = Any()
     private val recent = ArrayDeque<RecentBubble>()
     private val recentTtlMs = 10 * 60_000L
     private var baselineChatTitle: String? = null
@@ -448,7 +456,7 @@ class WeComAccessibilityService : AccessibilityService() {
 
         val candidates = collectChatBubbles(root, screenWidth)
         for (bubble in candidates) {
-            recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+            remember(RecentBubble(title, bubble.type, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
         }
         baselineChatTitle = title
         baselineReady = true
@@ -474,7 +482,7 @@ class WeComAccessibilityService : AccessibilityService() {
 
         if (!baselineReady || baselineChatTitle != title) {
             for (bubble in candidates) {
-                recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+                remember(RecentBubble(title, bubble.type, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
             }
             baselineChatTitle = title
             baselineReady = true
@@ -484,11 +492,18 @@ class WeComAccessibilityService : AccessibilityService() {
 
         var emitted = 0
         for (bubble in candidates) {
-            if (alreadySeen(title, bubble)) continue
-            recent.addLast(RecentBubble(title, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
-            cb(title, bubble.content, bubble.fromSelf, bubble.boundsKey())
+            if (!rememberIfUnseen(title, bubble, now)) continue
+            cb(
+                title,
+                bubble.type,
+                bubble.content,
+                bubble.fromSelf,
+                bubble.boundsKey(),
+                bubble.boundsList(),
+                bubble.relatedMediaBoundsList(),
+            )
             emitted++
-            Log.d(tag, "harvest chat=$title self=${bubble.fromSelf} reason=$reason content=${bubble.content}")
+            Log.d(tag, "harvest chat=$title self=${bubble.fromSelf} type=${bubble.type} reason=$reason content=${bubble.content}")
         }
         if (emitted == 0) {
             Log.d(tag, "chat scan no new title=$title candidates=${candidates.size} reason=$reason")
@@ -504,11 +519,32 @@ class WeComAccessibilityService : AccessibilityService() {
             if (cls.contains("TextView", true) && !n.text.isNullOrBlank()) {
                 val content = n.text.toString().trim()
                 classifyMessageBubble(n, screenWidth, content)?.let { candidates.add(it) }
+            } else {
+                classifyMediaBubble(n, screenWidth)?.let { candidates.add(it) }
             }
             for (i in 0 until n.childCount) walk(n.getChild(i))
         }
         walk(messageList)
-        return candidates
+        return attachAdjacentInboundImages(
+            candidates.distinctBy { "${it.type}:${it.fromSelf}:${it.boundsKey()}" }
+                .sortedBy { it.bounds.top }
+        )
+    }
+
+    private fun attachAdjacentInboundImages(candidates: List<ChatBubble>): List<ChatBubble> {
+        return candidates.mapIndexed { index, bubble ->
+            if (bubble.type != "text" || bubble.fromSelf) return@mapIndexed bubble
+            val image = candidates
+                .take(index)
+                .asReversed()
+                .firstOrNull {
+                    it.type == "image" &&
+                        !it.fromSelf &&
+                        it.bounds.bottom <= bubble.bounds.top + 80 &&
+                        bubble.bounds.top - it.bounds.bottom < 900
+                }
+            if (image == null) bubble else bubble.copy(relatedMediaBounds = image.bounds)
+        }
     }
 
     private fun classifyMessageBubble(
@@ -541,11 +577,59 @@ class WeComAccessibilityService : AccessibilityService() {
             .filter { it.width() in 24 until (screenWidth * 0.88f).toInt() }
             .maxByOrNull { it.width() }
             ?: role.anchor
-        return ChatBubble(content = content, fromSelf = role.fromSelf, bounds = bubbleRect)
+        return ChatBubble(type = "text", content = content, fromSelf = role.fromSelf, bounds = bubbleRect)
+    }
+
+    private fun classifyMediaBubble(
+        node: AccessibilityNodeInfo,
+        screenWidth: Int,
+    ): ChatBubble? {
+        val cls = node.className?.toString().orEmpty()
+        val id = node.viewIdResourceName?.substringAfterLast('/').orEmpty()
+        val text = node.text?.toString()?.trim().orEmpty()
+        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        if (text.isNotEmpty()) return null
+
+        val kind = inferMediaMessageType(cls, id, desc) ?: return null
+        val role = messageBubbleRole(node) ?: return null
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+        if (!isInMessageArea(bounds)) return null
+        if (bounds.width() < 40 || bounds.height() < 40) return null
+        if (bounds.width() > (screenWidth * 0.88f).toInt()) return null
+
+        val label = when (kind) {
+            "video" -> "[视频]"
+            else -> "[图片]"
+        }
+        return ChatBubble(type = kind, content = label, fromSelf = role.fromSelf, bounds = role.anchor)
+    }
+
+    private fun inferMediaMessageType(cls: String, id: String, desc: String): String? {
+        val haystack = "$cls $id $desc"
+        if (haystack.contains("video", true) || desc.contains("视频")) return "video"
+        if (
+            haystack.contains("image", true) ||
+            haystack.contains("photo", true) ||
+            haystack.contains("thumb", true) ||
+            cls.contains("ImageView", true) ||
+            desc.contains("图片") ||
+            desc.contains("照片")
+        ) return "image"
+        return null
     }
 
     private fun ChatBubble.boundsKey(): String {
         return "${bounds.left / 8}:${bounds.top / 8}:${bounds.right / 8}:${bounds.bottom / 8}"
+    }
+
+    private fun ChatBubble.boundsList(): List<Int> {
+        return listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)
+    }
+
+    private fun ChatBubble.relatedMediaBoundsList(): List<Int> {
+        val r = relatedMediaBounds ?: return emptyList()
+        return listOf(r.left, r.top, r.right, r.bottom)
     }
 
     private fun messageBubbleRole(node: AccessibilityNodeInfo): BubbleRole? {
@@ -585,6 +669,14 @@ class WeComAccessibilityService : AccessibilityService() {
             }
         }
         return null
+    }
+
+    private fun previewMessageType(preview: String): String {
+        return when (preview.trim()) {
+            "[图片]", "[图片消息]", "[图片表情]", "[Image]" -> "image"
+            "[视频]", "[Video]" -> "video"
+            else -> "text"
+        }
     }
 
     private fun looksLikeNonMessageText(content: String): Boolean {
@@ -631,26 +723,54 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private fun alreadySeen(sender: String, bubble: ChatBubble): Boolean {
-        for (item in recent) {
-            if (
-                item.chat == sender &&
-                item.content == bubble.content &&
-                item.fromSelf == bubble.fromSelf
-            ) return true
+        synchronized(recentLock) {
+            for (item in recent) {
+                if (
+                    item.chat == sender &&
+                    item.type == bubble.type &&
+                    item.content == bubble.content &&
+                    item.fromSelf == bubble.fromSelf
+                ) return true
+            }
         }
         return false
     }
 
     private fun alreadySeen(sender: String, content: String): Boolean {
-        for (item in recent) {
-            if (item.chat == sender && item.content == content && !item.fromSelf) return true
+        synchronized(recentLock) {
+            for (item in recent) {
+                if (item.chat == sender && item.content == content && !item.fromSelf) return true
+            }
         }
         return false
     }
 
     private fun gc(now: Long) {
-        while (recent.isNotEmpty() && now - recent.first().at > recentTtlMs) {
-            recent.removeFirst()
+        synchronized(recentLock) {
+            while (recent.isNotEmpty() && now - recent.first().at > recentTtlMs) {
+                recent.removeFirst()
+            }
+        }
+    }
+
+    private fun remember(item: RecentBubble) {
+        synchronized(recentLock) {
+            recent.addLast(item)
+        }
+    }
+
+    private fun rememberIfUnseen(sender: String, bubble: ChatBubble, now: Long): Boolean {
+        synchronized(recentLock) {
+            for (item in recent) {
+                if (
+                    item.chat == sender &&
+                    item.type == bubble.type &&
+                    item.content == bubble.content &&
+                    item.fromSelf == bubble.fromSelf
+                ) return false
+            }
+            recent.addLast(RecentBubble(sender, bubble.type, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+            return true
         }
     }
 
@@ -719,8 +839,9 @@ class WeComAccessibilityService : AccessibilityService() {
                 if (isOutboundPreview(row.preview)) continue
                 val key = "home:${row.name}:${row.preview}"
                 if (!emittedUnreadHomePreviews.add(key)) continue
-                recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now, boundsKey = key))
-                cb(row.name, row.preview, false, key)
+                val previewType = previewMessageType(row.preview)
+                remember(RecentBubble(row.name, previewType, row.preview, fromSelf = false, at = now, boundsKey = key))
+                cb(row.name, previewType, row.preview, false, key, emptyList(), emptyList())
                 emittedUnread++
             }
             homeBaselineReady = true
@@ -738,8 +859,9 @@ class WeComAccessibilityService : AccessibilityService() {
             homeListBaseline[row.name] = row.preview
             val key = "home:${row.name}:${row.preview}"
             if (!emittedUnreadHomePreviews.add(key)) continue
-            recent.addLast(RecentBubble(row.name, row.preview, fromSelf = false, at = now, boundsKey = key))
-            cb(row.name, row.preview, false, key)
+            val previewType = previewMessageType(row.preview)
+            remember(RecentBubble(row.name, previewType, row.preview, fromSelf = false, at = now, boundsKey = key))
+            cb(row.name, previewType, row.preview, false, key, emptyList(), emptyList())
             emitted++
             Log.d(
                 tag,

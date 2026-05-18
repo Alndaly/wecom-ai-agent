@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+import base64
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -35,6 +36,7 @@ from app.models import (
     utcnow,
 )
 from app.services import settings_service
+from app.services.media_store import resolve_media_path
 
 from .providers import ChatMessage, get_fallback_provider, get_provider
 
@@ -129,7 +131,7 @@ async def handle_inbound(
     # If the customer fired several messages in a row, run retrieval on the
     # concatenated text so the KB step sees the full intent, not just the
     # latest fragment ("还有，价格怎么算？" alone is uninformative).
-    retrieval_query = " ".join(m.content for m in state.unreplied_chain) or message.content
+    retrieval_query = " ".join(_message_prompt_text(m) for m in state.unreplied_chain) or _message_prompt_text(message)
     state.retrieval = await _retrieve(db, conv.team_id, retrieval_query)
 
     # 3. generate
@@ -230,9 +232,10 @@ async def _generate(state: AIState, db: AsyncSession) -> Decision:
     for m in state.history:
         role = "user" if m.direction == "in" else "assistant"
         label = "历史客户消息（已处理，仅供背景）" if role == "user" else "历史客服回复（已发送，仅供背景）"
-        msgs.append(ChatMessage(role=role, content=f"【{label}】{m.content}"))
-    chain_texts = [m.content for m in state.unreplied_chain] or [state.inbound.content]
-    msgs.append(ChatMessage(role="user", content=_format_unreplied_turn(chain_texts)))
+        msgs.append(ChatMessage(role=role, content=f"【{label}】{_message_prompt_text(m)}"))
+    chain_texts = [_message_prompt_text(m) for m in state.unreplied_chain] or [_message_prompt_text(state.inbound)]
+    images = _message_images(state.unreplied_chain or [state.inbound]) if _vision_enabled(llm_cfg) else []
+    msgs.append(ChatMessage(role="user", content=_format_unreplied_turn(chain_texts), images=images))
     try:
         result = await provider.chat(
             msgs,
@@ -296,6 +299,10 @@ def _agent_enabled(ai_cfg: dict) -> bool:
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _vision_enabled(llm_cfg: dict) -> bool:
+    return bool(llm_cfg.get("supports_vision"))
+
+
 def _format_unreplied_turn(chain: list[str]) -> str:
     cleaned = [c for c in chain if c]
     if not cleaned:
@@ -306,6 +313,41 @@ def _format_unreplied_turn(chain: list[str]) -> str:
     lines.extend(f"[{i}] {content}" for i, content in enumerate(cleaned, 1))
     lines.append("请只基于本轮未回复消息判断客户当前是否连续发送、是否需要合并回复。")
     return "\n".join(lines)
+
+
+def _message_prompt_text(message: Message) -> str:
+    body = (message.content or "").strip()
+    if message.media_json and message.type == "text":
+        if not body:
+            return "客户发送了一张图片。"
+        return f"客户发送了一张图片，并补充文字：{body}".strip()
+    if message.type == "image":
+        return f"客户发送了一张图片。{body}".strip()
+    if message.type == "video":
+        return f"客户发送了一个视频。{body}".strip()
+    return body
+
+
+def _message_images(messages: list[Message]) -> list[tuple[str, str]]:
+    images: list[tuple[str, str]] = []
+    for message in messages:
+        if not message.media_json:
+            continue
+        # Accept both `type=image` and the `type=text` + attached-image case
+        # (a11y can report an image bubble paired with a caption text bubble).
+        if message.type not in ("image", "text"):
+            continue
+        mime = str(message.media_json.get("mime") or "image/jpeg")
+        if not mime.startswith("image/"):
+            continue
+        path = resolve_media_path(message.media_json)
+        if path is None or not path.exists():
+            continue
+        try:
+            images.append((mime, base64.b64encode(path.read_bytes()).decode("ascii")))
+        except OSError:
+            log.exception("failed to read inbound image media message=%s", message.id)
+    return images
 
 
 def _llm_result_insufficient(text: str, confidence: float) -> bool:
@@ -340,18 +382,20 @@ async def _generate_via_agent(
 
     # Pass the full unreplied chain. The agent decides whether to answer
     # them all in one message or split into several.
-    chain_texts = [m.content for m in state.unreplied_chain] or [state.inbound.content]
+    chain_texts = [_message_prompt_text(m) for m in state.unreplied_chain] or [_message_prompt_text(state.inbound)]
+    images = _message_images(state.unreplied_chain or [state.inbound]) if _vision_enabled(llm_cfg) else []
     res = await run_conv_agent(
         db=db,
         team_id=state.conv.team_id,
         conversation_id=state.conv.id,
         contact_id=state.conv.contact_id,
-        inbound_text=state.inbound.content,
+        inbound_text=_message_prompt_text(state.inbound),
         trace_id=state.trace_id,
         system_prompt=system_prompt,
         profile_summary=state.memory_summary,
         history=state.history,
         unreplied_chain=chain_texts,
+        images=images,
         provider=provider,
         fallback_provider=fallback_provider,
         temperature=float(llm_cfg.get("temperature", settings.llm_temperature)),

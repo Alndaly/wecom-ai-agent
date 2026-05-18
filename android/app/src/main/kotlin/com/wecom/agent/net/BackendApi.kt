@@ -1,10 +1,13 @@
 package com.wecom.agent.net
 
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.io.File
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 data class UiAnalysisResult(
@@ -59,5 +62,38 @@ class BackendApi(
                 error = obj.optString("error").takeIf { it.isNotBlank() },
             )
         }
+    }
+
+    fun uploadInboundMedia(
+        robotId: String,
+        type: String,
+        file: File,
+        mime: String,
+        filename: String,
+    ): JSONObject? {
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("robot_id", robotId)
+            .addFormDataPart("token", token)
+            .addFormDataPart("type", type)
+            .addFormDataPart("file", filename, file.readBytes().toRequestBody(mime.toMediaType()))
+            .build()
+        val req = Request.Builder()
+            .url("${baseHttpUrl.trimEnd('/')}/android/inbound-media")
+            .post(body)
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val raw = resp.body?.string().orEmpty()
+            return JSONObject(raw)
+        }
+    }
+
+    companion object {
+        fun httpBaseFromWs(baseWsUrl: String): String =
+            baseWsUrl
+                .replaceFirst("ws://", "http://", ignoreCase = true)
+                .replaceFirst("wss://", "https://", ignoreCase = true)
+                .trimEnd('/')
     }
 }

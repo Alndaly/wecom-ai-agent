@@ -177,5 +177,6 @@ class AndroidMessageReceived(BaseModel):
     external_msg_id: str | None = None
     type: Literal["text", "image", "video"] = "text"
     content: str
+    media_json: dict | None = None
     sender_type: Literal["customer", "human"] = "customer"
     sent_at: datetime | None = None

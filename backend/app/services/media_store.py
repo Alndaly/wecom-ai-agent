@@ -59,6 +59,43 @@ async def persist_upload(upload: UploadFile, *, team_id: int, kind: str) -> dict
     }
 
 
+async def persist_upload_bytes(
+    raw: bytes,
+    *,
+    team_id: int,
+    kind: str,
+    mime: str,
+    filename: str,
+) -> dict:
+    mime = (mime or "").split(";", 1)[0].strip().lower()
+    if kind not in ALLOWED_MEDIA_MIME or mime not in ALLOWED_MEDIA_MIME[kind]:
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "unsupported media type")
+    max_bytes = MAX_IMAGE_BYTES if kind == "image" else MAX_VIDEO_BYTES
+    if not raw:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty media file")
+    if len(raw) > max_bytes:
+        limit = "15MB" if kind == "image" else "100MB"
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, f"media file exceeds {limit}")
+
+    original = _safe_original_name(filename or f"upload{EXT_BY_MIME.get(mime, '')}")
+    ext = EXT_BY_MIME.get(mime) or Path(original).suffix.lower()
+    stored = f"{uuid.uuid4().hex}{ext}"
+    root = MEDIA_ROOT / str(team_id)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / stored
+    path.write_bytes(raw)
+    token = secrets.token_urlsafe(32)
+    return {
+        "kind": kind,
+        "mime": mime,
+        "filename": original,
+        "storage_path": str(path),
+        "bytes": len(raw),
+        "download_token": token,
+        "url": f"/media/{token}",
+    }
+
+
 def resolve_media_path(meta: dict) -> Path | None:
     raw = str(meta.get("storage_path") or "")
     if not raw:

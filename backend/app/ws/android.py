@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
 from pathlib import Path
@@ -13,11 +13,35 @@ from app.core.ws_manager import hub
 from app.models import Robot
 from app.routers.robots import verify_robot_token
 from app.schemas import AndroidMessageReceived
+from app.services.media_store import persist_upload_bytes
 from app.services.conversation import ingest_inbound_message
 from app.services.send_orchestrator import append_task_log
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.post("/android/inbound-media")
+async def upload_inbound_media(
+    robot_id: str = Form(...),
+    token: str = Form(...),
+    type: str = Form(...),
+    file: UploadFile = File(...),
+) -> dict:
+    robot = await _auth_robot(robot_id, token)
+    if not robot:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid robot credentials")
+    if type not in {"image", "video"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "unsupported media type")
+    raw = await file.read()
+    media = await persist_upload_bytes(
+        raw,
+        team_id=robot.team_id,
+        kind=type,
+        mime=file.content_type or "",
+        filename=file.filename or "inbound-media",
+    )
+    return {"media": media}
 
 
 async def _auth_robot(robot_id: str, token: str) -> Robot | None:

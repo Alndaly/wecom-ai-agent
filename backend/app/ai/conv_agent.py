@@ -103,6 +103,7 @@ async def run_conv_agent(
     profile_summary: str,
     history,  # list[Message]
     unreplied_chain: list[str] | None = None,
+    images: list[tuple[str, str]] | None = None,
     provider,
     fallback_provider=None,
     temperature: float = 0.3,
@@ -156,9 +157,9 @@ async def run_conv_agent(
         for i, c in enumerate(chain, 1):
             bundle += f"\n[{i}] {c}"
         bundle += "\n\n请只基于本轮未回复消息判断客户当前是否连续发送，并决定用一条回复合并应对，或者用多条 replies（适合多个独立问题）。"
-        base_msgs.append(ChatMessage(role="user", content=bundle))
+        base_msgs.append(ChatMessage(role="user", content=bundle, images=images or []))
     else:
-        base_msgs.append(ChatMessage(role="user", content=f"【本轮未回复消息，共 1 条】\n[1] {chain[0]}"))
+        base_msgs.append(ChatMessage(role="user", content=f"【本轮未回复消息，共 1 条】\n[1] {chain[0]}", images=images or []))
 
     trace: list[dict[str, Any]] = []
     scratch_for_step: list[ChatMessage] = []

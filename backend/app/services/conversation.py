@@ -139,6 +139,20 @@ _AGG_PREFIX_RX = re.compile(r"^\s*\[\s*\d+\s*条\s*]\s*")
 _BOT_ECHO_RX = re.compile(r"^\s*收到您说的[「\"']")
 _TIME_ONLY_RX = re.compile(r"^\s*(上午|下午)?\s*\d{1,2}:\d{2}\s*$")
 
+# WeCom shows media messages in the conversation-list preview as a bracketed
+# placeholder ("[图片]", "[视频]", ...). When the device picks the message up
+# from the home harvest (not from the chat thread), we only get this text and
+# no media bytes. Upgrade the type so downstream prompt formatting and vision
+# routing treat it as media rather than a literal text question.
+_MEDIA_PLACEHOLDER_TO_TYPE: dict[str, str] = {
+    "[图片]": "image",
+    "[图片消息]": "image",
+    "[图片表情]": "image",
+    "[Image]": "image",
+    "[视频]": "video",
+    "[Video]": "video",
+}
+
 # WeCom internal system messages — these are platform notifications (weekly
 # summary, app announcements, password reset, etc.) that look like normal chat
 # bubbles but are NOT customer questions. Replying to them is embarrassing and
@@ -333,12 +347,21 @@ async def ingest_inbound_message(
             cleaned,
         )
         return None
+    effective_type = evt.type
+    if (
+        from_customer
+        and effective_type == "text"
+        and evt.media_json is None
+        and cleaned in _MEDIA_PLACEHOLDER_TO_TYPE
+    ):
+        effective_type = _MEDIA_PLACEHOLDER_TO_TYPE[cleaned]
     msg = Message(
         conversation_id=conv.id,
         direction="in" if from_customer else "out",
         sender_type="customer" if from_customer else "human",
-        type=evt.type,
+        type=effective_type,
         content=cleaned,
+        media_json=evt.media_json,
         external_msg_id=evt.external_msg_id,
         created_at=now,
         feedback_status="pending" if from_customer else None,
