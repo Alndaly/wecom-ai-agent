@@ -10,6 +10,7 @@ AI + 人工协同的企微私域运营智能体平台。
 backend/   FastAPI 服务（REST + WebSocket，SQLite/Postgres）
 web/       Next.js 管理台（工作台 / 设备 / …）
 android/   Kotlin RPA 客户端骨架
+clip-service/ 本地 CLIP / 多模态图片向量服务（资源库可选）
 tools/     mock_android.py / e2e_smoke.py
 docs/      产品文档
 ```
