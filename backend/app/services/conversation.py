@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.ws_manager import hub
 from app.memory import summarizer
-from app.models import Contact, Conversation, Message, Robot, utcnow
+from app.models import Contact, Conversation, Message, Robot, RobotTask, RobotTaskLog, utcnow
 from app.schemas import (
     AndroidMessageReceived,
     ConversationOut,
@@ -132,7 +132,7 @@ def _source_from_external_msg_id(external_msg_id: str | None) -> str | None:
     return None
 
 
-def _external_msg_id_kind(external_msg_id: str | None) -> str:
+def _external_message_id_kind(external_msg_id: str | None) -> str:
     if not external_msg_id:
         return "none"
     parts = external_msg_id.split(":", 2)
@@ -141,6 +141,124 @@ def _external_msg_id_kind(external_msg_id: str | None) -> str:
     if len(parts) >= 2 and parts[1].isdigit():
         return "post_time"
     return "unknown"
+
+
+async def _queue_chat_harvest_for_conversation_list_preview(
+    db: AsyncSession,
+    *,
+    robot: Robot,
+    conversation: Conversation,
+    contact_name: str,
+    preview: str,
+    unread_count: int,
+) -> bool:
+    # The conversation list only exposes the last unread message. When the
+    # unread badge says there are multiple messages, open the chat first so the
+    # accessibility collector can harvest the complete message bubbles.
+    active_tasks = (
+        await db.execute(
+            select(RobotTask)
+            .where(
+                RobotTask.robot_id == robot.id,
+                RobotTask.conversation_id == conversation.id,
+                RobotTask.type == "agent_goal",
+                RobotTask.status.in_(("pending", "dispatched", "queued", "running")),
+            )
+            .order_by(RobotTask.created_at.desc())
+            .limit(10)
+        )
+    ).scalars().all()
+    existing = next(
+        (
+            task
+            for task in active_tasks
+            if (task.payload_json or {}).get("reason") == "conversation_list_preview_multiple_unread"
+        ),
+        None,
+    )
+    if existing:
+        log.info(
+            "[message-callback] event=chat_harvest outcome=skip reason=task_already_active "
+            "robot=%s conversation_id=%s task_id=%s unread_count=%s preview_text=%r",
+            robot.robot_id,
+            conversation.id,
+            existing.id,
+            unread_count,
+            preview,
+        )
+        return True
+
+    goal = f"打开与「{contact_name}」的聊天，等待当前聊天页消息采集完成；不要发送任何内容。"
+    task = RobotTask(
+        robot_id=robot.id,
+        type="agent_goal",
+        payload_json={
+            "goal": goal,
+            "max_steps": 6,
+            "reason": "conversation_list_preview_multiple_unread",
+            "unread_count": unread_count,
+            "preview_text": preview,
+        },
+        status="dispatched",
+        priority=50,
+        conversation_id=conversation.id,
+    )
+    db.add(task)
+    await db.flush()
+    db.add(
+        RobotTaskLog(
+            robot_id=robot.id,
+            task_id=task.id,
+            level="info",
+            message=(
+                "会话列表预览显示多条未读，先打开聊天页采集完整消息气泡 "
+                f"unread_count={unread_count} preview_text={preview!r}"
+            ),
+        )
+    )
+    await db.commit()
+
+    from app.services import task_queue
+
+    await task_queue.enqueue(
+        robot.robot_id,
+        "agent_goal",
+        task.id,
+        priority=task_queue.PRIORITY_AUTO_REPLY,
+    )
+    log.info(
+        "[message-callback] event=chat_harvest outcome=queued robot=%s conversation_id=%s task_id=%s "
+        "reason=conversation_list_preview_multiple_unread unread_count=%s preview_text=%r",
+        robot.robot_id,
+        conversation.id,
+        task.id,
+        unread_count,
+        preview,
+    )
+    return True
+
+
+async def _has_active_conversation_list_harvest(
+    db: AsyncSession, *, robot_id: int, conversation_id: int
+) -> bool:
+    active_tasks = (
+        await db.execute(
+            select(RobotTask)
+            .where(
+                RobotTask.robot_id == robot_id,
+                RobotTask.conversation_id == conversation_id,
+                RobotTask.type == "agent_goal",
+                RobotTask.status.in_(("pending", "dispatched", "queued", "running")),
+            )
+            .order_by(RobotTask.created_at.desc())
+            .limit(10)
+        )
+    ).scalars().all()
+    return any(
+        (task.payload_json or {}).get("reason")
+        == "conversation_list_preview_multiple_unread"
+        for task in active_tasks
+    )
 
 # WeCom aggregates >1 pending unread messages in a single chat into a single
 # notification whose body is prefixed with "[N条]". The Android listener strips
@@ -152,7 +270,7 @@ _TIME_ONLY_RX = re.compile(r"^\s*(上午|下午)?\s*\d{1,2}:\d{2}\s*$")
 
 # WeCom shows media messages in the conversation-list preview as a bracketed
 # placeholder ("[图片]", "[视频]", ...). When the device picks the message up
-# from the home harvest (not from the chat thread), we only get this text and
+# from the conversation-list harvest (not from the chat thread), we only get this text and
 # no media bytes. Upgrade the type so downstream prompt formatting and vision
 # routing treat it as media rather than a literal text question.
 _MEDIA_PLACEHOLDER_TO_TYPE: dict[str, str] = {
@@ -301,25 +419,26 @@ async def ingest_inbound_message(
             if age <= timedelta(minutes=5):
                 log.info(
                     "[message-callback] event=ingest_dedupe outcome=skip reason=duplicate_external_msg_id "
-                    "conv=%s existing_msg=%s age=%s source=%s id_kind=%s external_msg_id=%s content=%r",
+                    "conversation_id=%s existing_message_id=%s age=%s collection_source=%s "
+                    "external_id_kind=%s external_msg_id=%s content=%r",
                     existing.conversation_id,
                     existing.id,
                     age,
                     _source_from_external_msg_id(evt.external_msg_id) or "unknown",
-                    _external_msg_id_kind(evt.external_msg_id),
+                    _external_message_id_kind(evt.external_msg_id),
                     evt.external_msg_id,
                     evt.content or "",
                 )
                 return None
             log.warning(
                 "[message-callback] event=ingest_dedupe outcome=accept reason=stale_external_msg_id_collision "
-                "action=drop_external_msg_id conv=%s existing_msg=%s age=%s stale_after=5m "
-                "source=%s id_kind=%s original_external_msg_id=%s content=%r",
+                "action=drop_external_msg_id conversation_id=%s existing_message_id=%s age=%s stale_after=5m "
+                "collection_source=%s external_id_kind=%s original_external_msg_id=%s content=%r",
                 conv.id,
                 existing.id,
                 age,
                 _source_from_external_msg_id(evt.external_msg_id) or "unknown",
-                _external_msg_id_kind(evt.external_msg_id),
+                _external_message_id_kind(evt.external_msg_id),
                 evt.external_msg_id,
                 evt.content or "",
             )
@@ -344,6 +463,31 @@ async def ingest_inbound_message(
             evt.contact.nickname, cleaned,
         )
         return None
+    if (
+        from_customer
+        and evt.observation_source == "conversation_list_preview"
+        and evt.completeness == "preview_only"
+        and int(evt.unread_count or 0) > 1
+    ):
+        await _queue_chat_harvest_for_conversation_list_preview(
+            db,
+            robot=robot,
+            conversation=conv,
+            contact_name=evt.contact.external_id,
+            preview=cleaned,
+            unread_count=int(evt.unread_count or 0),
+        )
+        log.info(
+            "[message-callback] event=message_ingest outcome=skip "
+            "reason=conversation_list_preview_incomplete_multiple_unread robot=%s "
+            "conversation_id=%s contact=%s unread_count=%s preview_text=%r",
+            robot.robot_id,
+            conv.id,
+            evt.contact.external_id,
+            evt.unread_count,
+            cleaned,
+        )
+        return None
     duplicate_inbound = False
     if from_customer:
         duplicate_inbound = await _is_cross_channel_replay(
@@ -357,13 +501,13 @@ async def ingest_inbound_message(
     if duplicate_inbound:
         log.info(
             "[message-callback] event=ingest_dedupe outcome=skip reason=recent_same_content_or_cross_channel_replay "
-            "conv=%s contact=%s external_msg_id_status=%s source=%s id_kind=%s "
+            "conversation_id=%s contact=%s external_msg_id_status=%s collection_source=%s external_id_kind=%s "
             "original_external_msg_id=%s effective_external_msg_id=%s content=%r",
             conv.id,
             evt.contact.external_id,
             external_msg_id_status,
             _source_from_external_msg_id(evt.external_msg_id) or "unknown",
-            _external_msg_id_kind(evt.external_msg_id),
+            _external_message_id_kind(evt.external_msg_id),
             original_external_msg_id,
             evt.external_msg_id,
             cleaned,
@@ -371,7 +515,7 @@ async def ingest_inbound_message(
         return None
     if not from_customer and await _has_recent_outbound_same_content(db, conv.id, cleaned, now):
         log.info(
-            "skip self echo already recorded conv=%s contact=%s content=%r",
+            "skip self echo already recorded conversation_id=%s contact=%s content=%r",
             conv.id,
             evt.contact.external_id,
             cleaned,
@@ -409,10 +553,10 @@ async def ingest_inbound_message(
     # eagerly load contact for serialization
     await db.refresh(conv, attribute_names=["contact"])
     log.info(
-        "[message-callback] event=message_persisted outcome=stored robot=%s conv=%s msg=%s "
+        "[message-callback] event=message_persisted outcome=stored robot=%s conversation_id=%s message_id=%s "
         "contact=%s direction=%s sender_type=%s type=%s feedback_status=%s "
         "external_msg_id_status=%s original_external_msg_id=%s stored_external_msg_id=%s "
-        "source=%s id_kind=%s content=%r",
+        "collection_source=%s external_id_kind=%s content=%r",
         robot.robot_id,
         conv.id,
         msg.id,
@@ -425,7 +569,7 @@ async def ingest_inbound_message(
         original_external_msg_id,
         evt.external_msg_id,
         _source_from_external_msg_id(original_external_msg_id) or "unknown",
-        _external_msg_id_kind(original_external_msg_id),
+        _external_message_id_kind(original_external_msg_id),
         cleaned,
     )
 
@@ -444,9 +588,20 @@ async def ingest_inbound_message(
         ConversationOut.model_validate(conv).model_dump(mode="json"),
     )
 
+    harvest_in_progress = from_customer and await _has_active_conversation_list_harvest(
+        db, robot_id=robot.id, conversation_id=conv.id
+    )
     if not settings.auto_reply_enabled:
         log.info(
-            "[message-callback] event=auto_reply outcome=skip reason=global_disabled conv=%s msg=%s mode=%s",
+            "[message-callback] event=auto_reply outcome=skip reason=global_disabled conversation_id=%s message_id=%s mode=%s",
+            conv.id,
+            msg.id,
+            conv.mode,
+        )
+    elif harvest_in_progress:
+        log.info(
+            "[message-callback] event=auto_reply outcome=defer "
+            "reason=conversation_list_harvest_in_progress conversation_id=%s message_id=%s mode=%s",
             conv.id,
             msg.id,
             conv.mode,
@@ -455,7 +610,7 @@ async def ingest_inbound_message(
         from app.services import auto_reply_scheduler
 
         log.info(
-            "[message-callback] event=auto_reply outcome=wake robot=%s conv=%s msg=%s mode=%s source=message.received",
+            "[message-callback] event=auto_reply outcome=wake robot=%s conversation_id=%s message_id=%s mode=%s source=message.received",
             robot.robot_id,
             conv.id,
             msg.id,
@@ -464,7 +619,7 @@ async def ingest_inbound_message(
         auto_reply_scheduler.wake_robot(robot.id)
     elif from_customer:
         log.info(
-            "[message-callback] event=auto_reply outcome=skip reason=conversation_mode conv=%s msg=%s mode=%s",
+            "[message-callback] event=auto_reply outcome=skip reason=conversation_mode conversation_id=%s message_id=%s mode=%s",
             conv.id,
             msg.id,
             conv.mode,
@@ -477,7 +632,7 @@ async def ingest_inbound_message(
         summarizer.schedule_refresh(contact.id, conv.id)
     else:
         log.info(
-            "[message-callback] memory refresh disabled conv=%s msg=%s",
+            "[message-callback] memory refresh disabled conversation_id=%s message_id=%s",
             conv.id,
             msg.id,
         )

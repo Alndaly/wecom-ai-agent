@@ -277,6 +277,7 @@ def _task_snapshot(task: RobotTask) -> dict:
         "priority": int(task.priority if task.priority is not None else _default_priority(task.type)),
         "waited_ms": max(waited_ms, 0),
         "cancellable": task.status != "running",
+        "warning": task.last_error,
     }
 
 

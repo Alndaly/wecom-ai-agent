@@ -85,6 +85,7 @@ export default function DeviceDetailPage() {
   const [frame, setFrame] = useState<ScreenFrame | null>(null);
   const [frameError, setFrameError] = useState<string | null>(null);
   const [lastCommandMessage, setLastCommandMessage] = useState<string | null>(null);
+  const [taskWarning, setTaskWarning] = useState<string | null>(null);
   const [dumping, setDumping] = useState(false);
   const [pendingDumpRequest, setPendingDumpRequest] = useState<string | null>(null);
   const [uiDump, setUiDump] = useState<UiDump | null>(null);
@@ -157,7 +158,10 @@ export default function DeviceDetailPage() {
       // Backend returns DESC by created_at — newest first, like a chat
       // / notification feed. We keep that order in the UI.
       api<RobotTaskLog[]>(`/robots/${id}/logs?limit=200`)
-        .then(setLogs)
+        .then((rows) => {
+          setLogs(rows);
+          setTaskWarning(latestHarvestWarning(rows));
+        })
         .catch(() => {});
     };
     loadLogs();
@@ -246,12 +250,23 @@ export default function DeviceDetailPage() {
         // Newest on top — prepend.
         return [row, ...prev];
       });
+      if (row.message.includes("[chat_harvest]")) {
+        setTaskWarning(latestHarvestWarning([row]));
+      }
     }
     if (event === "task.updated") {
+      if (
+        payload.robot_id === robot?.robot_id &&
+        typeof payload.error === "string" &&
+        payload.error.includes("采集")
+      ) {
+        setTaskWarning(payload.error);
+      }
       api<RobotQueueSnapshot>(`/robots/${id}/queue`).then(setQueue).catch(() => {});
     }
     if (event === "robot.logs_cleared" && robot?.robot_id === payload.robot_id) {
       setLogs([]);
+      setTaskWarning(null);
     }
   });
 
@@ -489,6 +504,7 @@ export default function DeviceDetailPage() {
               <StateRow label="实时屏幕" value={streaming ? "已开启" : "未开启"} active={streaming} />
               <StateRow label="屏幕帧" value={frame ? formatFull(frame.created_at) : "等待中"} />
               <StateRow label="最近命令" value={lastCommandMessage ?? "暂无"} />
+              {taskWarning && <StateRow label="采集告警" value={taskWarning} tone="warning" />}
               <StateRow
                 label="队列"
                 value={
@@ -671,11 +687,27 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function StateRow({ label, value, active = false }: { label: string; value: string; active?: boolean }) {
+function StateRow({
+  label,
+  value,
+  active = false,
+  tone = "normal",
+}: {
+  label: string;
+  value: string;
+  active?: boolean;
+  tone?: "normal" | "warning";
+}) {
+  const valueClass =
+    tone === "warning"
+      ? "text-amber-700 dark:text-amber-300"
+      : active
+        ? "text-emerald-700 dark:text-emerald-300"
+        : "";
   return (
     <div className="flex items-start justify-between gap-3">
       <span className="shrink-0 text-muted-foreground">{label}</span>
-      <span className={`min-w-0 break-words text-right font-medium ${active ? "text-emerald-700 dark:text-emerald-300" : ""}`}>
+      <span className={`min-w-0 break-words text-right font-medium ${valueClass}`}>
         {value}
       </span>
     </div>
@@ -737,6 +769,16 @@ function stripQuotes(s: string): string {
     return s.slice(1, -1);
   }
   return s;
+}
+
+function latestHarvestWarning(logs: RobotTaskLog[]): string | null {
+  for (const log of logs) {
+    if (!log.message.includes("[chat_harvest]")) continue;
+    const match = log.message.match(/\bwarning=(.*?)(?:\s+message=|$)/);
+    const warning = match?.[1]?.trim();
+    return warning || null;
+  }
+  return null;
 }
 
 function AgentCommandCard({
@@ -879,8 +921,15 @@ function QueueRow({
   cancelling: boolean;
   onCancel: (taskId: number) => void;
 }) {
+  const hasWarning = Boolean(item.warning);
   return (
-    <div className="rounded-md border bg-background px-3 py-2">
+    <div
+      className={`rounded-md border px-3 py-2 ${
+        hasWarning
+          ? "border-amber-200 bg-amber-50/70 dark:border-amber-900 dark:bg-amber-950/20"
+          : "bg-background"
+      }`}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -896,6 +945,11 @@ function QueueRow({
           {item.detail && (
             <div className="mt-0.5 line-clamp-2 break-words text-[11px] leading-snug text-muted-foreground">
               {item.detail}
+            </div>
+          )}
+          {item.warning && (
+            <div className="mt-1 line-clamp-3 break-words text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+              {item.warning}
             </div>
           )}
           <div className="mt-1 flex flex-wrap gap-2 font-mono text-[10.5px] text-muted-foreground">

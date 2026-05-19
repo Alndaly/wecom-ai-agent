@@ -1,7 +1,9 @@
 package com.wecom.agent.service
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.graphics.Bitmap
+import android.graphics.Path
 import android.os.Build
 import android.util.Base64
 import android.util.Log
@@ -13,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import kotlin.coroutines.resume
 
@@ -34,7 +37,7 @@ class WeComAccessibilityService : AccessibilityService() {
             private set
 
         /** Set by AgentForegroundService; called for every fresh visible message bubble. */
-        @Volatile var onChatMessage: ((sender: String, type: String, content: String, fromSelf: Boolean, messageKey: String, bounds: List<Int>, relatedMediaBounds: List<Int>) -> Unit)? = null
+        @Volatile var onChatMessage: ((sender: String, type: String, content: String, fromSelf: Boolean, messageKey: String, bounds: List<Int>, relatedMediaBounds: List<Int>, observationSource: String, unreadCount: Int?) -> Unit)? = null
     }
 
     private val tag = "WeComA11y"
@@ -63,6 +66,15 @@ class WeComAccessibilityService : AccessibilityService() {
         val bounds: android.graphics.Rect,
         val relatedMediaBounds: android.graphics.Rect? = null,
     )
+    data class ChatHarvestResult(
+        val requestedMessages: Int,
+        val emittedMessages: Int,
+        val observedBubbles: Int,
+        val scrollPages: Int,
+        val quietWindowMs: Long,
+        val maxDurationMs: Long,
+        val stoppedReason: String,
+    )
     private data class BubbleRole(val fromSelf: Boolean, val anchor: android.graphics.Rect)
     private val recentLock = Any()
     private val recent = ArrayDeque<RecentBubble>()
@@ -72,9 +84,9 @@ class WeComAccessibilityService : AccessibilityService() {
     /** Snapshot of the message-list rows seen the first time we land on it; we
      *  only emit rows whose preview *changes* compared to this baseline so we
      *  don't re-fire all history on startup. */
-    private val homeListBaseline = HashMap<String, String>()
-    private val emittedUnreadHomePreviews = HashSet<String>()
-    private var homeBaselineReady = false
+    private val conversationListBaseline = HashMap<String, String>()
+    private val emittedUnreadConversationListPreviews = HashSet<String>()
+    private var conversationListBaselineReady = false
     private var lastChatHarvestAt = 0L
     private data class CachedScreenshot(val atMs: Long, val quality: Int, val frame: ScreenFramePayload)
     private val screenshotMutex = Mutex()
@@ -116,7 +128,7 @@ class WeComAccessibilityService : AccessibilityService() {
         val root = rootInActiveWindow ?: return
         if (root.packageName?.toString() != "com.tencent.wework") return
         if (isMessagesListVisible(root)) {
-            maybeHarvestHomeList()
+            maybeHarvestConversationList()
         } else if (looksLikeChatPage(root)) {
             maybeHarvestChat(reason = reason)
         }
@@ -271,11 +283,15 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private suspend fun captureScreenOnceJpegBase64(quality: Int): ScreenFramePayload {
-        return suspendCancellableCoroutine { cont ->
-            takeScreenshot(
-                android.view.Display.DEFAULT_DISPLAY,
-                mainExecutor,
-                object : TakeScreenshotCallback {
+        // takeScreenshot is callback-based and on rare occasions the callback
+        // never fires (display gone, surface flinger stall). Don't let that
+        // wedge the caller — bound the wait and report the timeout explicitly.
+        return withTimeoutOrNull(8_000L) {
+            suspendCancellableCoroutine { cont ->
+                takeScreenshot(
+                    android.view.Display.DEFAULT_DISPLAY,
+                    mainExecutor,
+                    object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
                         val bitmap = Bitmap.wrapHardwareBuffer(
                             screenshot.hardwareBuffer,
@@ -308,6 +324,9 @@ class WeComAccessibilityService : AccessibilityService() {
                     }
                 },
             )
+            }
+        } ?: ScreenFramePayload(error = "截图失败：回调超时(8s)").also {
+            Log.w(tag, "screenshot callback timeout after 8s — takeScreenshot never called back")
         }
     }
 
@@ -354,9 +373,9 @@ class WeComAccessibilityService : AccessibilityService() {
         if (currentPage != Page.HOME) {
             // re-prime the home-list baseline on next entry to avoid replaying
             // stale previews after a navigation away.
-            homeListBaseline.clear()
-            emittedUnreadHomePreviews.clear()
-            homeBaselineReady = false
+            conversationListBaseline.clear()
+            emittedUnreadConversationListPreviews.clear()
+            conversationListBaselineReady = false
         }
     }
 
@@ -447,6 +466,226 @@ class WeComAccessibilityService : AccessibilityService() {
         if (looksLikeChatPage(root)) primeCurrentChatBaseline(reason = "force")
     }
 
+    suspend fun forceEmitRecentCustomerBubbles(
+        maxMessages: Int,
+        quietWindowMs: Long,
+        maxDurationMs: Long,
+    ): ChatHarvestResult {
+        val requestedMessages = maxMessages.coerceIn(1, 30)
+        val quietWindow = quietWindowMs.coerceIn(500L, 5_000L)
+        val maxDuration = maxDurationMs.coerceIn(2_000L, 20_000L)
+        val emptyResult = ChatHarvestResult(
+            requestedMessages = requestedMessages,
+            emittedMessages = 0,
+            observedBubbles = 0,
+            scrollPages = 0,
+            quietWindowMs = quietWindow,
+            maxDurationMs = maxDuration,
+            stoppedReason = "chat_not_ready",
+        )
+        val cb = onChatMessage ?: return emptyResult
+        val root = rootInActiveWindow ?: return emptyResult
+        if (root.packageName?.toString() != "com.tencent.wework") return emptyResult
+        if (!looksLikeChatPage(root)) return emptyResult
+
+        val title = refreshChatTitle(root) ?: "当前聊天"
+        val now = System.currentTimeMillis()
+        val deadlineAt = now + maxDuration
+        gc(now)
+
+        val olderPages = mutableListOf<List<ChatBubble>>()
+        val quietPages = mutableListOf<List<ChatBubble>>()
+        var swipes = 0
+        val maxSwipes = when {
+            requestedMessages <= 5 -> 1
+            requestedMessages <= 10 -> 2
+            else -> 4
+        }
+        // noMorePages becomes true when there's nothing useful left to scroll
+        // for. Two ways to hit it:
+        //   1. swipeChatTowardOlderMessages() returned false (gesture dropped
+        //      or list isn't scrollable) — see swipe() for the drop logging.
+        //   2. swipe succeeded but the new page exposed zero new bubbles, i.e.
+        //      we're already at the top of the chat history.
+        // Once true, the quiet loop is allowed to terminate on the quiet
+        // window instead of burning the full deadline.
+        var noMorePages = false
+
+        while (true) {
+            olderPages.add(collectCurrentCustomerBubbles())
+            val observedBeforeSwipe = orderedUniqueBubbles(olderPages, quietPages).size
+            if (observedBeforeSwipe >= requestedMessages) break
+            if (swipes >= maxSwipes) {
+                noMorePages = true
+                break
+            }
+            if (System.currentTimeMillis() >= deadlineAt) break
+            val swiped = swipeChatTowardOlderMessages()
+            if (!swiped) {
+                noMorePages = true
+                break
+            }
+            swipes++
+            delay(450)
+            // Confirm the swipe actually exposed new content. If a swipe +
+            // re-collect added zero new unique bubbles, we're at the top of
+            // the chat (or the scroller is wedged) — stop burning swipes.
+            olderPages.add(collectCurrentCustomerBubbles())
+            val observedAfterSwipe = orderedUniqueBubbles(olderPages, quietPages).size
+            if (observedAfterSwipe == observedBeforeSwipe) {
+                Log.i(tag, "harvest reached top contact=$title swipes=$swipes observed=$observedAfterSwipe")
+                noMorePages = true
+                break
+            }
+        }
+
+        repeat(swipes) {
+            swipeChatTowardNewerMessages()
+            delay(180)
+        }
+
+        var lastNewBubbleAt = System.currentTimeMillis()
+        var lastObservedCount = orderedUniqueBubbles(olderPages, quietPages).size
+        var stoppedReason = "quiet_window_reached"
+        while (true) {
+            quietPages.add(collectCurrentCustomerBubbles())
+            val observed = orderedUniqueBubbles(olderPages, quietPages).size
+            if (observed > lastObservedCount) {
+                lastObservedCount = observed
+                lastNewBubbleAt = System.currentTimeMillis()
+            }
+
+            val nowLoop = System.currentTimeMillis()
+            val enoughMessagesOrNoMorePages =
+                observed >= requestedMessages || swipes >= maxSwipes || noMorePages
+            if (observed > 0 && enoughMessagesOrNoMorePages && nowLoop - lastNewBubbleAt >= quietWindow) {
+                stoppedReason = "quiet_window_reached"
+                break
+            }
+            if (observed >= requestedMessages && observed >= 30) {
+                stoppedReason = "max_messages_reached"
+                break
+            }
+            if (nowLoop >= deadlineAt) {
+                stoppedReason = "max_duration_reached"
+                break
+            }
+            delay(250)
+        }
+
+        val observedBubbles = orderedUniqueBubbles(olderPages, quietPages)
+        val bubbles = observedBubbles
+            .takeLast(requestedMessages)
+
+        var emitted = 0
+        for (bubble in bubbles) {
+            remember(RecentBubble(title, bubble.type, bubble.content, bubble.fromSelf, now, bubble.boundsKey()))
+            cb(
+                title,
+                bubble.type,
+                bubble.content,
+                bubble.fromSelf,
+                bubble.boundsKey(),
+                bubble.boundsList(),
+                bubble.relatedMediaBoundsList(),
+                "chat_message_bubble",
+                null,
+            )
+            emitted++
+        }
+        baselineChatTitle = title
+        baselineReady = true
+        lastChatHarvestAt = System.currentTimeMillis()
+        Log.i(tag, "forced chat harvest contact=$title requested_messages=$requestedMessages emitted=$emitted observed=${observedBubbles.size} scroll_pages=$swipes stopped_reason=$stoppedReason quiet_window_ms=$quietWindow max_duration_ms=$maxDuration")
+        return ChatHarvestResult(
+            requestedMessages = requestedMessages,
+            emittedMessages = emitted,
+            observedBubbles = observedBubbles.size,
+            scrollPages = swipes,
+            quietWindowMs = quietWindow,
+            maxDurationMs = maxDuration,
+            stoppedReason = stoppedReason,
+        )
+    }
+
+    private fun collectCurrentCustomerBubbles(): List<ChatBubble> {
+        val root = rootInActiveWindow ?: return emptyList()
+        val screenWidth = resources.displayMetrics.widthPixels
+        return collectChatBubbles(root, screenWidth)
+            .filter { !it.fromSelf }
+            .sortedBy { it.bounds.top }
+    }
+
+    private fun orderedUniqueBubbles(
+        olderPages: List<List<ChatBubble>>,
+        quietPages: List<List<ChatBubble>>,
+    ): List<ChatBubble> {
+        val out = LinkedHashMap<String, ChatBubble>()
+        for (page in olderPages.asReversed()) {
+            for (bubble in page) out.putIfAbsent(harvestBubbleKey(bubble), bubble)
+        }
+        for (page in quietPages) {
+            for (bubble in page) out.putIfAbsent(harvestBubbleKey(bubble), bubble)
+        }
+        return out.values.toList()
+    }
+
+    private fun harvestBubbleKey(bubble: ChatBubble): String {
+        return "${bubble.type}:${bubble.content}:${bubble.boundsKey()}"
+    }
+
+    private suspend fun swipeChatTowardOlderMessages(): Boolean =
+        scrollChatList(forward = false, durationMs = 260)
+
+    private suspend fun swipeChatTowardNewerMessages(): Boolean =
+        scrollChatList(forward = true, durationMs = 220)
+
+    /**
+     * Scrolls the chat ListView via the a11y ACTION_SCROLL_* action when
+     * possible — that path goes through the view's own scroll handler and
+     * doesn't suffer from the dispatchGesture callback-never-fires problem
+     * we kept hitting on WeCom. Falls back to a coordinate swipe (with the
+     * timeout-bounded wrapper) if the node refuses the action.
+     *
+     * forward=false → toward older messages (scroll up the chat history).
+     * forward=true  → toward newer messages (scroll back down to latest).
+     */
+    private suspend fun scrollChatList(forward: Boolean, durationMs: Long): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val node = findChatMessageList(root)
+        if (node != null && node.isScrollable) {
+            val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+            else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            val ok = node.performAction(action)
+            if (ok) return true
+            Log.w(tag, "chat scroll action rejected forward=$forward — falling back to gesture")
+        } else {
+            Log.w(
+                tag,
+                "chat scroll node missing or not scrollable (node=${node != null}) — falling back to gesture",
+            )
+        }
+        val bounds = currentChatMessageListBounds() ?: return false
+        val x = bounds.centerX().toFloat()
+        return if (forward) {
+            val fromY = bounds.bottom - bounds.height() * 0.12f
+            val toY = bounds.top + bounds.height() * 0.28f
+            swipe(x, fromY, x, toY, durationMs = durationMs)
+        } else {
+            val fromY = bounds.top + bounds.height() * 0.28f
+            val toY = bounds.bottom - bounds.height() * 0.12f
+            swipe(x, fromY, x, toY, durationMs = durationMs)
+        }
+    }
+
+    private fun currentChatMessageListBounds(): android.graphics.Rect? {
+        val root = rootInActiveWindow ?: return null
+        val node = findChatMessageList(root) ?: return null
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+        return bounds.takeUnless { it.isEmpty }
+    }
+
     private fun primeCurrentChatBaseline(reason: String) {
         val root = rootInActiveWindow ?: return
         val title = refreshChatTitle(root) ?: "当前聊天"
@@ -501,6 +740,8 @@ class WeComAccessibilityService : AccessibilityService() {
                 bubble.boundsKey(),
                 bubble.boundsList(),
                 bubble.relatedMediaBoundsList(),
+                "chat_message_bubble",
+                null,
             )
             emitted++
             Log.d(tag, "harvest chat=$title self=${bubble.fromSelf} type=${bubble.type} reason=$reason content=${bubble.content}")
@@ -774,6 +1015,57 @@ class WeComAccessibilityService : AccessibilityService() {
         }
     }
 
+    private suspend fun swipe(
+        x1: Float,
+        y1: Float,
+        x2: Float,
+        y2: Float,
+        durationMs: Long,
+    ): Boolean {
+        val path = Path().apply {
+            moveTo(x1, y1)
+            lineTo(x2, y2)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        // dispatchGesture's callback may never fire if the gesture pipeline drops
+        // the stroke (system busy, conflicting gesture, etc). Time it out instead
+        // of hanging the entire ReAct command, and log loudly when it happens —
+        // a silent gesture drop is the kind of thing we must never lose.
+        val budget = durationMs + 1_500L
+        val raw = withTimeoutOrNull(budget) {
+            suspendCancellableCoroutine { cont ->
+                val dispatched = dispatchGesture(
+                    gesture,
+                    object : GestureResultCallback() {
+                        override fun onCompleted(gestureDescription: GestureDescription?) {
+                            if (cont.isActive) cont.resume(true)
+                        }
+
+                        override fun onCancelled(gestureDescription: GestureDescription?) {
+                            if (cont.isActive) cont.resume(false)
+                        }
+                    },
+                    null,
+                )
+                if (!dispatched && cont.isActive) cont.resume(false)
+            }
+        }
+        val outcome = when (raw) {
+            true -> "completed"
+            false -> "cancelled_or_rejected"
+            null -> "callback_timeout"
+        }
+        val accepted = raw == true
+        if (!accepted) {
+            Log.w(
+                tag,
+                "swipe drop x=($x1,$y1)->($x2,$y2) duration=${durationMs}ms budget=${budget}ms outcome=$outcome",
+            )
+        }
+        return accepted
+    }
+
     // ---- public hooks for the periodic message-list scanner -----------------
     fun isWeComForeground(): Boolean {
         val pkg = rootInActiveWindow?.packageName?.toString().orEmpty()
@@ -787,8 +1079,8 @@ class WeComAccessibilityService : AccessibilityService() {
 
     /** Force a harvest of whatever is currently visible. Same logic as the
      *  WINDOW_CONTENT_CHANGED handler but driven externally. */
-    fun forceHarvestHomeList() {
-        maybeHarvestHomeList()
+    fun forceHarvestConversationList() {
+        maybeHarvestConversationList()
     }
 
     /** Returns the bounds (in screen px) of the conversation list, so the
@@ -799,6 +1091,26 @@ class WeComAccessibilityService : AccessibilityService() {
         val r = android.graphics.Rect()
         list.getBoundsInScreen(r)
         return r
+    }
+
+    /**
+     * Scroll the conversation list via the a11y ACTION_SCROLL_* action. Same
+     * reasoning as scrollChatList: this is far more reliable than injecting
+     * a swipe gesture, which we've seen get silently dropped by the gesture
+     * pipeline. Returns false if the node isn't found or refuses the action,
+     * so the caller can fall back to a coordinate swipe.
+     *
+     * forward=true → scroll toward older conversations (down the list).
+     */
+    fun scrollMessagesList(forward: Boolean): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val list = findConversationListScrollable(root) ?: return false
+        if (!list.isScrollable) return false
+        val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        val ok = list.performAction(action)
+        if (!ok) Log.w(tag, "conversation list scroll rejected forward=$forward")
+        return ok
     }
 
     // ---------------------------------------------------- harvest 消息 tab
@@ -816,7 +1128,7 @@ class WeComAccessibilityService : AccessibilityService() {
      *    the rest joined form the preview.
      *  - Outbound previews (prefixed with "我:" / "我：" / "[草稿]") are skipped.
      */
-    private fun maybeHarvestHomeList() {
+    private fun maybeHarvestConversationList() {
         val cb = onChatMessage ?: return
         val root = rootInActiveWindow ?: return
         if (!isMessagesListVisible(root)) return
@@ -826,26 +1138,26 @@ class WeComAccessibilityService : AccessibilityService() {
 
         val rows = collectListRows(root)
         if (rows.isEmpty()) {
-            Log.i(tag, "home harvest skipped: no conversation rows")
+            Log.i(tag, "conversation list harvest skipped: no conversation rows")
             return
         }
 
-        if (!homeBaselineReady) {
+        if (!conversationListBaselineReady) {
             var emittedUnread = 0
             for (row in rows) {
-                homeListBaseline[row.name] = row.preview
+                conversationListBaseline[row.name] = row.preview
                 if (!row.hasUnread) continue
                 if (row.preview.isEmpty()) continue
                 if (isOutboundPreview(row.preview)) continue
-                val key = "home:${row.name}:${row.preview}"
-                if (!emittedUnreadHomePreviews.add(key)) continue
+                val key = "conversation_list:${row.name}:${row.preview}:unread=${row.unreadCount}"
+                if (!emittedUnreadConversationListPreviews.add(key)) continue
                 val previewType = previewMessageType(row.preview)
                 remember(RecentBubble(row.name, previewType, row.preview, fromSelf = false, at = now, boundsKey = key))
-                cb(row.name, previewType, row.preview, false, key, emptyList(), emptyList())
+                cb(row.name, previewType, row.preview, false, key, emptyList(), emptyList(), "conversation_list_preview", row.unreadCount)
                 emittedUnread++
             }
-            homeBaselineReady = true
-            Log.i(tag, "home baseline primed rows=${rows.size} unreadRows=${rows.count { it.hasUnread }} emittedUnread=$emittedUnread")
+            conversationListBaselineReady = true
+            Log.i(tag, "conversation list baseline primed rows=${rows.size} unread_rows=${rows.count { it.hasUnread }} emitted_unread_rows=$emittedUnread")
             return
         }
 
@@ -853,22 +1165,22 @@ class WeComAccessibilityService : AccessibilityService() {
         for (row in rows) {
             if (row.preview.isEmpty()) continue
             if (isOutboundPreview(row.preview)) continue
-            val prev = homeListBaseline[row.name]
-            val changed = prev != row.preview
+            val previousPreviewText = conversationListBaseline[row.name]
+            val changed = previousPreviewText != row.preview
             if (!changed && !row.hasUnread) continue
-            homeListBaseline[row.name] = row.preview
-            val key = "home:${row.name}:${row.preview}"
-            if (!emittedUnreadHomePreviews.add(key)) continue
+            conversationListBaseline[row.name] = row.preview
+            val key = "conversation_list:${row.name}:${row.preview}:unread=${row.unreadCount}"
+            if (!emittedUnreadConversationListPreviews.add(key)) continue
             val previewType = previewMessageType(row.preview)
             remember(RecentBubble(row.name, previewType, row.preview, fromSelf = false, at = now, boundsKey = key))
-            cb(row.name, previewType, row.preview, false, key, emptyList(), emptyList())
+            cb(row.name, previewType, row.preview, false, key, emptyList(), emptyList(), "conversation_list_preview", row.unreadCount)
             emitted++
             Log.d(
                 tag,
-                "home harvest name=${row.name} unread=${row.hasUnread} changed=$changed preview=${row.preview}",
+                "conversation list harvest contact=${row.name} has_unread=${row.hasUnread} preview_changed=$changed preview_text=${row.preview}",
             )
         }
-        Log.i(tag, "home harvest checked rows=${rows.size} unreadRows=${rows.count { it.hasUnread }} emitted=$emitted")
+        Log.i(tag, "conversation list harvest checked rows=${rows.size} unread_rows=${rows.count { it.hasUnread }} emitted=$emitted")
     }
 
     private fun isMessagesListVisible(root: AccessibilityNodeInfo): Boolean {
@@ -892,25 +1204,26 @@ class WeComAccessibilityService : AccessibilityService() {
         return found
     }
 
-    private data class HomeListRow(
+    private data class ConversationListRow(
         val name: String,
         val preview: String,
         val hasUnread: Boolean,
+        val unreadCount: Int,
     )
 
-    private data class HomeListText(
+    private data class ConversationListText(
         val y: Int,
         val x: Int,
         val id: String,
         val text: String,
     )
 
-    private fun collectListRows(root: AccessibilityNodeInfo): List<HomeListRow> {
+    private fun collectListRows(root: AccessibilityNodeInfo): List<ConversationListRow> {
         val list = findConversationListScrollable(root) ?: run {
-            Log.i(tag, "home harvest skipped: no scrollable conversation list")
+            Log.i(tag, "conversation list harvest skipped: no scrollable conversation list")
             return emptyList()
         }
-        val out = mutableListOf<HomeListRow>()
+        val out = mutableListOf<ConversationListRow>()
         val screenHeight = resources.displayMetrics.heightPixels
         val headerCutoff = (screenHeight * 0.09f).toInt()
         val footerCutoff = (screenHeight * 0.90f).toInt()
@@ -921,7 +1234,7 @@ class WeComAccessibilityService : AccessibilityService() {
             row.getBoundsInScreen(rowBounds)
             if (rowBounds.bottom < headerCutoff || rowBounds.top > footerCutoff) continue
 
-            val texts = mutableListOf<HomeListText>()
+            val texts = mutableListOf<ConversationListText>()
             fun walk(n: AccessibilityNodeInfo?) {
                 n ?: return
                 val cls = n.className?.toString().orEmpty()
@@ -931,7 +1244,7 @@ class WeComAccessibilityService : AccessibilityService() {
                         val r = android.graphics.Rect()
                         n.getBoundsInScreen(r)
                         texts.add(
-                            HomeListText(
+                            ConversationListText(
                                 y = r.centerY(),
                                 x = r.centerX(),
                                 id = n.viewIdResourceName?.substringAfterLast('/').orEmpty(),
@@ -945,20 +1258,20 @@ class WeComAccessibilityService : AccessibilityService() {
             walk(row)
             if (texts.size < 2) continue
 
-            texts.sortWith(compareBy<HomeListText> { it.y }.thenBy { it.x })
-            val idBased = parseHomeRowByKnownFields(texts)
-            val fallback = idBased ?: parseHomeRowByTextShape(texts)
+            texts.sortWith(compareBy<ConversationListText> { it.y }.thenBy { it.x })
+            val idBased = parseConversationListRowByKnownFields(texts)
+            val fallback = idBased ?: parseConversationListRowByTextShape(texts)
             val parsed = fallback ?: continue
-            val (name, preview, hasUnread) = parsed
+            val (name, preview, hasUnread, unreadCount) = parsed
             if (preview.isBlank()) continue
-            out.add(HomeListRow(name = name, preview = preview, hasUnread = hasUnread))
-            Log.d(tag, "home row parsed name=$name unread=$hasUnread preview=$preview")
+            out.add(ConversationListRow(name = name, preview = preview, hasUnread = hasUnread, unreadCount = unreadCount))
+            Log.d(tag, "conversation list row parsed contact=$name has_unread=$hasUnread unread_count=$unreadCount preview_text=$preview")
         }
-        Log.i(tag, "home rows parsed=${out.size} listChildren=${list.childCount}")
+        Log.i(tag, "conversation list rows parsed=${out.size} list_children=${list.childCount}")
         return out
     }
 
-    private fun parseHomeRowByKnownFields(texts: List<HomeListText>): HomeListRow? {
+    private fun parseConversationListRowByKnownFields(texts: List<ConversationListText>): ConversationListRow? {
         val name = texts
             .firstOrNull { it.id == "hrr" && !looksLikeBottomTabLabel(it.text) && it.text != "消息" }
             ?.text
@@ -967,11 +1280,14 @@ class WeComAccessibilityService : AccessibilityService() {
             .firstOrNull { it.id == "mdj" && it.text.isNotBlank() }
             ?.text
             ?: return null
-        val hasUnread = texts.any { it.id == "ko_" && looksLikeUnreadBadge(it.text) }
-        return HomeListRow(name = name, preview = preview, hasUnread = hasUnread)
+        val unreadCount = texts
+            .filter { it.id == "ko_" }
+            .mapNotNull { unreadBadgeCount(it.text) }
+            .maxOrNull() ?: 0
+        return ConversationListRow(name = name, preview = preview, hasUnread = unreadCount > 0, unreadCount = unreadCount)
     }
 
-    private fun parseHomeRowByTextShape(texts: List<HomeListText>): HomeListRow? {
+    private fun parseConversationListRowByTextShape(texts: List<ConversationListText>): ConversationListRow? {
         val name = texts
             .map { it.text }
             .firstOrNull {
@@ -988,8 +1304,8 @@ class WeComAccessibilityService : AccessibilityService() {
             .filterNot { looksLikeBottomTabLabel(it) }
         if (rest.isEmpty()) return null
         val preview = rest.maxByOrNull { it.length }?.trim() ?: return null
-        val hasUnread = texts.any { looksLikeUnreadBadge(it.text) }
-        return HomeListRow(name = name, preview = preview, hasUnread = hasUnread)
+        val unreadCount = texts.mapNotNull { unreadBadgeCount(it.text) }.maxOrNull() ?: 0
+        return ConversationListRow(name = name, preview = preview, hasUnread = unreadCount > 0, unreadCount = unreadCount)
     }
 
     private fun findConversationListScrollable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -1065,7 +1381,14 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private fun looksLikeUnreadBadge(s: String): Boolean {
-        return s.matches(Regex("""^\d{1,3}\+?$"""))
+        return unreadBadgeCount(s) != null
+    }
+
+    private fun unreadBadgeCount(s: String): Int? {
+        val trimmed = s.trim()
+        if (!trimmed.matches(Regex("""^\d{1,3}\+?$"""))) return null
+        val value = trimmed.removeSuffix("+").toIntOrNull() ?: return null
+        return if (trimmed.endsWith("+")) value + 1 else value
     }
 
     private fun looksLikeContactTag(s: String): Boolean {

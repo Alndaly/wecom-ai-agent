@@ -128,11 +128,15 @@ async def _handle_event(robot: Robot, data: dict) -> None:
         evt = AndroidMessageReceived.model_validate(payload)
         log.info(
             "[message-callback] event=ws_received robot=%s contact=%s sender_type=%s "
-            "type=%s external_msg_id=%s content=%r",
+            "type=%s observation_source=%s completeness=%s unread_count=%s "
+            "external_msg_id=%s content=%r",
             robot.robot_id,
             evt.contact.external_id,
             evt.sender_type,
             evt.type,
+            evt.observation_source,
+            evt.completeness,
+            evt.unread_count,
             evt.external_msg_id,
             evt.content or "",
         )
@@ -193,7 +197,7 @@ async def _handle_event(robot: Robot, data: dict) -> None:
         # `command`, `ok`, `message`, and an optional `data` object.
         resolved = hub.resolve_request(payload.get("request_id"), payload)
         log.info(
-            "device.command_result robot=%s command=%s ok=%s request=%s resolved=%s msg=%r",
+            "device.command_result robot=%s command=%s ok=%s request=%s resolved=%s message=%r",
             robot.robot_id,
             payload.get("command"),
             payload.get("ok"),

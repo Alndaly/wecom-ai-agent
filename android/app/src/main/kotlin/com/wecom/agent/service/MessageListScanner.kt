@@ -5,8 +5,10 @@ import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
 import android.view.accessibility.AccessibilityNodeInfo
+import android.util.Log
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
@@ -35,7 +37,7 @@ class MessageListScanner(
         if (!svc.isWeComForeground()) return ScanReport.skipped("WeCom 不在前台")
         if (shouldYield()) return ScanReport.skipped("检测到高优任务，跳过扫描")
         ensureMessagesTab(svc).takeIf { !it.ok }?.let { return it }
-        svc.forceHarvestHomeList()
+        svc.forceHarvestConversationList()
         return ScanReport.ok("已扫描可见区域")
     }
 
@@ -55,7 +57,7 @@ class MessageListScanner(
         val bounds = svc.getMessagesListBounds() ?: return ScanReport.skipped("未找到会话列表")
 
         // First harvest the top of the list.
-        svc.forceHarvestHomeList()
+        svc.forceHarvestConversationList()
 
         // Compute swipe path inside the list bounds. Going from a low Y to a
         // high Y in screen coordinates is *up* on screen, which scrolls the
@@ -74,15 +76,15 @@ class MessageListScanner(
                 log("检测到高优任务，提前让出（已下滑 $swipes 次）")
                 break
             }
-            val ok = swipe(svc, cx, yHigh, cx, yLow, durationMs = 280)
+            val ok = scrollOrSwipe(svc, forward = true, cx = cx, yFrom = yHigh, yTo = yLow, durationMs = 280)
             if (!ok) {
-                log("swipe up 失败，提前结束")
+                log("scroll down 失败，提前结束")
                 break
             }
             swipes++
             // Let the list settle (animation + content load).
             delay(600)
-            svc.forceHarvestHomeList()
+            svc.forceHarvestConversationList()
             if (stopOnStagnant) {
                 val now = listFingerprint(svc)
                 if (now == lastFingerprint) {
@@ -95,11 +97,10 @@ class MessageListScanner(
             }
         }
 
-        // Restore — scroll back up the same number of times. Direction swaps:
-        // low → high on screen pulls the list back to top. We DO restore even
+        // Restore — scroll back up the same number of times. We DO restore even
         // when preempted, otherwise the operator's view stays scrolled.
         repeat(swipes) {
-            swipe(svc, cx, yLow, cx, yHigh, durationMs = 240)
+            scrollOrSwipe(svc, forward = false, cx = cx, yFrom = yLow, yTo = yHigh, durationMs = 240)
             delay(240)
         }
         return ScanReport.ok(
@@ -184,6 +185,24 @@ class MessageListScanner(
         return texts.joinToString("|")
     }
 
+    /**
+     * Prefer the a11y ACTION_SCROLL_* action on the conversation list node —
+     * it goes through the view's own scroll handler and doesn't suffer from
+     * the dispatchGesture-callback-never-fires problem we see on WeCom. Falls
+     * back to a coordinate swipe (already timeout-bounded) if the node refuses.
+     */
+    private suspend fun scrollOrSwipe(
+        svc: WeComAccessibilityService,
+        forward: Boolean,
+        cx: Float,
+        yFrom: Float,
+        yTo: Float,
+        durationMs: Long,
+    ): Boolean {
+        if (svc.scrollMessagesList(forward = forward)) return true
+        return swipe(svc, cx, yFrom, cx, yTo, durationMs = durationMs)
+    }
+
     private suspend fun swipe(
         svc: AccessibilityService,
         x1: Float, y1: Float, x2: Float, y2: Float,
@@ -195,42 +214,49 @@ class MessageListScanner(
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return suspendCancellableCoroutine { cont ->
-            val ok = svc.dispatchGesture(
-                gesture,
-                object : AccessibilityService.GestureResultCallback() {
-                    override fun onCompleted(g: GestureDescription?) {
-                        if (cont.isActive) cont.resume(true)
-                    }
-                    override fun onCancelled(g: GestureDescription?) {
-                        if (cont.isActive) cont.resume(false)
-                    }
-                },
-                null,
-            )
-            if (!ok) cont.resume(false)
-        }
+        return dispatchGestureBounded(svc, gesture, durationMs + 1_500L, "swipe($x1,$y1->$x2,$y2,${durationMs}ms)")
     }
 
     private suspend fun tap(svc: AccessibilityService, x: Float, y: Float): Boolean {
         val path = Path().apply { moveTo(x, y) }
         val stroke = GestureDescription.StrokeDescription(path, 0, 80)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return suspendCancellableCoroutine { cont ->
-            val ok = svc.dispatchGesture(
-                gesture,
-                object : AccessibilityService.GestureResultCallback() {
-                    override fun onCompleted(g: GestureDescription?) {
-                        if (cont.isActive) cont.resume(true)
-                    }
-                    override fun onCancelled(g: GestureDescription?) {
-                        if (cont.isActive) cont.resume(false)
-                    }
-                },
-                null,
-            )
-            if (!ok) cont.resume(false)
+        return dispatchGestureBounded(svc, gesture, 1_500L, "tap($x,$y)")
+    }
+
+    private suspend fun dispatchGestureBounded(
+        svc: AccessibilityService,
+        gesture: GestureDescription,
+        budgetMs: Long,
+        label: String,
+    ): Boolean {
+        val raw = withTimeoutOrNull(budgetMs) {
+            suspendCancellableCoroutine { cont ->
+                val dispatched = svc.dispatchGesture(
+                    gesture,
+                    object : AccessibilityService.GestureResultCallback() {
+                        override fun onCompleted(g: GestureDescription?) {
+                            if (cont.isActive) cont.resume(true)
+                        }
+                        override fun onCancelled(g: GestureDescription?) {
+                            if (cont.isActive) cont.resume(false)
+                        }
+                    },
+                    null,
+                )
+                if (!dispatched && cont.isActive) cont.resume(false)
+            }
         }
+        val outcome = when (raw) {
+            true -> "completed"
+            false -> "cancelled_or_rejected"
+            null -> "callback_timeout"
+        }
+        val accepted = raw == true
+        if (!accepted) {
+            Log.w("MessageListScanner", "gesture drop $label budget=${budgetMs}ms outcome=$outcome")
+        }
+        return accepted
     }
 }
 

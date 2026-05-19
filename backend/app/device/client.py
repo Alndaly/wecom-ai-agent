@@ -89,6 +89,24 @@ class DeviceClient:
     async def react_session_end(self, *, timeout: float = 4.0) -> DeviceCommandResult:
         return await self.command("react_session_end", timeout=timeout)
 
+    async def harvest_current_chat(
+        self,
+        *,
+        max_messages: int,
+        quiet_window_ms: int = 1200,
+        max_duration_ms: int = 10000,
+        timeout: float = 16.0,
+    ) -> DeviceCommandResult:
+        return await self.command(
+            "harvest_current_chat",
+            {
+                "max_messages": max(1, min(int(max_messages), 30)),
+                "quiet_window_ms": max(500, min(int(quiet_window_ms), 5000)),
+                "max_duration_ms": max(2000, min(int(max_duration_ms), 20000)),
+            },
+            timeout=timeout,
+        )
+
     async def tap_text(self, text: str, *, timeout: float) -> DeviceCommandResult:
         return await self.command("tap_text", {"text": text}, timeout=timeout)
 

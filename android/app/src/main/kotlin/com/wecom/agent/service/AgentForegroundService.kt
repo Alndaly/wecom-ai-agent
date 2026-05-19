@@ -27,6 +27,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -175,7 +176,7 @@ class AgentForegroundService : Service() {
         MessageNotificationListener.registerCallback { sender, content, postTime ->
             forwardInboundMessage(sender, content, postTime, viaNotification = true)
         }
-        WeComAccessibilityService.onChatMessage = { sender, type, content, fromSelf, messageKey, bounds, relatedMediaBounds ->
+        WeComAccessibilityService.onChatMessage = { sender, type, content, fromSelf, messageKey, bounds, relatedMediaBounds, observationSource, unreadCount ->
             if (a11yInboundEnabled) {
                 forwardChatMessage(
                     sender,
@@ -186,6 +187,8 @@ class AgentForegroundService : Service() {
                     messageKey = messageKey,
                     bounds = bounds,
                     relatedMediaBounds = relatedMediaBounds,
+                    observationSource = observationSource,
+                    unreadCount = unreadCount,
                 )
             }
         }
@@ -391,6 +394,7 @@ class AgentForegroundService : Service() {
                     "screenshot_once",
                     "react_session_start",
                     "react_session_end",
+                    "harvest_current_chat",
                     "tap_text",
                     "tap_node",
                     "tap_xy",
@@ -745,6 +749,31 @@ class AgentForegroundService : Service() {
                             Pair(frame.error == null, frame.error ?: "已截图")
                         }
                     }
+                    "harvest_current_chat" -> {
+                        val svc = WeComAccessibilityService.instance
+                        if (svc == null) {
+                            Pair(false, "无障碍未启用")
+                        } else {
+                            val maxMessages = obj["max_messages"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                                ?.coerceIn(1, 30)
+                                ?: 10
+                            val quietWindowMs = obj["quiet_window_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+                                ?: 1_200L
+                            val maxDurationMs = obj["max_duration_ms"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+                                ?: 10_000L
+                            val harvest = svc.forceEmitRecentCustomerBubbles(maxMessages, quietWindowMs, maxDurationMs)
+                            data = buildJsonObject {
+                                put("requested_messages", JsonPrimitive(harvest.requestedMessages))
+                                put("emitted_messages", JsonPrimitive(harvest.emittedMessages))
+                                put("observed_bubbles", JsonPrimitive(harvest.observedBubbles))
+                                put("scroll_pages", JsonPrimitive(harvest.scrollPages))
+                                put("quiet_window_ms", JsonPrimitive(harvest.quietWindowMs))
+                                put("max_duration_ms", JsonPrimitive(harvest.maxDurationMs))
+                                put("stopped_reason", JsonPrimitive(harvest.stoppedReason))
+                            }
+                            Pair(harvest.emittedMessages > 0, "已采集当前聊天页客户消息气泡 ${harvest.emittedMessages}/${harvest.requestedMessages} 条，停止原因=${harvest.stoppedReason}")
+                        }
+                    }
                     "tap_text" -> {
                         val text = obj["text"]?.jsonPrimitive?.contentOrNull
                         if (text.isNullOrBlank()) Pair(false, "缺少 text 参数")
@@ -867,7 +896,7 @@ class AgentForegroundService : Service() {
         val msg = result.second
 
         val elapsed = System.currentTimeMillis() - started
-        broadcastLog("ReAct → $command ok=$ok msg=$msg (${elapsed}ms)")
+        broadcastLog("ReAct → $command ok=$ok message=$msg (${elapsed}ms)")
         val payload = json.encodeToJsonElement(
             com.wecom.agent.model.DeviceCommandResultPayload.serializer(),
             com.wecom.agent.model.DeviceCommandResultPayload(
@@ -885,6 +914,7 @@ class AgentForegroundService : Service() {
         return when (command) {
             "open_wecom" -> 12_000L
             "screenshot_once" -> 10_000L
+            "harvest_current_chat" -> 16_000L
             "stage_media" -> 45_000L
             else -> 8_000L
         }
@@ -941,11 +971,21 @@ class AgentForegroundService : Service() {
         postTimeMs: Long,
         viaNotification: Boolean,
     ) {
+        val collectionSource = if (viaNotification) "system_notification" else "accessibility_chat_scan"
         Log.i(
             tag,
-            "callback detected src=${if (viaNotification) "notif" else "a11y"} sender=$sender content=$content",
+            "callback detected collection_source=$collectionSource sender=$sender content=$content",
         )
-        forwardMessage(sender, "text", content, postTimeMs, senderType = "customer", src = if (viaNotification) "notif" else "a11y")
+        forwardMessage(
+            sender,
+            "text",
+            content,
+            postTimeMs,
+            senderType = "customer",
+            src = if (viaNotification) "notif" else "a11y",
+            observationSource = if (viaNotification) "system_notification" else "chat_message_bubble",
+            completeness = if (viaNotification) "wake_only" else "complete",
+        )
     }
 
     private fun forwardChatMessage(
@@ -957,6 +997,8 @@ class AgentForegroundService : Service() {
         messageKey: String,
         bounds: List<Int>,
         relatedMediaBounds: List<Int>,
+        observationSource: String,
+        unreadCount: Int?,
     ) {
         if (type == "text" && fromSelf && isRecentAutomatedOutput(content)) {
             Log.i(tag, "skip automated self echo sender=$sender content=$content")
@@ -964,15 +1006,17 @@ class AgentForegroundService : Service() {
             return
         }
         val src = if (fromSelf) "a11y-self" else "a11y"
+        val collectionSource = if (fromSelf) "accessibility_self_message" else "accessibility_customer_message"
         val senderType = if (fromSelf) "human" else "customer"
         if (isRecentObservedInput(src, sender, senderType, type, content)) {
-            Log.i(tag, "skip repeated a11y observation src=$src sender=$sender senderType=$senderType type=$type content=$content")
+            Log.i(tag, "skip repeated accessibility observation collection_source=$collectionSource sender=$sender sender_type=$senderType message_type=$type content=$content")
             return
         }
         Log.i(
             tag,
-            "callback detected src=$src sender=$sender stable_key=$messageKey type=$type content=$content",
+            "callback detected collection_source=$collectionSource sender=$sender ui_stable_key=$messageKey message_type=$type content=$content",
         )
+        val completeness = if (observationSource == "conversation_list_preview") "preview_only" else "complete"
         if (!fromSelf && type == "image") {
             scope.launch {
                 val mediaJson = fetchInboundImageMedia(bounds)
@@ -985,6 +1029,9 @@ class AgentForegroundService : Service() {
                     src = src,
                     stableKey = messageKey,
                     mediaJson = mediaJson,
+                    observationSource = observationSource,
+                    completeness = completeness,
+                    unreadCount = unreadCount,
                 )
             }
             return
@@ -1001,6 +1048,9 @@ class AgentForegroundService : Service() {
                     src = src,
                     stableKey = messageKey,
                     mediaJson = mediaJson,
+                    observationSource = observationSource,
+                    completeness = completeness,
+                    unreadCount = unreadCount,
                 )
             }
             return
@@ -1013,6 +1063,9 @@ class AgentForegroundService : Service() {
             senderType = senderType,
             src = src,
             stableKey = messageKey,
+            observationSource = observationSource,
+            completeness = completeness,
+            unreadCount = unreadCount,
         )
     }
 
@@ -1151,6 +1204,9 @@ class AgentForegroundService : Service() {
         src: String,
         stableKey: String? = null,
         mediaJson: JsonElement? = null,
+        observationSource: String? = null,
+        completeness: String? = null,
+        unreadCount: Int? = null,
     ) {
         val normalizedType = when (type) {
             "image", "video" -> type
@@ -1165,18 +1221,27 @@ class AgentForegroundService : Service() {
             media_json = mediaJson,
             sender_type = senderType,
             sent_at = Instant.ofEpochMilli(postTimeMs).toString(),
+            observation_source = observationSource,
+            completeness = completeness,
+            unread_count = unreadCount,
         )
         val sent = sendInboundPayload(payload)
         if (!sent) {
             enqueuePendingInbound(PendingInbound(payload, src, senderType))
         }
-        val idKind = if (stableKey?.trim()?.isNotEmpty() == true) "stable_key_bucketed" else "post_time"
-        val stableBucket = if (stableKey?.trim()?.isNotEmpty() == true) postTimeMs.floorDiv(stableExternalIdBucketMs).toString() else ""
+        val externalIdKind = if (stableKey?.trim()?.isNotEmpty() == true) "bucketed_ui_stable_key" else "notification_post_time"
+        val stableTimeBucket = if (stableKey?.trim()?.isNotEmpty() == true) postTimeMs.floorDiv(stableExternalIdBucketMs).toString() else ""
+        val collectionSource = when (src) {
+            "notif" -> "system_notification"
+            "a11y" -> "accessibility_customer_message"
+            "a11y-self" -> "accessibility_self_message"
+            else -> src
+        }
         broadcastLog(
-            if (sent) "上报消息[$src/$senderType/$normalizedType] $sender :: $content"
-            else "上报暂存(未连接)[$src/$senderType/$normalizedType] $sender :: $content"
+            if (sent) "上报消息[$collectionSource/$senderType/$normalizedType] $sender :: $content"
+            else "上报暂存(未连接)[$collectionSource/$senderType/$normalizedType] $sender :: $content"
         )
-        Log.i(tag, "callback sent src=$src senderType=$senderType type=$normalizedType sent=$sent queued=${!sent} id_kind=$idKind stable_bucket=$stableBucket stable_key=${stableKey ?: ""} external_msg_id=$externalId sender=$sender content=$content")
+        Log.i(tag, "callback sent collection_source=$collectionSource observation_source=${observationSource ?: ""} completeness=${completeness ?: ""} unread_count=${unreadCount ?: 0} sender_type=$senderType message_type=$normalizedType sent=$sent queued=${!sent} external_id_kind=$externalIdKind stable_time_bucket=$stableTimeBucket ui_stable_key=${stableKey ?: ""} external_msg_id=$externalId sender=$sender content=$content")
     }
 
     private fun sendInboundPayload(payload: MessageReceivedPayload): Boolean {
@@ -1189,7 +1254,7 @@ class AgentForegroundService : Service() {
         pendingInbound.addLast(item)
         while (pendingInbound.size > pendingInboundCap) {
             val dropped = pendingInbound.removeFirst()
-            Log.w(tag, "drop pending inbound src=${dropped.src} senderType=${dropped.senderType} content=${dropped.payload.content}")
+            Log.w(tag, "drop pending inbound collection_source=${dropped.src} sender_type=${dropped.senderType} content=${dropped.payload.content}")
         }
     }
 

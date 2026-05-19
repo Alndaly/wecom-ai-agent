@@ -241,6 +241,7 @@ export type RobotQueueItem = {
   priority: number;
   waited_ms: number;
   cancellable?: boolean;
+  warning?: string | null;
 };
 
 export type RobotQueueSnapshot = {

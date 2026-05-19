@@ -72,6 +72,27 @@ async def _send_robot_command(robot: Robot, payload: dict) -> None:
         raise HTTPException(status.HTTP_409_CONFLICT, "robot is offline")
 
 
+async def _publish_task_warning(
+    *, robot: Robot, task_id: int, warning: str, db: AsyncSession
+) -> None:
+    """Expose a non-fatal task warning to operators while keeping the task alive."""
+    task = await db.get(RobotTask, task_id)
+    if task is None:
+        return
+    task.last_error = warning
+    await db.commit()
+    await hub.broadcast_web(
+        robot.team_id,
+        "task.updated",
+        {
+            "robot_id": robot.robot_id,
+            "task_id": task.id,
+            "status": task.status,
+            "error": task.last_error,
+        },
+    )
+
+
 @router.get("", response_model=list[RobotOut])
 async def list_robots(
     user: User = Depends(current_user), db: AsyncSession = Depends(get_db)
@@ -424,6 +445,82 @@ async def run_agent_goal_task(task_id: int) -> None:
                     log_sink=_sink,
                     force_llm=force_llm,
                 )
+                if (
+                    result.ok
+                    and (task.payload_json or {}).get("reason")
+                    == "conversation_list_preview_multiple_unread"
+                ):
+                    unread_count = int((task.payload_json or {}).get("unread_count") or 1)
+                    await asyncio.sleep(0.6)
+                    # Timeout budget: algorithm maxDuration < device withTimeout
+                    # < backend send_request timeout. Keeping them coincident
+                    # made backend race the device-side return.
+                    harvest = await device.harvest_current_chat(
+                        max_messages=max(1, unread_count),
+                        quiet_window_ms=1200,
+                        max_duration_ms=10000,
+                        timeout=20.0,
+                    )
+                    emitted_messages = int((harvest.data or {}).get("emitted_messages") or 0)
+                    requested_messages = int(
+                        (harvest.data or {}).get("requested_messages") or unread_count
+                    )
+                    observed_bubbles = int((harvest.data or {}).get("observed_bubbles") or 0)
+                    scroll_pages = int((harvest.data or {}).get("scroll_pages") or 0)
+                    stopped_reason = str((harvest.data or {}).get("stopped_reason") or "unknown")
+                    harvest_warning: str | None = None
+                    if not harvest.ok or emitted_messages <= 0:
+                        harvest_warning = (
+                            "采集失败：没有从当前聊天页采集到客户消息气泡；"
+                            "可能漏采，请查看设备画面或任务日志。"
+                        )
+                    elif emitted_messages < requested_messages:
+                        harvest_warning = (
+                            f"采集不足：会话列表显示约 {requested_messages} 条未读，"
+                            f"当前聊天页只采集到 {emitted_messages} 条；可能漏采，"
+                            "不要认为本轮已完整处理。"
+                        )
+                    await _sink(
+                        "warn" if harvest_warning else "info",
+                        (
+                            "[chat_harvest] current chat bubble collection "
+                            f"ok={harvest.ok} emitted_messages={emitted_messages} "
+                            f"requested_messages={requested_messages} observed_bubbles={observed_bubbles} "
+                            f"scroll_pages={scroll_pages} stopped_reason={stopped_reason} "
+                            f"warning={harvest_warning or ''} message={harvest.message or ''}"
+                        ),
+                    )
+                    if harvest_warning:
+                        await _publish_task_warning(
+                            robot=robot,
+                            task_id=task.id,
+                            warning=harvest_warning,
+                            db=db,
+                        )
+                    if harvest.ok and emitted_messages > 0:
+                        await asyncio.sleep(0.8)
+                        from app.services import auto_reply_scheduler
+
+                        log.info(
+                            "chat_harvest completed; waking auto-reply robot=%s task=%s "
+                            "conversation_id=%s emitted_messages=%s requested_messages=%s",
+                            robot.robot_id,
+                            task.id,
+                            task.conversation_id,
+                            emitted_messages,
+                            requested_messages,
+                        )
+                        auto_reply_scheduler.wake_robot(robot.id)
+                    else:
+                        log.warning(
+                            "chat_harvest produced no messages; auto-reply not woken robot=%s "
+                            "task=%s conversation_id=%s ok=%s message=%r",
+                            robot.robot_id,
+                            task.id,
+                            task.conversation_id,
+                            harvest.ok,
+                            harvest.message,
+                        )
             finally:
                 if session_started:
                     try:
@@ -444,7 +541,12 @@ async def run_agent_goal_task(task_id: int) -> None:
                 await db.commit()
                 await hub.broadcast_web(
                     robot.team_id, "task.updated",
-                    {"task_id": task.id, "status": task_row.status, "error": task_row.last_error},
+                    {
+                        "robot_id": robot.robot_id,
+                        "task_id": task.id,
+                        "status": task_row.status,
+                        "error": task_row.last_error,
+                    },
                 )
             raise
         except Exception as e:  # noqa: BLE001
@@ -474,5 +576,10 @@ async def run_agent_goal_task(task_id: int) -> None:
         await db.commit()
         await hub.broadcast_web(
             robot.team_id, "task.updated",
-            {"task_id": task.id, "status": task_row.status, "error": task_row.last_error},
+            {
+                "robot_id": robot.robot_id,
+                "task_id": task.id,
+                "status": task_row.status,
+                "error": task_row.last_error,
+            },
         )

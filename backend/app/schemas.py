@@ -180,3 +180,10 @@ class AndroidMessageReceived(BaseModel):
     media_json: dict | None = None
     sender_type: Literal["customer", "human"] = "customer"
     sent_at: datetime | None = None
+    observation_source: Literal[
+        "system_notification",
+        "conversation_list_preview",
+        "chat_message_bubble",
+    ] | None = None
+    completeness: Literal["wake_only", "preview_only", "complete"] | None = None
+    unread_count: int | None = None

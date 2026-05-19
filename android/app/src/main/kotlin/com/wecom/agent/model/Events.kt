@@ -22,6 +22,12 @@ data class MessageReceivedPayload(
     val media_json: JsonElement? = null,
     val sender_type: String = "customer",
     val sent_at: String? = null,
+    // These fields describe how complete this Android observation is. A
+    // conversation-list preview may only show the last unread message, while a
+    // chat-message bubble is the actual message content seen inside the chat.
+    val observation_source: String? = null,
+    val completeness: String? = null,
+    val unread_count: Int? = null,
 )
 
 @Serializable

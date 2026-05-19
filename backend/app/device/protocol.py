@@ -58,6 +58,7 @@ DeviceCommandName = Literal[
     "screenshot_once",
     "react_session_start",
     "react_session_end",
+    "harvest_current_chat",
     "tap_text",
     "tap_node",
     "tap_xy",
